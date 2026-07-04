@@ -23,3 +23,23 @@ Priority: high -- silently incomplete results and wrong aggregates on graphs > 1
   error mode for aggregate queries where truncation means a wrong answer.
 - The multi-filter path either intersects unbounded id streams or picks the most selective filter
   to drive and post-filters the rest, instead of intersecting independently truncated lists.
+
+## Resolution
+
+Rather than making the cap configurable/observable, the cap was removed: with no explicit query
+LIMIT, both the node start-scan (`get_start_nodes`) and the relationship-index anchor scan
+(`traverse_from_relationship_index`) now derive their scan bound from the actual candidate count
+instead of the hardcoded 100000.
+
+- Node scan: `AllNodesCountPeered()` / `AllNodesCountPeered(label)`.
+- Relationship-index scan: `FindRelationshipCountPeered(label, prop, EQ, val)` (the anchor op is
+  always EQ here, so the count matches the scan exactly).
+
+Using the real count keeps the underlying `reserve()` / `max = skip + limit` accumulation bounded
+(a giant sentinel like SIZE_MAX would over-reserve / overflow), so nothing is silently truncated.
+This also fixes finding #2 for free: every per-filter `FindNodesPeered` list is now bounded by the
+label's total node count, so no filter list is truncated before the leapfrog intersection.
+
+Trade-off: an unbounded query now costs one extra count round-trip, and materializes the full
+result set in memory (the intended behavior when no LIMIT is given). A >100k-node regression test is
+a good follow-up but needs a large fixture / build environment to exercise.

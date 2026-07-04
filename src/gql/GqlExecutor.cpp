@@ -157,6 +157,110 @@ struct GqlRowOuterVarsLess {
  * @param query_ptr Shared pointer to the GQL query.
  * @return A future resolving to a QueryResult containing columns and values.
  */
+/**
+ * @brief A plan for answering a pure COUNT over a single node pattern from the shard count
+ *        indexes, without materializing any Node objects.
+ *
+ * This is the fast path for queries shaped like `MATCH (n:Label) RETURN count(n)` (optionally with
+ * a single property filter). Counting by materializing every node OOMs on large labels, so when a
+ * query matches this exact shape we answer it directly with AllNodesCountPeered / FindNodeCountPeered.
+ * Anything more complex falls back to the normal executor.
+ */
+struct SimpleNodeCountPlan {
+    bool has_label = false;
+    std::string label;
+    bool has_filter = false;
+    std::string filter_property;
+    Operation filter_op = Operation::EQ;
+    property_type_t filter_value;
+    std::string column_name;
+    uint64_t multiplier = 1;
+};
+
+/**
+ * @brief Detect whether a query is a pure COUNT over a single node pattern and, if so, populate a
+ *        SimpleNodeCountPlan. Returns false (fall back to the normal executor) for any shape that
+ *        cannot be answered by a single count-index lookup.
+ */
+static bool try_plan_simple_node_count(const GqlQuery& q, SimpleNodeCountPlan& out) {
+    if (q.kind != QueryKind::SINGLE) return false;
+    if (q.explain || q.profile) return false;      // keep plan/profile output on the normal path
+    if (!q.writes.empty()) return false;
+    if (q.where_expr) return false;
+    if (q.has_unnested_subquery) return false;
+    if (q.distinct) return false;
+    if (q.limit.has_value()) return false;
+    if (!q.order_by.empty()) return false;
+    if (q.matches.size() != 1) return false;
+    if (q.returns.size() != 1) return false;
+
+    const auto& item = q.returns[0];
+    if (!item.expr || item.expr->kind != ExpressionKind::AGGREGATION) return false;
+    const auto* ae = static_cast<const AggregateExpr*>(item.expr.get());
+    if (ae->fn_kind != AggregateKind::COUNT) return false;
+
+    const auto& m = q.matches[0];
+    if (m.is_optional) return false;
+    if (m.shortest_path_kind != ShortestPathKind::NONE) return false;
+    if (m.is_khop) return false;
+    if (!m.path_variable.empty()) return false;
+    if (m.limit.has_value()) return false;
+    if (!m.pattern.edges.empty()) return false;
+    if (m.pattern.nodes.size() != 1) return false;
+
+    const auto& node = m.pattern.nodes[0];
+    if (node.where_expr) return false;
+
+    // The count target must be count(*) or count(<the pattern node's variable>). For a single
+    // non-optional node every matched row binds a distinct node, so count(n) == row count.
+    if (ae->expr) {
+        if (ae->expr->kind != ExpressionKind::VARIABLE) return false;
+        const auto* ve = static_cast<const VariableExpr*>(ae->expr.get());
+        if (node.variable.empty() || ve->name != node.variable) return false;
+    }
+
+    // Only a single literal label (or no label) can be answered by the count endpoints;
+    // AND/OR/NOT/WILDCARD label expressions fall back.
+    if (node.label_expr) {
+        if (node.label_expr->kind != LabelExprKind::LITERAL) return false;
+        out.has_label = true;
+        out.label = node.label_expr->name;
+    }
+
+    // Zero filters -> count all (of the label). Exactly one filter (with a label) -> FindNodeCount.
+    // More than one filter has no single count endpoint, so fall back.
+    size_t filter_count = node.properties.size() + node.property_filters.size();
+    if (filter_count > 1) return false;
+    if (filter_count == 1) {
+        if (!out.has_label) return false;  // FindNodeCountPeered requires a node type
+        out.has_filter = true;
+        if (!node.properties.empty()) {
+            const auto& kv = *node.properties.begin();
+            out.filter_property = kv.first;
+            out.filter_op = Operation::EQ;
+            out.filter_value = kv.second;
+        } else {
+            const auto& f = node.property_filters[0];
+            out.filter_property = f.property;
+            out.filter_op = f.op;
+            out.filter_value = f.value;
+        }
+    }
+
+    // Column name mirrors the key derivation used elsewhere for RETURN items.
+    if (item.alias) {
+        out.column_name = *item.alias;
+    } else if (!ae->expr) {
+        out.column_name = "count(*)";
+    } else {
+        const auto* ve = static_cast<const VariableExpr*>(ae->expr.get());
+        out.column_name = "count(" + ve->name + ")";
+    }
+
+    out.multiplier = q.count_multiplication_factor;
+    return true;
+}
+
 static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph, std::shared_ptr<GqlQuery> query_ptr) {
     if (query_ptr->no_op) {
         QueryResult query_res;
@@ -306,6 +410,31 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
                 return combined_res;
             });
         });
+    }
+
+    // Fast path: a pure COUNT over a single node pattern is answered directly from the shard count
+    // indexes, without materializing Node objects -- otherwise counting a large label (e.g.
+    // count(Comment) over millions of rows) exhausts memory.
+    {
+        SimpleNodeCountPlan cplan;
+        if (try_plan_simple_node_count(*query_ptr, cplan)) {
+            seastar::future<uint64_t> count_fut = cplan.has_filter
+                ? graph.shard.local().FindNodeCountPeered(cplan.label, cplan.filter_property, cplan.filter_op, cplan.filter_value)
+                : (cplan.has_label ? graph.shard.local().AllNodesCountPeered(cplan.label)
+                                   : graph.shard.local().AllNodesCountPeered());
+            return count_fut.then([cplan](uint64_t c) {
+                int64_t value = static_cast<int64_t>(c);
+                if (cplan.multiplier > 1) {
+                    value *= static_cast<int64_t>(cplan.multiplier);
+                }
+                QueryResult result;
+                result.column_names.push_back(cplan.column_name);
+                std::vector<GqlValue> row;
+                row.push_back(GqlValue(value));
+                result.rows.push_back(std::move(row));
+                return result;
+            });
+        }
     }
 
     // 2. Detect if the query contains aggregate functions (COUNT, SUM, AVG, MIN, MAX)

@@ -43,3 +43,16 @@ label's total node count, so no filter list is truncated before the leapfrog int
 Trade-off: an unbounded query now costs one extra count round-trip, and materializes the full
 result set in memory (the intended behavior when no LIMIT is given). A >100k-node regression test is
 a good follow-up but needs a large fixture / build environment to exercise.
+
+## Follow-up (deploy-surfaced): count without materialization
+
+Deploying the above to a real SF1 graph (Comment ~1.7M nodes) surfaced that removing the cap made
+`count(Comment)` materialize every Node just to size the aggregate group -> std::bad_alloc. Fixed by
+a guarded fast path in execute_query_internal: `MATCH (n:Label) RETURN count(n)` (single node, no
+edges, optional single filter, no WHERE/ORDER/LIMIT/DISTINCT) is answered from the shard count
+indexes (AllNodesCountPeered / FindNodeCountPeered) with no Node materialization; anything more
+complex falls back. Verified live: count(Comment)=1,739,438 and count(n)=2,888,570 in <1ms (were OOM).
+
+Remaining edges (candidates for a future task): non-aggregate unbounded scans (`MATCH (c:Comment)
+RETURN c` with no LIMIT) still materialize all rows; multi-filter counts (>1 filter) fall back to the
+materializing path.

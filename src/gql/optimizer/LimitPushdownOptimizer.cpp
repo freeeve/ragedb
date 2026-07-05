@@ -81,6 +81,22 @@ void LimitPushdownOptimizer::limit_pushdown_pass(GqlQuery& query) {
 
     if (query.matches.empty()) return;
 
+    // Do not push the LIMIT into the scan when a predicate is evaluated AFTER the scan (a residual
+    // query/node WHERE, a multi-label pattern, or edge predicates on the relationship-index path):
+    // scanning exactly `limit` rows would under-return. Leave the LIMIT to post-filter truncation.
+    if (query.where_expr) return;
+    for (const auto& m : query.matches) {
+        for (const auto& node : m.pattern.nodes) {
+            if (node.where_expr) return;
+            if (node.label_expr && node.label_expr->kind != LabelExprKind::LITERAL) return;
+        }
+        for (const auto& edge : m.pattern.edges) {
+            if (edge.where_expr) return;
+            if (edge.label_expr && edge.label_expr->kind != LabelExprKind::LITERAL) return;
+            if (!edge.properties.empty() || !edge.property_filters.empty()) return;
+        }
+    }
+
     if (query.matches.size() == 1) {
         query.matches[0].limit = query.limit;
         return;

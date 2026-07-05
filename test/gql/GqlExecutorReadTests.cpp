@@ -384,3 +384,44 @@ TEST_CASE("GQL Execution Read Tests", "[gql_executor_read]") {
 // driven from inside the Catch harness (which itself runs the session in a seastar::async), so 016 is
 // verified on the live server instead -- the unlabeled transitive query no longer OOMs and bounded
 // queries still return the correct closure.
+
+TEST_CASE("GQL LIMIT with a residual WHERE returns the full LIMIT", "[gql_executor_read][task009]") {
+    auto graph = Graph("gql_limit_pushdown_test");
+    graph.Start().get();
+    graph.Clear();
+
+    graph.shard.local().NodeTypeInsertPeered("Person").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "name", "string").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "age", "integer").get();
+
+    // 15 non-matching (age 10) added first (lower ids -> scanned first), then 5 matching (age 50).
+    for (int i = 0; i < 15; ++i) {
+        graph.shard.local().NodeAddPeered("Person", "lo" + std::to_string(i),
+            "{\"name\": \"lo" + std::to_string(i) + "\", \"age\": 10}").get();
+    }
+    for (int i = 0; i < 5; ++i) {
+        graph.shard.local().NodeAddPeered("Person", "hi" + std::to_string(i),
+            "{\"name\": \"hi" + std::to_string(i) + "\", \"age\": 50}").get();
+    }
+
+    auto count_rows = [](const std::string& r) {
+        size_t c = 0, pos = 0;
+        while ((pos = r.find("\"name\":", pos)) != std::string::npos) { c++; pos += 7; }
+        return c;
+    };
+
+    // Sanity: without a LIMIT the residual predicate must match all 5 (isolates query/data issues).
+    std::string res_nolimit = GqlExecutor::execute(graph,
+        std::string("MATCH (n:Person) WHERE n.age > 25 OR n.name = 'zzz' RETURN n.name AS name")).get();
+    INFO("no-limit result: " << res_nolimit);
+    REQUIRE(count_rows(res_nolimit) == 5);
+
+    // The OR keeps the predicate residual (not pushed into the scan). With a pushed LIMIT the scan
+    // stops at the first 5 (non-matching) rows and under-returns; the fix scans all then truncates.
+    std::string res = GqlExecutor::execute(graph,
+        std::string("MATCH (n:Person) WHERE n.age > 25 OR n.name = 'zzz' RETURN n.name AS name LIMIT 5")).get();
+    INFO("limit-5 result: " << res);
+    REQUIRE(count_rows(res) == 5);
+
+    graph.Stop().get();
+}

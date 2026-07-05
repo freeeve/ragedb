@@ -199,13 +199,15 @@ struct IsNullExpr : public Expression {
 struct AggregateExpr : public Expression {
     AggregateKind fn_kind;              ///< The kind of aggregate function.
     std::unique_ptr<Expression> expr;   ///< Expression target to aggregate (nullptr for COUNT(*)).
-    AggregateExpr(AggregateKind kind_val, std::unique_ptr<Expression> e) {
+    bool distinct = false;              ///< True for DISTINCT aggregates, e.g. count(DISTINCT x).
+    AggregateExpr(AggregateKind kind_val, std::unique_ptr<Expression> e, bool distinct_val = false) {
         kind = ExpressionKind::AGGREGATION;
         fn_kind = kind_val;
         expr = std::move(e);
+        distinct = distinct_val;
     }
     std::unique_ptr<Expression> clone() const override {
-        return std::make_unique<AggregateExpr>(fn_kind, expr ? expr->clone() : nullptr);
+        return std::make_unique<AggregateExpr>(fn_kind, expr ? expr->clone() : nullptr, distinct);
     }
 };
 

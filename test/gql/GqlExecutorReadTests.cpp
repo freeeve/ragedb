@@ -378,3 +378,29 @@ TEST_CASE("GQL Execution Read Tests", "[gql_executor_read]") {
 
     guard.stop();
 }
+
+TEST_CASE("GQL count(DISTINCT) dedupes repeated values", "[gql_executor_read][task_distinct]") {
+    auto graph = Graph("gql_distinct_test");
+    graph.Start().get();
+    graph.Clear();
+    graph.shard.local().NodeTypeInsertPeered("Person").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "name", "string").get();
+    graph.shard.local().RelationshipTypeInsertPeered("KNOWS").get();
+    uint64_t a = graph.shard.local().NodeAddPeered("Person", "alice", "{\"name\": \"Alice\"}").get();
+    uint64_t b = graph.shard.local().NodeAddPeered("Person", "bob", "{\"name\": \"Bob\"}").get();
+    uint64_t c = graph.shard.local().NodeAddPeered("Person", "carol", "{\"name\": \"Carol\"}").get();
+    // Alice->Bob, Alice->Carol, Bob->Carol. From Alice, 1..2 directed hops reach: Bob, Carol, and
+    // Carol again via Bob. So count(f)=3 but count(DISTINCT f)=2 ({Bob, Carol}).
+    graph.shard.local().RelationshipAddPeered("KNOWS", a, b, "{}").get();
+    graph.shard.local().RelationshipAddPeered("KNOWS", a, c, "{}").get();
+    graph.shard.local().RelationshipAddPeered("KNOWS", b, c, "{}").get();
+
+    std::string res = GqlExecutor::execute(graph,
+        std::string("MATCH (a:Person {name: 'Alice'})-[:KNOWS*1..2]->(f:Person) "
+                    "RETURN count(DISTINCT f) AS distinct_f, count(f) AS total_f")).get();
+    INFO("result: " << res);
+    REQUIRE(res.find("\"distinct_f\": 2") != std::string::npos);
+    REQUIRE(res.find("\"total_f\": 3") != std::string::npos);
+
+    graph.Stop().get();
+}

@@ -454,9 +454,27 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
         }
     }
 
-    // Determine if we can push limit evaluation directly into the traversal
+    // Determine if we can push limit evaluation directly into the traversal. Pushing the LIMIT as
+    // the physical scan bound is only sound when every remaining predicate is applied INSIDE the
+    // scan; if any predicate is evaluated after the scan (a residual WHERE, a multi-label pattern
+    // post-filtered, or edge predicates post-filtered on the relationship-index path), scanning
+    // exactly `limit` rows under-returns. In those cases scan with the default bound and truncate.
+    bool residual_post_scan_filter = query_ptr->where_expr != nullptr;
+    for (const auto& m : query_ptr->matches) {
+        for (const auto& node : m.pattern.nodes) {
+            if (node.where_expr) residual_post_scan_filter = true;
+            if (node.label_expr && node.label_expr->kind != LabelExprKind::LITERAL) residual_post_scan_filter = true;
+        }
+        for (const auto& edge : m.pattern.edges) {
+            if (edge.where_expr) residual_post_scan_filter = true;
+            if (edge.label_expr && edge.label_expr->kind != LabelExprKind::LITERAL) residual_post_scan_filter = true;
+            if (!edge.properties.empty() || !edge.property_filters.empty()) residual_post_scan_filter = true;
+        }
+    }
+
     size_t limit_val = 0;
-    if (query_ptr->limit.has_value() && query_ptr->order_by.empty() && !query_contains_aggregates) {
+    if (query_ptr->limit.has_value() && query_ptr->order_by.empty() &&
+        !query_contains_aggregates && !residual_post_scan_filter) {
         limit_val = *query_ptr->limit;
     }
 

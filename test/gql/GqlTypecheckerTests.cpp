@@ -203,3 +203,44 @@ TEST_CASE("GQL Static Typechecker Tests", "[gql_typechecker]") {
 
     graph.Stop().get();
 }
+
+TEST_CASE("Typechecker is WITH-aware (task 022)", "[gql_typechecker][task022]") {
+    auto graph = Graph("gql_typechecker_with_test");
+    graph.Start().get();
+    graph.Clear();
+    graph.shard.local().NodeTypeInsertPeered("Person").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "name", "string").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "age", "integer").get();
+    graph.shard.local().RelationshipTypeInsertPeered("FRIEND_OF").get();
+
+    SECTION("piped variables are visible in later segments") {
+        auto query = GqlParser::parse("MATCH (p:Person) WITH p RETURN p.name");
+        REQUIRE_NOTHROW(GqlTypechecker::typecheck(graph, query));
+
+        auto staged = GqlParser::parse(
+            "MATCH (p:Person) WITH p MATCH (p)-[:FRIEND_OF]->(f:Person) RETURN f.name");
+        REQUIRE_NOTHROW(GqlTypechecker::typecheck(graph, staged));
+
+        auto aliased = GqlParser::parse("MATCH (p:Person) WITH p.age AS a RETURN a");
+        REQUIRE_NOTHROW(GqlTypechecker::typecheck(graph, aliased));
+    }
+
+    SECTION("an unbound variable after WITH throws instead of returning nulls") {
+        auto query = GqlParser::parse("MATCH (p:Person) WITH p RETURN q.name");
+        REQUIRE_THROWS_WITH(GqlTypechecker::typecheck(graph, query), Catch::Contains("q"));
+    }
+
+    SECTION("a type error inside the first segment is still caught") {
+        auto query = GqlParser::parse("MATCH (p:Person) WHERE p.salary > 1 WITH p RETURN p.name");
+        REQUIRE_THROWS_WITH(GqlTypechecker::typecheck(graph, query),
+            Catch::Contains("Property 'salary' does not exist"));
+    }
+
+    SECTION("variables not projected by WITH are out of scope downstream") {
+        auto query = GqlParser::parse(
+            "MATCH (p:Person)-[:FRIEND_OF]->(r:Person) WITH p RETURN r.name");
+        REQUIRE_THROWS_WITH(GqlTypechecker::typecheck(graph, query), Catch::Contains("r"));
+    }
+
+    graph.Stop().get();
+}

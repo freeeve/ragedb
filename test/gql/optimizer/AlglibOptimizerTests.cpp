@@ -99,6 +99,36 @@ TEST_CASE("GQL Optimizer Phase 24: Irreflexive Contradiction Pruner", "[gql_opti
     }
 }
 
+// Negative controls (task 005): the irreflexive pruner must NOT no_op these -- each is satisfiable.
+TEST_CASE("GQL Optimizer Phase 24: Irreflexive pruner negative controls", "[gql_optimizer][alglib][task005]") {
+    GqlVirtualCatalog::local().clear();
+    GqlVirtualCatalog::local().set_relationship_algebraic_properties("parent_of", {"irreflexive"});
+
+    SECTION("Anonymous endpoints are distinct nodes, not a self-loop") {
+        auto query = GqlParser::parse("MATCH ()-[:parent_of]->() RETURN count(*)");
+        GqlOptimizer::optimize(query);
+        REQUIRE(query.no_op == false);
+    }
+
+    SECTION("Variable-length edge can form a longer cycle a->b->a (satisfiable)") {
+        auto query = GqlParser::parse("MATCH (a)-[:parent_of*2..2]->(a) RETURN a");
+        GqlOptimizer::optimize(query);
+        REQUIRE(query.no_op == false);
+    }
+
+    SECTION("Equality inside a disjunction must not force a contradiction") {
+        auto query = GqlParser::parse("MATCH (a)-[:parent_of]->(b) WHERE a = b OR a.x = 1 RETURN a");
+        GqlOptimizer::optimize(query);
+        REQUIRE(query.no_op == false);
+    }
+
+    SECTION("Positive control still fires: a genuine direct self-loop is a contradiction") {
+        auto query = GqlParser::parse("MATCH (a)-[:parent_of]->(a) RETURN a");
+        GqlOptimizer::optimize(query);
+        REQUIRE(query.no_op == true);
+    }
+}
+
 TEST_CASE("GQL Optimizer Phase 25: Antisymmetric Loop Collapse", "[gql_optimizer][alglib]") {
     SECTION("Antisymmetric but not reflexive - should collapse to self-loop") {
         GqlVirtualCatalog::local().clear();

@@ -1404,22 +1404,27 @@ std::unique_ptr<Expression> GqlParser::parse_primary() {
                 consume(TokenType::LPAREN, "Expected '(' after aggregate function");
                 
                 std::unique_ptr<Expression> arg = nullptr;
+                bool distinct = false;
                 // Special case for count(*)
                 if (upper_name == "COUNT" && check(TokenType::STAR)) {
                     advance(); // consume '*'
                 } else {
+                    // Optional DISTINCT before the aggregated expression, e.g. count(DISTINCT x).
+                    if (match(TokenType::DISTINCT)) {
+                        distinct = true;
+                    }
                     arg = parse_expression();
                 }
                 consume(TokenType::RPAREN, "Expected ')' after aggregate function argument");
-                
+
                 AggregateKind fn;
                 if (upper_name == "COUNT") fn = AggregateKind::COUNT;
                 else if (upper_name == "SUM") fn = AggregateKind::SUM;
                 else if (upper_name == "AVG") fn = AggregateKind::AVG;
                 else if (upper_name == "MIN") fn = AggregateKind::MIN;
                 else fn = AggregateKind::MAX;
-                
-                return std::make_unique<AggregateExpr>(fn, std::move(arg));
+
+                return std::make_unique<AggregateExpr>(fn, std::move(arg), distinct);
             } else if (upper_name == "SIZE") {
                 advance(); // consume "size"
                 consume(TokenType::LPAREN, "Expected '(' after size");

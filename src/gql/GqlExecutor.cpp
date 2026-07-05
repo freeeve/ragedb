@@ -350,6 +350,12 @@ static bool plan_streaming_edge_aggregate(const GqlQuery& q, EdgeAggPlan& out) {
     for (const auto& spec : q.order_by) find_aggregates(spec.expr.get(), out.aggs);
     if (out.aggs.empty()) return false;
 
+    // DISTINCT aggregates (e.g. count(DISTINCT x)) need per-group value dedup, which the streaming
+    // accumulator does not perform; fall back to the normal grouped aggregation path.
+    for (const auto* agg : out.aggs) {
+        if (agg->distinct) return false;
+    }
+
     // Aggregates must be count(*) or over a single variable / one of its properties.
     std::string agg_var;
     for (const auto* agg : out.aggs) {
@@ -1341,12 +1347,30 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
             for (const auto& [key, group] : groups) {
                 std::map<const AggregateExpr*, GqlValue> aggregate_results;
                 for (const auto* agg : aggregate_exprs) {
+                    // For a DISTINCT aggregate (e.g. count(DISTINCT x)) reduce the group to one row per
+                    // distinct non-null value of the aggregated expression, so the count/sum/min/max
+                    // logic below sees each value exactly once.
+                    std::vector<GqlRow> distinct_rows;
+                    const std::vector<GqlRow>* agg_rows_ptr = &group.rows;
+                    if (agg->distinct && agg->expr) {
+                        auto val_less = [](const GqlValue& a, const GqlValue& b) { return compare_gql_values(a, b) < 0; };
+                        std::set<GqlValue, decltype(val_less)> seen(val_less);
+                        for (const auto& r : group.rows) {
+                            GqlValue v = evaluate_expression(r, agg->expr.get());
+                            if (v.type == GqlValue::NIL) continue;
+                            if (seen.insert(v).second) {
+                                distinct_rows.push_back(r);
+                            }
+                        }
+                        agg_rows_ptr = &distinct_rows;
+                    }
+                    const std::vector<GqlRow>& agg_rows = *agg_rows_ptr;
                     if (agg->fn_kind == AggregateKind::COUNT) {
                         int64_t count = 0;
                         if (!agg->expr) {
                             count = static_cast<int64_t>(group.rows.size());
                         } else {
-                            for (const auto& r : group.rows) {
+                            for (const auto& r : agg_rows) {
                                 GqlValue v = evaluate_expression(r, agg->expr.get());
                                 if (v.type != GqlValue::NIL) {
                                     count++;
@@ -1363,7 +1387,7 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
                         bool has_double = false;
                         int64_t count = 0;
 
-                        for (const auto& r : group.rows) {
+                        for (const auto& r : agg_rows) {
                             GqlValue v = evaluate_expression(r, agg->expr.get());
                             if (v.type == GqlValue::PROPERTY) {
                                 if (std::holds_alternative<int64_t>(v.property)) {
@@ -1400,7 +1424,7 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
                         }
                     } else if (agg->fn_kind == AggregateKind::MIN) {
                         GqlValue min_val;
-                        for (const auto& r : group.rows) {
+                        for (const auto& r : agg_rows) {
                             GqlValue v = evaluate_expression(r, agg->expr.get());
                             if (v.type != GqlValue::NIL) {
                                 if (min_val.type == GqlValue::NIL || compare_gql_values(v, min_val) < 0) {
@@ -1411,7 +1435,7 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
                         aggregate_results[agg] = min_val;
                     } else if (agg->fn_kind == AggregateKind::MAX) {
                         GqlValue max_val;
-                        for (const auto& r : group.rows) {
+                        for (const auto& r : agg_rows) {
                             GqlValue v = evaluate_expression(r, agg->expr.get());
                             if (v.type != GqlValue::NIL) {
                                 if (max_val.type == GqlValue::NIL || compare_gql_values(v, max_val) > 0) {

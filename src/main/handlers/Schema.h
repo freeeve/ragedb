@@ -216,6 +216,22 @@ class Schema {
         seastar::future<std::unique_ptr<seastar::http::reply>> handle(const seastar::sstring& path, std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) override;
     };
 
+    class GetRelationshipTypeAlgebraHandler : public seastar::httpd::handler_base {
+    public:
+        explicit GetRelationshipTypeAlgebraHandler(Schema& schema) : parent(schema) {};
+    private:
+        Schema& parent;
+        seastar::future<std::unique_ptr<seastar::http::reply>> handle(const seastar::sstring& path, std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) override;
+    };
+
+    class DeleteRelationshipTypeAlgebraHandler : public seastar::httpd::handler_base {
+    public:
+        explicit DeleteRelationshipTypeAlgebraHandler(Schema& schema) : parent(schema) {};
+    private:
+        Schema& parent;
+        seastar::future<std::unique_ptr<seastar::http::reply>> handle(const seastar::sstring& path, std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) override;
+    };
+
     ragedb::Graph& graph;
     ClearGraphHandler clearGraphHandler;
     GetNodeTypesHandler getNodeTypesHandler;
@@ -241,6 +257,8 @@ class Schema {
     GetRelationshipIndexesHandler getRelationshipIndexesHandler;
     GetRelationshipTypeIndexesHandler getRelationshipTypeIndexesHandler;
     PostRelationshipTypeAlgebraHandler postRelationshipTypeAlgebraHandler;
+    GetRelationshipTypeAlgebraHandler getRelationshipTypeAlgebraHandler;
+    DeleteRelationshipTypeAlgebraHandler deleteRelationshipTypeAlgebraHandler;
 public:
     explicit Schema (ragedb::Graph &_graph) : graph(_graph), clearGraphHandler(*this),
                                      getNodeTypesHandler(*this), getRelationshipTypesHandler(*this),
@@ -252,7 +270,9 @@ public:
                                      postRelationshipTypePropertyIndexHandler(*this), deleteRelationshipTypePropertyIndexHandler(*this),
                                      getNodeIndexesHandler(*this), getNodeTypeIndexesHandler(*this),
                                      getRelationshipIndexesHandler(*this), getRelationshipTypeIndexesHandler(*this),
-                                     postRelationshipTypeAlgebraHandler(*this){}
+                                     postRelationshipTypeAlgebraHandler(*this),
+                                     getRelationshipTypeAlgebraHandler(*this),
+                                     deleteRelationshipTypeAlgebraHandler(*this){}
     void set_routes(seastar::httpd::routes& routes);
 };
 

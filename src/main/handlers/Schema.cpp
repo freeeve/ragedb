@@ -17,10 +17,14 @@
 #include "Schema.h"
 
 #include <utility>
+#include <algorithm>
 #include "Utilities.h"
 #include "../json/JSON.h"
 #include <seastar/json/formatter.hh>
 #include "../../gql/GqlVirtualCatalog.h"
+#include "../../gql/GqlQueryCache.h"
+#include "../../graph/cache/WccCache.h"
+#include "../../graph/cache/TransitiveReachabilityCache.h"
 
 void Schema::set_routes(seastar::httpd::routes &routes) {
     auto clearGraph = new seastar::httpd::match_rule(&clearGraphHandler);
@@ -166,6 +170,18 @@ void Schema::set_routes(seastar::httpd::routes &routes) {
     postRelationshipTypeAlgebra->add_param("type");
     postRelationshipTypeAlgebra->add_str("/algebra");
     routes.add(postRelationshipTypeAlgebra, seastar::httpd::operation_type::POST);
+
+    auto getRelationshipTypeAlgebra = new seastar::httpd::match_rule(&getRelationshipTypeAlgebraHandler);
+    getRelationshipTypeAlgebra->add_str("/db/" + graph.GetName() + "/schema/relationships");
+    getRelationshipTypeAlgebra->add_param("type");
+    getRelationshipTypeAlgebra->add_str("/algebra");
+    routes.add(getRelationshipTypeAlgebra, seastar::httpd::operation_type::GET);
+
+    auto deleteRelationshipTypeAlgebra = new seastar::httpd::match_rule(&deleteRelationshipTypeAlgebraHandler);
+    deleteRelationshipTypeAlgebra->add_str("/db/" + graph.GetName() + "/schema/relationships");
+    deleteRelationshipTypeAlgebra->add_param("type");
+    deleteRelationshipTypeAlgebra->add_str("/algebra");
+    routes.add(deleteRelationshipTypeAlgebra, seastar::httpd::operation_type::DELETE);
 }
 
 future<std::unique_ptr<seastar::http::reply>>
@@ -577,6 +593,29 @@ Schema::GetRelationshipTypeIndexesHandler::handle([[maybe_unused]] const seastar
     return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
 }
 
+/**
+ * @brief The algebraic traits the optimizer passes understand. POSTed values are lowercased and
+ *        validated against this set: anything else would be recorded but never fire, a silent no-op.
+ */
+static const std::unordered_set<std::string> KNOWN_ALGEBRAIC_TRAITS = {
+    "reflexive", "irreflexive", "symmetric", "antisymmetric", "transitive"
+};
+
+/**
+ * @brief Broadcast a trait update for one relationship type to every shard's thread-local catalog,
+ *        clearing the plan cache and both semantic caches with it: cached plans bake in the
+ *        optimizer flags the traits control, and the semantic caches hold closures computed under
+ *        the old traits.
+ */
+static seastar::future<> apply_algebra_traits(ragedb::Graph& graph, std::string rel_type, std::unordered_set<std::string> props) {
+    return graph.shard.invoke_on_all([rel_type = std::move(rel_type), props = std::move(props)](ragedb::Shard&) {
+        ragedb::gql::GqlVirtualCatalog::local().set_relationship_algebraic_properties(rel_type, props);
+        ragedb::gql::GqlQueryCache::local().clear();
+        ragedb::gql::WccCache::local().clear();
+        ragedb::gql::TransitiveReachabilityCache::local().clear();
+    });
+}
+
 future<std::unique_ptr<seastar::http::reply>>
 Schema::PostRelationshipTypeAlgebraHandler::handle([[maybe_unused]] const seastar::sstring &path, std::unique_ptr<seastar::http::request> req,
                                                   std::unique_ptr<seastar::http::reply> rep) {
@@ -586,7 +625,13 @@ Schema::PostRelationshipTypeAlgebraHandler::handle([[maybe_unused]] const seasta
         parent.graph.Log(req->_method, req->get_url(), req->content);
         std::string rel_type = req->get_path_param(Utilities::TYPE);
 
-        // Parse JSON array of properties from req->content
+        if (parent.graph.shard.local().RelationshipTypesGet().count(rel_type) == 0) {
+            rep->set_status(seastar::http::reply::status_type::bad_request);
+            rep->write_body("json", seastar::json::stream_object("Relationship type '" + rel_type + "' does not exist"));
+            return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
+        }
+
+        // Parse JSON array of trait strings, lowercase them, and reject unknown traits.
         std::unordered_set<std::string> props;
         try {
             simdjson::dom::parser parser;
@@ -595,7 +640,14 @@ Schema::PostRelationshipTypeAlgebraHandler::handle([[maybe_unused]] const seasta
             if (!error && value.type() == simdjson::dom::element_type::ARRAY) {
                 simdjson::dom::array array = value.get_array();
                 for (auto val : array) {
-                    props.insert(std::string(val.get_string().value()));
+                    std::string trait = ragedb::gql::GqlVirtualCatalog::local().normalize_name(std::string(val.get_string().value()));
+                    if (KNOWN_ALGEBRAIC_TRAITS.count(trait) == 0) {
+                        rep->set_status(seastar::http::reply::status_type::bad_request);
+                        rep->write_body("json", seastar::json::stream_object("Unknown algebraic trait '" + trait +
+                            "'. Known traits: reflexive, irreflexive, symmetric, antisymmetric, transitive"));
+                        return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
+                    }
+                    props.insert(std::move(trait));
                 }
             } else {
                 rep->set_status(seastar::http::reply::status_type::bad_request);
@@ -608,12 +660,47 @@ Schema::PostRelationshipTypeAlgebraHandler::handle([[maybe_unused]] const seasta
             return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
         }
 
-        // Broadcast to all reactors to update thread-local GqlVirtualCatalog
-        return parent.graph.shard.invoke_on_all([rel_type, props](ragedb::Shard&) {
-            ragedb::gql::GqlVirtualCatalog::local().set_relationship_algebraic_properties(rel_type, props);
-        }).then([rep = std::move(rep)]() mutable {
+        return apply_algebra_traits(parent.graph, std::move(rel_type), std::move(props))
+        .then([rep = std::move(rep)]() mutable {
             rep->set_status(seastar::http::reply::status_type::ok);
             rep->write_body("json", seastar::json::stream_object("Algebraic properties updated"));
+            return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
+        });
+    }
+    return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
+}
+
+future<std::unique_ptr<seastar::http::reply>>
+Schema::GetRelationshipTypeAlgebraHandler::handle([[maybe_unused]] const seastar::sstring &path, std::unique_ptr<seastar::http::request> req,
+                                                  std::unique_ptr<seastar::http::reply> rep) {
+    bool valid_type = Utilities::validate_parameter(Utilities::TYPE, req, rep, "Invalid type");
+
+    if (valid_type) {
+        std::string rel_type = req->get_path_param(Utilities::TYPE);
+        const auto& all = ragedb::gql::GqlVirtualCatalog::local().get_relationship_algebraic_properties();
+        auto it = all.find(ragedb::gql::GqlVirtualCatalog::local().normalize_name(rel_type));
+        std::vector<std::string> traits;
+        if (it != all.end()) {
+            traits.assign(it->second.begin(), it->second.end());
+            std::sort(traits.begin(), traits.end());
+        }
+        rep->write_body("json", seastar::json::stream_object(traits));
+    }
+    return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
+}
+
+future<std::unique_ptr<seastar::http::reply>>
+Schema::DeleteRelationshipTypeAlgebraHandler::handle([[maybe_unused]] const seastar::sstring &path, std::unique_ptr<seastar::http::request> req,
+                                                     std::unique_ptr<seastar::http::reply> rep) {
+    bool valid_type = Utilities::validate_parameter(Utilities::TYPE, req, rep, "Invalid type");
+
+    if (valid_type) {
+        parent.graph.Log(req->_method, req->get_url());
+        std::string rel_type = req->get_path_param(Utilities::TYPE);
+        return apply_algebra_traits(parent.graph, std::move(rel_type), {})
+        .then([rep = std::move(rep)]() mutable {
+            rep->set_status(seastar::http::reply::status_type::ok);
+            rep->write_body("json", seastar::json::stream_object("Algebraic properties cleared"));
             return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
         });
     }

@@ -17,10 +17,11 @@
 #include "PathTraverser.h"
 #include "JoinHelpers.h"
 #include "Join.h"
-#include "WccCache.h"
-#include "TransitiveReachabilityCache.h"
+#include "../../graph/cache/WccCache.h"
+#include "../../graph/cache/TransitiveReachabilityCache.h"
 #include <seastar/core/when_all.hh>
 #include <seastar/core/thread.hh>
+#include <seastar/core/loop.hh>
 #include <seastar/util/later.hh>
 #include <algorithm>
 #include <unordered_set>
@@ -182,6 +183,48 @@ seastar::future<std::vector<Node>> get_start_nodes(ragedb::Graph& graph, const P
             return final_list;
         });
     });
+}
+
+/**
+ * @brief Fetch one page of candidate start nodes in scan order (task 020). Only filterless scans
+ *        are paged: AllNodesPeered distributes skip/limit across shards from per-shard counts, so
+ *        each page is genuinely bounded (unlike the filtered scan paths, which fetch skip+limit
+ *        rows from every shard per call).
+ */
+static seastar::future<std::vector<Node>> get_start_nodes_page(
+        ragedb::Graph& graph, const PatternNode& node, uint64_t skip, uint64_t count,
+        const ProjectionPruner& pruner) {
+    std::string single_label = "";
+    if (node.label_expr && node.label_expr->kind == LabelExprKind::LITERAL) {
+        single_label = node.label_expr->name;
+    }
+
+    seastar::future<std::vector<Node>> page_fut = single_label.empty()
+        ? graph.shard.local().AllNodesPeered(skip, count)
+        : graph.shard.local().AllNodesPeered(single_label, skip, count);
+
+    return page_fut.then([var = node.variable, pruner](std::vector<Node> page) {
+        if (pruner.should_prune(var)) {
+            auto keys = pruner.get_keys(var);
+            for (auto& n : page) {
+                n.pruneProperties(keys);
+            }
+        }
+        return page;
+    });
+}
+
+/**
+ * @brief Whether the pattern's start-node scan can be driven page by page: an unbound, filterless
+ *        anchor whose candidates come back in plain scan order (no sort, no degree population).
+ *        Anchors with property filters keep the one-shot scan: their filtered fetch paths are not
+ *        memory-bounded per page, and the filters already narrow the scan.
+ */
+static bool start_scan_is_pageable(const PatternNode& node, const std::string& sort_property, bool sort_by_id) {
+    if (!sort_property.empty() || sort_by_id) return false;
+    if (!node.degree_opt_info.empty()) return false;
+    if (!node.properties.empty() || !node.property_filters.empty()) return false;
+    return true;
 }
 
 struct PathHop {
@@ -942,6 +985,58 @@ seastar::future<std::vector<GqlRow>> traverse_path_pattern(ragedb::Graph& graph,
         return traverse_from_relationship_index(graph, prep_pattern, base_row, limit, pruner, path_mode);
     }
 
+    // Edge patterns cannot bound the anchor scan by the LIMIT (a start node may yield no match),
+    // so an unbound anchor used to trigger a full-label materialisation. Drive those scans page by
+    // page instead: expand each page, accumulate matches, and stop as soon as the LIMIT is
+    // satisfied or the scan is exhausted, keeping peak memory at one page plus the results.
+    if (bound_it == base_row.bindings.end() && !prep_pattern.edges.empty() &&
+        start_scan_is_pageable(prep_pattern.nodes[0], sort_property, sort_by_id)) {
+        struct ChunkScanState {
+            std::vector<GqlRow> rows;
+            uint64_t skip = 0;
+            bool exhausted = false;
+        };
+        auto state = std::make_shared<ChunkScanState>();
+        const uint64_t chunk = gql_scan_chunk_size > 0 ? gql_scan_chunk_size : 65536;
+        return seastar::repeat([state, chunk, &graph, prep_pattern, base_row, limit, pruner, path_mode]() {
+            return get_start_nodes_page(graph, prep_pattern.nodes[0], state->skip, chunk, pruner)
+            .then([state, chunk, &graph, prep_pattern, base_row, limit, pruner, path_mode](std::vector<Node> page) {
+                state->exhausted = page.size() < chunk;
+                state->skip += page.size();
+
+                std::vector<GqlRow> initial_rows;
+                for (const auto& node : page) {
+                    if (prep_pattern.nodes[0].label_expr && !matches_label_expr(node.getType(), prep_pattern.nodes[0].label_expr)) {
+                        continue;
+                    }
+                    GqlRow new_row = base_row;
+                    new_row.bindings[prep_pattern.nodes[0].variable] = GqlValue(node);
+                    new_row.bindings["_n_0"] = GqlValue(node);
+                    if (prep_pattern.nodes[0].where_expr && !evaluate_expression(new_row, prep_pattern.nodes[0].where_expr.get()).is_truthy()) {
+                        continue;
+                    }
+                    initial_rows.push_back(std::move(new_row));
+                }
+
+                if (initial_rows.empty()) {
+                    return seastar::make_ready_future<seastar::stop_iteration>(
+                        state->exhausted ? seastar::stop_iteration::yes : seastar::stop_iteration::no);
+                }
+                return traverse_path_pattern_iterative(graph, prep_pattern, 0, std::move(initial_rows), limit, pruner, path_mode)
+                .then([state, limit](std::vector<GqlRow> matched) {
+                    for (auto& r : matched) {
+                        state->rows.push_back(std::move(r));
+                        if (limit > 0 && state->rows.size() >= limit) break;
+                    }
+                    if (limit > 0 && state->rows.size() >= limit) return seastar::stop_iteration::yes;
+                    return state->exhausted ? seastar::stop_iteration::yes : seastar::stop_iteration::no;
+                });
+            });
+        }).then([state]() {
+            return seastar::make_ready_future<std::vector<GqlRow>>(std::move(state->rows));
+        });
+    }
+
     size_t start_node_limit = prep_pattern.edges.empty() ? limit : 0;
     seastar::future<std::vector<Node>> start_nodes_fut = seastar::make_ready_future<std::vector<Node>>();
     if (bound_it != base_row.bindings.end() && bound_it->second.type == GqlValue::NODE) {
@@ -1379,9 +1474,10 @@ seastar::future<std::vector<GqlRow>> traverse_match_statement(ragedb::Graph& gra
             rel_type = edge.label_expr->name;
         }
 
-        seastar::future<std::map<uint64_t, uint64_t>> partitions_fut = seastar::make_ready_future<std::map<uint64_t, uint64_t>>();
-        if (WccCache::local().has(rel_type)) {
-            partitions_fut = seastar::make_ready_future<std::map<uint64_t, uint64_t>>(WccCache::local().get(rel_type));
+        using PartitionPtr = std::shared_ptr<const WccCache::PartitionMap>;
+        seastar::future<PartitionPtr> partitions_fut = seastar::make_ready_future<PartitionPtr>();
+        if (auto cached = WccCache::local().get(rel_type)) {
+            partitions_fut = seastar::make_ready_future<PartitionPtr>(std::move(cached));
         } else {
             // WeaklyConnectedComponentsPeered blocks on cross-shard futures internally (.get0()),
             // which aborts when run on the reactor thread (the HTTP/GQL path, smp>1). Run it inside a
@@ -1389,8 +1485,7 @@ seastar::future<std::vector<GqlRow>> traverse_match_statement(ragedb::Graph& gra
             partitions_fut = seastar::async([&graph, rel_type] {
                 return graph.shard.local().WeaklyConnectedComponentsPeered(rel_type, "", "", "", "", true, false);
             }).then([rel_type](std::map<uint64_t, uint64_t> wcc) {
-                WccCache::local().set(rel_type, std::move(wcc));
-                return WccCache::local().get(rel_type);
+                return WccCache::local().set(rel_type, std::move(wcc));
             });
         }
 
@@ -1419,8 +1514,9 @@ seastar::future<std::vector<GqlRow>> traverse_match_statement(ragedb::Graph& gra
         }
 
         return seastar::when_all_succeed(std::move(partitions_fut), std::move(start_nodes_fut), std::move(end_nodes_fut))
-        .then([&graph, stmt, row, start_node_var, end_node_var, rel_type](std::tuple<std::map<uint64_t, uint64_t>, std::vector<Node>, std::vector<Node>> results) {
-            auto wcc = std::move(std::get<0>(results));
+        .then([&graph, stmt, row, start_node_var, end_node_var, rel_type](std::tuple<PartitionPtr, std::vector<Node>, std::vector<Node>> results) {
+            auto wcc_ptr = std::move(std::get<0>(results));
+            const auto& wcc = *wcc_ptr;
             auto start_nodes = std::move(std::get<1>(results));
             auto end_nodes = std::move(std::get<2>(results));
 
@@ -1503,10 +1599,10 @@ seastar::future<std::vector<GqlRow>> traverse_match_statement(ragedb::Graph& gra
             rel_type = edge.label_expr->name;
         }
 
-        seastar::future<std::map<uint64_t, std::unordered_set<uint64_t>>> descendants_fut =
-            seastar::make_ready_future<std::map<uint64_t, std::unordered_set<uint64_t>>>();
-        if (TransitiveReachabilityCache::local().has(rel_type)) {
-            descendants_fut = seastar::make_ready_future<std::map<uint64_t, std::unordered_set<uint64_t>>>(TransitiveReachabilityCache::local().get(rel_type));
+        using DescendantsPtr = std::shared_ptr<const TransitiveReachabilityCache::DescendantsMap>;
+        seastar::future<DescendantsPtr> descendants_fut = seastar::make_ready_future<DescendantsPtr>();
+        if (auto cached = TransitiveReachabilityCache::local().get(rel_type)) {
+            descendants_fut = seastar::make_ready_future<DescendantsPtr>(std::move(cached));
         } else {
             // ReachablePeered blocks on cross-shard futures internally (.get0()), which aborts on the
             // reactor thread (the HTTP/GQL path, smp>1). Run it inside a seastar::thread where waiting
@@ -1518,12 +1614,12 @@ seastar::future<std::vector<GqlRow>> traverse_match_statement(ragedb::Graph& gra
                 for (const auto& p : pairs) {
                     descendants[p.first].insert(p.second);
                 }
-                TransitiveReachabilityCache::local().set(rel_type, std::move(descendants));
-                return TransitiveReachabilityCache::local().get(rel_type);
+                return TransitiveReachabilityCache::local().set(rel_type, std::move(descendants));
             });
         }
 
-        return descendants_fut.then([&graph, stmt, row, start_node_var, end_node_var, pruner](std::map<uint64_t, std::unordered_set<uint64_t>> descendants) {
+        return descendants_fut.then([&graph, stmt, row, start_node_var, end_node_var, pruner](DescendantsPtr descendants_ptr) {
+        const auto& descendants = *descendants_ptr;
         const auto& start_pat = stmt.pattern.nodes[0];
         const auto& end_pat = stmt.pattern.nodes[1];
         // An unbound endpoint with no label/property/filter constraint would scan the whole graph via
@@ -1578,7 +1674,8 @@ seastar::future<std::vector<GqlRow>> traverse_match_statement(ragedb::Graph& gra
         }
 
         return seastar::when_all_succeed(std::move(start_nodes_fut), std::move(end_nodes_fut))
-        .then([stmt, row, start_node_var, end_node_var, descendants = std::move(descendants)](std::tuple<std::vector<Node>, std::vector<Node>> results) {
+        .then([stmt, row, start_node_var, end_node_var, descendants_ptr](std::tuple<std::vector<Node>, std::vector<Node>> results) {
+            const auto& descendants = *descendants_ptr;
             auto start_nodes = std::move(std::get<0>(results));
             auto end_nodes = std::move(std::get<1>(results));
 

@@ -20,6 +20,7 @@
 #include <string>
 #include <unordered_map>
 #include <map>
+#include <memory>
 #include <cstdint>
 
 namespace ragedb::gql {
@@ -27,11 +28,17 @@ namespace ragedb::gql {
 /**
  * Thread-local cache for Weakly Connected Components (WCC) partition maps.
  * Avoids repeated calculations of Union-Find trees during equivalence class coalescing.
+ * Entries are immutable shared snapshots: readers hold a shared_ptr instead of copying the
+ * (potentially O(V)) map per query row, and invalidation just drops the cache's reference
+ * while in-flight readers keep theirs.
  */
 class WccCache {
+public:
+    using PartitionMap = std::map<uint64_t, uint64_t>;
+
 private:
     // Maps relationship type -> partition map (node_id -> component_id)
-    std::unordered_map<std::string, std::map<uint64_t, uint64_t>> cache;
+    std::unordered_map<std::string, std::shared_ptr<const PartitionMap>> cache;
 
 public:
     static WccCache& local() {
@@ -51,12 +58,16 @@ public:
         return cache.find(rel_type) != cache.end();
     }
 
-    const std::map<uint64_t, uint64_t>& get(const std::string& rel_type) const {
-        return cache.at(rel_type);
+    // Returns the cached snapshot, or nullptr if absent.
+    std::shared_ptr<const PartitionMap> get(const std::string& rel_type) const {
+        auto it = cache.find(rel_type);
+        return it != cache.end() ? it->second : nullptr;
     }
 
-    void set(const std::string& rel_type, std::map<uint64_t, uint64_t>&& partitions) {
-        cache[rel_type] = std::move(partitions);
+    std::shared_ptr<const PartitionMap> set(const std::string& rel_type, PartitionMap&& partitions) {
+        auto snapshot = std::make_shared<const PartitionMap>(std::move(partitions));
+        cache[rel_type] = snapshot;
+        return snapshot;
     }
 };
 

@@ -35,12 +35,16 @@ private:
     bool check(TokenType type) const;
     bool match(TokenType type);
     void consume(TokenType type, const std::string& error_message);
+    std::string consume_identifier(const std::string& error_message);
 
     // Parsing routines
     GqlQuery parse_query();
     GqlQuery parse_union();
     GqlQuery parse_intersect();
     GqlQuery parse_single_query();
+    void parse_return_items(GqlQuery& query, bool require_alias_for_expressions);
+    void parse_order_by(GqlQuery& query);
+    void parse_limit(GqlQuery& query);
     MatchStatement parse_match();
     PathPattern parse_path_pattern();
     PatternNode parse_node_pattern();

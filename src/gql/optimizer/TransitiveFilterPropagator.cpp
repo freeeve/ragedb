@@ -191,7 +191,8 @@ bool are_expressions_equal(const Expression* e1, const Expression* e2) {
         case ExpressionKind::AGGREGATION: {
             const auto* a1 = static_cast<const AggregateExpr*>(e1);
             const auto* a2 = static_cast<const AggregateExpr*>(e2);
-            return a1->fn_kind == a2->fn_kind && are_expressions_equal(a1->expr.get(), a2->expr.get());
+            return a1->fn_kind == a2->fn_kind && a1->distinct == a2->distinct &&
+                   are_expressions_equal(a1->expr.get(), a2->expr.get());
         }
         case ExpressionKind::IS_NULL_CHECK: {
             const auto* n1 = static_cast<const IsNullExpr*>(e1);

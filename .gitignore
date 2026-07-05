@@ -64,4 +64,4 @@ test/cmake-build-release-coverage/
 
 # graphify
 graphify-out/cost.json
-graphify-out/cache/
+graphify-out/cache/__pycache__/

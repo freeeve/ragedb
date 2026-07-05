@@ -144,6 +144,9 @@ struct EdgeRef {
 
 void AntisymmetricLoopCollapser::antisymmetric_loop_pass(GqlQuery& query) {
     if (query.skip_semantic || query.kind != QueryKind::SINGLE) return;
+    // Every rewrite here is keyed on registered algebraic traits; with none registered
+    // the pass cannot fire, so skip the per-match scanning entirely.
+    if (GqlVirtualCatalog::local().get_relationship_algebraic_properties().empty()) return;
 
     bool changed = false;
     do {

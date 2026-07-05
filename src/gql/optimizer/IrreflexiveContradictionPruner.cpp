@@ -84,6 +84,9 @@ bool are_equal_vars(const std::string& v1, const std::string& v2, const std::map
 
 void IrreflexiveContradictionPruner::irreflexive_contradiction_pass(GqlQuery& query) {
     if (query.skip_semantic || query.kind != QueryKind::SINGLE) return;
+    // Every rewrite here is keyed on registered algebraic traits; with none registered
+    // the pass cannot fire, so skip the per-match scanning entirely.
+    if (GqlVirtualCatalog::local().get_relationship_algebraic_properties().empty()) return;
 
     // Collect variable equality class map
     std::map<std::string, std::set<std::string>> node_eq;

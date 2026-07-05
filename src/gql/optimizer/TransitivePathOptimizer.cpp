@@ -15,6 +15,7 @@
  */
 
 #include "TransitivePathOptimizer.h"
+#include "OptimizerUtils.h"
 #include "../GqlVirtualCatalog.h"
 #include <unordered_map>
 #include <unordered_set>
@@ -47,6 +48,9 @@ bool is_reachable_min_depth_2(const std::string& start, const std::string& targe
 
 void TransitivePathOptimizer::transitive_path_pass(GqlQuery& query) {
     if (query.skip_semantic || query.kind != QueryKind::SINGLE) return;
+    // Every rewrite here is keyed on registered algebraic traits; with none registered
+    // the pass cannot fire, so skip the per-match scanning entirely.
+    if (GqlVirtualCatalog::local().get_relationship_algebraic_properties().empty()) return;
 
     // 1. Simplify variable-length paths of transitive relations to single hops
     for (auto& match : query.matches) {
@@ -62,17 +66,8 @@ void TransitivePathOptimizer::transitive_path_pass(GqlQuery& query) {
                     GqlVirtualCatalog::local().has_relationship_algebraic_property(rel_type, "transitive");
 
                 // The transitive-reachability fast path (Case 0.6) only reproduces the original
-                // traversal for a simple, unbounded, RIGHT-directed hop with no edge binding/
-                // predicates, no path variable, and no shortest-path selector. Guard against every
-                // case it would silently get wrong: hop bounds (*2..2, *0..), direction (LEFT/ANY),
-                // edge predicates/variable, a bound path, or a shortest-path selector.
-                bool safe_to_rewrite =
-                    edge.direction == EdgeDirection::RIGHT &&
-                    edge.min_hops == 1 && edge.max_hops == std::numeric_limits<uint64_t>::max() &&
-                    edge.variable.empty() &&
-                    edge.properties.empty() && edge.property_filters.empty() && !edge.where_expr &&
-                    match.path_variable.empty() &&
-                    match.shortest_path_kind == ShortestPathKind::NONE;
+                // traversal for the one safe shape encoded in is_simple_unbounded_right_hop.
+                bool safe_to_rewrite = is_simple_unbounded_right_hop(match, edge);
 
                 if (is_transitive && !is_equivalence && safe_to_rewrite) {
                     match.transitive_reachability_lookup = true;

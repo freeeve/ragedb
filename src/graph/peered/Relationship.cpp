@@ -15,10 +15,34 @@
  */
 
 #include "../Shard.h"
-#include "../../gql/executor/WccCache.h"
-#include "../../gql/executor/TransitiveReachabilityCache.h"
+#include "../cache/AlgebraicTraits.h"
+#include "../cache/WccCache.h"
+#include "../cache/TransitiveReachabilityCache.h"
 
 namespace ragedb {
+
+    seastar::future<> Shard::InvalidateAlgebraicCachesPeered(const std::string &rel_type) {
+        // A type without algebraic traits can have nothing cached for it (the fast paths only
+        // populate the caches for annotated types), so bulk writes skip the all-shard broadcast.
+        // Trait changes clear the caches through the schema algebra endpoint.
+        if (!AlgebraicTraits::local().any(rel_type)) {
+            return seastar::make_ready_future<>();
+        }
+        return container().invoke_on_all([rel_type](Shard&) {
+            ragedb::gql::WccCache::local().invalidate(rel_type);
+            ragedb::gql::TransitiveReachabilityCache::local().invalidate(rel_type);
+        });
+    }
+
+    seastar::future<> Shard::InvalidateAllAlgebraicCachesPeered() {
+        if (AlgebraicTraits::local().all().empty()) {
+            return seastar::make_ready_future<>();
+        }
+        return container().invoke_on_all([](Shard&) {
+            ragedb::gql::WccCache::local().clear();
+            ragedb::gql::TransitiveReachabilityCache::local().clear();
+        });
+    }
 
     namespace {
         void relationship_index_remove_helper(Shard& shard, uint16_t type_id, uint64_t internal_id, const std::string& property, const property_type_t& value) {
@@ -210,12 +234,9 @@ namespace ragedb {
         };
         return fut().then([this, rel_type](uint64_t rel_id) {
             if (rel_id > 0) {
-                (void)container().invoke_on_all([rel_type](Shard&) {
-                    ragedb::gql::WccCache::local().invalidate(rel_type);
-                    ragedb::gql::TransitiveReachabilityCache::local().invalidate(rel_type);
-                });
+                return InvalidateAlgebraicCachesPeered(rel_type).then([rel_id] { return rel_id; });
             }
-            return rel_id;
+            return seastar::make_ready_future<uint64_t>(rel_id);
         });
     }
 
@@ -320,12 +341,9 @@ namespace ragedb {
         };
         return fut().then([this, rel_type](uint64_t rel_id) {
             if (rel_id > 0) {
-                (void)container().invoke_on_all([rel_type](Shard&) {
-                    ragedb::gql::WccCache::local().invalidate(rel_type);
-                    ragedb::gql::TransitiveReachabilityCache::local().invalidate(rel_type);
-                });
+                return InvalidateAlgebraicCachesPeered(rel_type).then([rel_id] { return rel_id; });
             }
-            return rel_id;
+            return seastar::make_ready_future<uint64_t>(rel_id);
         });
     }
 
@@ -414,12 +432,9 @@ namespace ragedb {
         };
         return fut().then([this, rel_type](uint64_t rel_id) {
             if (rel_id > 0) {
-                (void)container().invoke_on_all([rel_type](Shard&) {
-                    ragedb::gql::WccCache::local().invalidate(rel_type);
-                    ragedb::gql::TransitiveReachabilityCache::local().invalidate(rel_type);
-                });
+                return InvalidateAlgebraicCachesPeered(rel_type).then([rel_id] { return rel_id; });
             }
-            return rel_id;
+            return seastar::make_ready_future<uint64_t>(rel_id);
         });
     }
 
@@ -471,13 +486,9 @@ namespace ragedb {
         };
         return fut().then([this, rel_type_id](uint64_t rel_id) {
             if (rel_id > 0) {
-                std::string rel_type = relationship_types.getType(rel_type_id);
-                (void)container().invoke_on_all([rel_type](Shard&) {
-                    ragedb::gql::WccCache::local().invalidate(rel_type);
-                    ragedb::gql::TransitiveReachabilityCache::local().invalidate(rel_type);
-                });
+                return InvalidateAlgebraicCachesPeered(relationship_types.getType(rel_type_id)).then([rel_id] { return rel_id; });
             }
-            return rel_id;
+            return seastar::make_ready_future<uint64_t>(rel_id);
         });
     }
 
@@ -566,12 +577,9 @@ namespace ragedb {
         };
         return fut().then([this, rel_type](uint64_t rel_id) {
             if (rel_id > 0) {
-                (void)container().invoke_on_all([rel_type](Shard&) {
-                    ragedb::gql::WccCache::local().invalidate(rel_type);
-                    ragedb::gql::TransitiveReachabilityCache::local().invalidate(rel_type);
-                });
+                return InvalidateAlgebraicCachesPeered(rel_type).then([rel_id] { return rel_id; });
             }
-            return rel_id;
+            return seastar::make_ready_future<uint64_t>(rel_id);
         });
     }
 
@@ -624,13 +632,9 @@ namespace ragedb {
         };
         return fut().then([this, rel_type_id](uint64_t rel_id) {
             if (rel_id > 0) {
-                std::string rel_type = relationship_types.getType(rel_type_id);
-                (void)container().invoke_on_all([rel_type](Shard&) {
-                    ragedb::gql::WccCache::local().invalidate(rel_type);
-                    ragedb::gql::TransitiveReachabilityCache::local().invalidate(rel_type);
-                });
+                return InvalidateAlgebraicCachesPeered(relationship_types.getType(rel_type_id)).then([rel_id] { return rel_id; });
             }
-            return rel_id;
+            return seastar::make_ready_future<uint64_t>(rel_id);
         });
     }
 
@@ -659,14 +663,10 @@ namespace ragedb {
                 return container().invoke_on(shard_id2, [rel_type_incoming_node_id, external_id] (Shard &local_shard) {
                     return local_shard.RelationshipRemoveIncoming(rel_type_incoming_node_id.first, external_id, rel_type_incoming_node_id.second);
                 }).then([this, rel_type_id](bool removed) {
-                    if (removed) {
-                        std::string rel_type = relationship_types.getType(rel_type_id);
-                        (void)container().invoke_on_all([rel_type](Shard&) {
-                            ragedb::gql::WccCache::local().invalidate(rel_type);
-                            ragedb::gql::TransitiveReachabilityCache::local().invalidate(rel_type);
-                        });
-                    }
-                    return removed;
+                    // Invalidate unconditionally: the removal chain has already deleted the
+                    // outgoing half, so the topology changed regardless of the incoming result.
+                    return InvalidateAlgebraicCachesPeered(relationship_types.getType(rel_type_id))
+                        .then([removed] { return removed; });
                 });
             });
         });

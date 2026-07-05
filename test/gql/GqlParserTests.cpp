@@ -542,3 +542,41 @@ TEST_CASE("GQL Parser parses VIEW and CONSTRAINT DDL", "[gql_parser]") {
 
 
 
+
+TEST_CASE("WITH items and reserved-word identifiers (task 019)", "[gql_parser][task019]") {
+    SECTION("non-variable WITH items require an alias") {
+        REQUIRE_THROWS_WITH(
+            GqlParser::parse("MATCH (p:Person) WITH p.name MATCH (q:Person) RETURN q"),
+            Catch::Contains("aliased"));
+    }
+
+    SECTION("aliased expression and plain variable WITH items parse") {
+        auto q = GqlParser::parse("MATCH (p:Person) WITH p, p.name AS name RETURN name");
+        REQUIRE(q.with_segments.size() == 1);
+        REQUIRE(q.with_segments[0]->returns.size() == 2);
+        REQUIRE(q.with_segments[0]->returns[1].alias == "name");
+    }
+
+    SECTION("reserved words are usable as property names and aliases") {
+        auto q1 = GqlParser::parse("MATCH (n:Doc) RETURN n.with");
+        REQUIRE(q1.returns.size() == 1);
+
+        auto q2 = GqlParser::parse("MATCH (n:Doc) RETURN n.name AS with");
+        REQUIRE(q2.returns[0].alias == "with");
+
+        auto q3 = GqlParser::parse("MATCH (n:Doc) WITH n.with AS with RETURN with");
+        REQUIRE(q3.with_segments.size() == 1);
+        REQUIRE(q3.with_segments[0]->returns[0].alias == "with");
+    }
+}
+
+TEST_CASE("EXISTS accepts an openCypher-style bare pattern subquery (task 018)", "[gql_parser][task018]") {
+    auto q = GqlParser::parse(
+        "MATCH (a:Person) WHERE EXISTS { (a)-[:KNOWS]->(b:Person) } RETURN a.name");
+    REQUIRE(q.where_expr != nullptr);
+
+    auto q2 = GqlParser::parse(
+        "MATCH (m:Message)<-[:REPLY_OF]-(c) MATCH (c)-[:HAS_CREATOR]->(x:Person) "
+        "WHERE EXISTS { (x)-[:KNOWS]-(y:Person {id: 1}) } RETURN x.id");
+    REQUIRE(q2.matches.size() == 2);
+}

@@ -526,19 +526,59 @@ void GqlTypechecker::check_return_item(const ReturnItem& return_item) {
     }
 }
 
+/**
+ * @brief Derive the variable environment a completed WITH segment pipes into the next one: each
+ *        projected column becomes a binding under its output name (alias, or the variable's own
+ *        name). Called after the segment was checked, so its expressions are known to be valid.
+ */
+std::map<std::string, VariableSchema> GqlTypechecker::project_returns(const GqlQuery& segment) {
+    std::map<std::string, VariableSchema> projected;
+    for (const auto& item : segment.returns) {
+        if (!item.expr) continue;
+        std::string source_var;
+        if (item.expr->kind == ExpressionKind::VARIABLE) {
+            source_var = static_cast<const VariableExpr*>(item.expr.get())->name;
+        }
+        std::string name = item.alias ? *item.alias : source_var;
+        if (name.empty()) continue;  // non-variable items without alias are rejected at parse time
+
+        VariableSchema schema;
+        if (!source_var.empty()) {
+            auto it = env.find(source_var);
+            if (it != env.end()) schema = it->second;
+        } else {
+            schema.type = check_expression(*item.expr);
+        }
+        projected[name] = schema;
+    }
+    return projected;
+}
+
 void GqlTypechecker::check_query(const GqlQuery& query) {
     if (query.clear_cache) {
         return;
     }
 
-    // WITH-pipeline queries carry variables across segment horizons (a later segment references
-    // variables projected by an earlier WITH, not bound by its own MATCH). The typechecker is not
-    // WITH-aware and would flag those piped variables as unbound; such queries are validated during
-    // execution instead.
+    // WITH-pipeline queries are checked segment by segment: each segment sees only the bindings
+    // the previous segment projected (plus whatever its own MATCH binds), mirroring execution.
     if (!query.with_segments.empty()) {
+        std::map<std::string, VariableSchema> piped;
+        for (const auto& seg : query.with_segments) {
+            GqlTypechecker seg_tc(graph);
+            seg_tc.env = std::move(piped);
+            seg_tc.check_segment_body(*seg);
+            piped = seg_tc.project_returns(*seg);
+        }
+        GqlTypechecker final_tc(graph);
+        final_tc.env = std::move(piped);
+        final_tc.check_segment_body(query);
         return;
     }
 
+    check_segment_body(query);
+}
+
+void GqlTypechecker::check_segment_body(const GqlQuery& query) {
     if (query.kind != QueryKind::SINGLE) {
         if (query.left) {
             check_query(*query.left);

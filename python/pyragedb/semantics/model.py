@@ -5,6 +5,8 @@ from .concept import Concept, AttributeRef
 from .relationship import Property, Relationship
 from .fragment import Fragment, Condition, AndCondition, OrCondition
 
+REQUEST_TIMEOUT_SECONDS = 10
+
 _active_model = None
 
 class Model:
@@ -42,11 +44,12 @@ class Model:
     @property
     def alglib(self):
         """
-        Exposes algebraic relation properties helper module.
+        Exposes algebraic relation properties helpers bound to THIS model, so traits sync to this
+        model's host/graph rather than whichever model was constructed last.
         Matches RelationalAI Model.alglib library API.
         """
         from .std import alglib
-        return alglib
+        return alglib.ModelAlglib(self)
 
 
     def Concept(self, name, identify_by=None, extends=None, identity_includes_type=False):
@@ -60,7 +63,7 @@ class Model:
         self._concept_index[name] = concept
         # Automatically register concept type in database schema
         try:
-            requests.post(f"{self.host}/db/{self.graph}/schema/nodes/{name}")
+            requests.post(f"{self.host}/db/{self.graph}/schema/nodes/{name}", timeout=REQUEST_TIMEOUT_SECONDS)
         except Exception:
             pass  # Ignored if server not running during definition
 
@@ -73,7 +76,7 @@ class Model:
                 
                 if is_relationship:
                     try:
-                        requests.post(f"{self.host}/db/{self.graph}/schema/relationships/{prop_name.upper()}")
+                        requests.post(f"{self.host}/db/{self.graph}/schema/relationships/{prop_name.upper()}", timeout=REQUEST_TIMEOUT_SECONDS)
                     except Exception:
                         pass
                 else:
@@ -90,7 +93,7 @@ class Model:
                     else:
                         db_type = "string"
                     try:
-                        requests.post(f"{self.host}/db/{self.graph}/schema/nodes/{name}/properties/{prop_name}/{db_type}")
+                        requests.post(f"{self.host}/db/{self.graph}/schema/nodes/{name}/properties/{prop_name}/{db_type}", timeout=REQUEST_TIMEOUT_SECONDS)
                     except Exception:
                         pass
         return concept
@@ -118,7 +121,7 @@ class Model:
 
             # Register in database schema
             try:
-                requests.post(f"{self.host}/db/{self.graph}/schema/nodes/{prop.subject}/properties/{prop.name}/{db_type}")
+                requests.post(f"{self.host}/db/{self.graph}/schema/nodes/{prop.subject}/properties/{prop.name}/{db_type}", timeout=REQUEST_TIMEOUT_SECONDS)
             except Exception:
                 pass
         return prop
@@ -134,7 +137,7 @@ class Model:
 
             # Register relationship type in database schema
             try:
-                requests.post(f"{self.host}/db/{self.graph}/schema/relationships/{rel.name.upper()}")
+                requests.post(f"{self.host}/db/{self.graph}/schema/relationships/{rel.name.upper()}", timeout=REQUEST_TIMEOUT_SECONDS)
             except Exception:
                 pass
         return rel
@@ -461,7 +464,7 @@ class Model:
         # Register in database as a constraint
         ddl = f"CREATE CONSTRAINT {name} AS {gql}"
         try:
-            r = requests.post(f"{self.host}/db/{self.graph}/gql", data=ddl)
+            r = requests.post(f"{self.host}/db/{self.graph}/gql", data=ddl, timeout=REQUEST_TIMEOUT_SECONDS)
             if r.status_code != 200:
                 raise RuntimeError(f"Failed to register constraint: {r.text}")
         except Exception:
@@ -585,7 +588,7 @@ class Model:
             is_rel = expr.name in ("jaccard_similarity", "cosine_similarity", "adamic_adar", "preferential_attachment", "reachable", "distance", "triangle", "unique_triangle")
             if is_rel:
                 try:
-                    requests.post(f"{self.host}/db/{self.graph}/schema/relationships/{prop_name.upper()}")
+                    requests.post(f"{self.host}/db/{self.graph}/schema/relationships/{prop_name.upper()}", timeout=REQUEST_TIMEOUT_SECONDS)
                 except Exception:
                     pass
             else:
@@ -601,7 +604,7 @@ class Model:
                 
                 for t_name in node_types:
                     try:
-                        requests.post(f"{self.host}/db/{self.graph}/schema/nodes/{t_name}/properties/{prop_name}/{db_type}")
+                        requests.post(f"{self.host}/db/{self.graph}/schema/nodes/{t_name}/properties/{prop_name}/{db_type}", timeout=REQUEST_TIMEOUT_SECONDS)
                     except Exception:
                         pass
 
@@ -609,13 +612,13 @@ class Model:
             lua_script = generate_lua_script(graph, prop_name, expr)
 
             # 3. Post Lua script to RageDB server
-            r = requests.post(f"{self.host}/db/{self.graph}/lua", data=lua_script)
+            r = requests.post(f"{self.host}/db/{self.graph}/lua", data=lua_script, timeout=REQUEST_TIMEOUT_SECONDS)
             if r.status_code != 200:
                 raise RuntimeError(f"Failed to execute graph algorithm Lua script on server: {r.text}")
 
     def exec_gql(self, query):
         self._evaluate_pending_graph_algorithms()
-        r = requests.post(f"{self.host}/db/{self.graph}/gql", data=query)
+        r = requests.post(f"{self.host}/db/{self.graph}/gql", data=query, timeout=REQUEST_TIMEOUT_SECONDS)
         if r.status_code != 200:
             raise RuntimeError(f"GQL Error: {r.text}")
         return r.text

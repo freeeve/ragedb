@@ -398,14 +398,24 @@ TEST_CASE("GQL LIMIT with a residual WHERE returns the full LIMIT", "[gql_execut
             "{\"name\": \"hi" + std::to_string(i) + "\", \"age\": 50}").get();
     }
 
+    auto count_rows = [](const std::string& r) {
+        size_t c = 0, pos = 0;
+        while ((pos = r.find("\"name\":", pos)) != std::string::npos) { c++; pos += 7; }
+        return c;
+    };
+
+    // Sanity: without a LIMIT the residual predicate must match all 5 (isolates query/data issues).
+    std::string res_nolimit = GqlExecutor::execute(graph,
+        std::string("MATCH (n:Person) WHERE n.age > 25 OR n.name = 'zzz' RETURN n.name AS name")).get();
+    INFO("no-limit result: " << res_nolimit);
+    REQUIRE(count_rows(res_nolimit) == 5);
+
     // The OR keeps the predicate residual (not pushed into the scan). With a pushed LIMIT the scan
     // stops at the first 5 (non-matching) rows and under-returns; the fix scans all then truncates.
-    std::string query = "MATCH (n:Person) WHERE n.age > 25 OR n.name = 'zzz' RETURN n.name AS name LIMIT 5";
-    std::string res = GqlExecutor::execute(graph, query).get();
-
-    size_t count = 0, pos = 0;
-    while ((pos = res.find("\"name\":", pos)) != std::string::npos) { count++; pos += 7; }
-    REQUIRE(count == 5);
+    std::string res = GqlExecutor::execute(graph,
+        std::string("MATCH (n:Person) WHERE n.age > 25 OR n.name = 'zzz' RETURN n.name AS name LIMIT 5")).get();
+    INFO("limit-5 result: " << res);
+    REQUIRE(count_rows(res) == 5);
 
     graph.Stop().get();
 }

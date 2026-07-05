@@ -78,6 +78,44 @@ TEST_CASE("GQL Optimizer Phase 23: Transitive Path Pruning", "[gql_optimizer][al
     }
 }
 
+// Guards (task 003): the transitive-reachability rewrite must NOT fire for patterns the fast path
+// gets wrong, and shortcut pruning must not drop constrained/bound matches.
+TEST_CASE("GQL Optimizer Phase 23: transitive rewrite guards", "[gql_optimizer][alglib][task003]") {
+    GqlVirtualCatalog::local().clear();
+    GqlVirtualCatalog::local().set_relationship_algebraic_properties("ancestor_of", {"transitive"});
+
+    SECTION("bounded hops *2..2 are not rewritten") {
+        auto q = GqlParser::parse("MATCH (a)-[:ancestor_of*2..2]->(b) RETURN a, b");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.matches[0].transitive_reachability_lookup == false);
+    }
+    SECTION("zero-lower-bound *0.. is not rewritten") {
+        auto q = GqlParser::parse("MATCH (a)-[:ancestor_of*0..]->(b) RETURN a, b");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.matches[0].transitive_reachability_lookup == false);
+    }
+    SECTION("LEFT direction is not rewritten") {
+        auto q = GqlParser::parse("MATCH (a)<-[:ancestor_of*]-(b) RETURN a, b");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.matches[0].transitive_reachability_lookup == false);
+    }
+    SECTION("a bound edge variable is not rewritten") {
+        auto q = GqlParser::parse("MATCH (a)-[r:ancestor_of*]->(b) RETURN r");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.matches[0].transitive_reachability_lookup == false);
+    }
+    SECTION("the safe *1.. case is still rewritten") {
+        auto q = GqlParser::parse("MATCH (a)-[:ancestor_of*]->(b) RETURN a, b");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.matches[0].transitive_reachability_lookup == true);
+    }
+    SECTION("a shortcut carrying an edge variable is not pruned") {
+        auto q = GqlParser::parse("MATCH (x)-[:ancestor_of]->(y) MATCH (y)-[:ancestor_of]->(z) MATCH (x)-[e:ancestor_of]->(z) RETURN x, y, z, e");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.matches.size() == 3);
+    }
+}
+
 TEST_CASE("GQL Optimizer Phase 24: Irreflexive Contradiction Pruner", "[gql_optimizer][alglib]") {
     GqlVirtualCatalog::local().clear();
     GqlVirtualCatalog::local().set_relationship_algebraic_properties("parent_of", {"irreflexive"});

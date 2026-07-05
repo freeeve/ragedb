@@ -1523,35 +1523,64 @@ seastar::future<std::vector<GqlRow>> traverse_match_statement(ragedb::Graph& gra
             });
         }
 
+        return descendants_fut.then([&graph, stmt, row, start_node_var, end_node_var, pruner](std::map<uint64_t, std::unordered_set<uint64_t>> descendants) {
+        const auto& start_pat = stmt.pattern.nodes[0];
+        const auto& end_pat = stmt.pattern.nodes[1];
+        // An unbound endpoint with no label/property/filter constraint would scan the whole graph via
+        // get_start_nodes. Derive its candidates from the reachability map instead (start side = the
+        // map's keys, end side = the reachable set), bounding memory by the relation's node set rather
+        // than the entire graph. Labeled/constrained endpoints keep get_start_nodes (bounded by label).
+        bool start_unconstrained = !start_pat.label_expr && start_pat.properties.empty() &&
+            start_pat.property_filters.empty() && !start_pat.where_expr;
+        bool end_unconstrained = !end_pat.label_expr && end_pat.properties.empty() &&
+            end_pat.property_filters.empty() && !end_pat.where_expr;
+
         seastar::future<std::vector<Node>> start_nodes_fut = seastar::make_ready_future<std::vector<Node>>();
+        bool start_resolved = false;
         if (!start_node_var.empty()) {
             auto bound_start_it = row.bindings.find(start_node_var);
             if (bound_start_it != row.bindings.end() && bound_start_it->second.type == GqlValue::NODE) {
                 start_nodes_fut = seastar::make_ready_future<std::vector<Node>>(std::vector<Node>{ *bound_start_it->second.node });
+                start_resolved = true;
+            }
+        }
+        if (!start_resolved) {
+            if (start_unconstrained) {
+                std::vector<uint64_t> ids;
+                ids.reserve(descendants.size());
+                for (const auto& kv : descendants) ids.push_back(kv.first);
+                start_nodes_fut = graph.shard.local().NodesGetPeered(ids);
             } else {
                 start_nodes_fut = get_start_nodes(graph, stmt.pattern.nodes[0], 0, pruner);
             }
-        } else {
-            start_nodes_fut = get_start_nodes(graph, stmt.pattern.nodes[0], 0, pruner);
         }
 
         seastar::future<std::vector<Node>> end_nodes_fut = seastar::make_ready_future<std::vector<Node>>();
+        bool end_resolved = false;
         if (!end_node_var.empty()) {
             auto bound_end_it = row.bindings.find(end_node_var);
             if (bound_end_it != row.bindings.end() && bound_end_it->second.type == GqlValue::NODE) {
                 end_nodes_fut = seastar::make_ready_future<std::vector<Node>>(std::vector<Node>{ *bound_end_it->second.node });
+                end_resolved = true;
+            }
+        }
+        if (!end_resolved) {
+            if (end_unconstrained) {
+                std::unordered_set<uint64_t> end_id_set;
+                for (const auto& kv : descendants) {
+                    for (uint64_t d : kv.second) end_id_set.insert(d);
+                }
+                std::vector<uint64_t> ids(end_id_set.begin(), end_id_set.end());
+                end_nodes_fut = graph.shard.local().NodesGetPeered(ids);
             } else {
                 end_nodes_fut = get_start_nodes(graph, stmt.pattern.nodes[1], 0, pruner);
             }
-        } else {
-            end_nodes_fut = get_start_nodes(graph, stmt.pattern.nodes[1], 0, pruner);
         }
 
-        return seastar::when_all_succeed(std::move(descendants_fut), std::move(start_nodes_fut), std::move(end_nodes_fut))
-        .then([&graph, stmt, row, start_node_var, end_node_var](std::tuple<std::map<uint64_t, std::unordered_set<uint64_t>>, std::vector<Node>, std::vector<Node>> results) {
-            auto descendants = std::move(std::get<0>(results));
-            auto start_nodes = std::move(std::get<1>(results));
-            auto end_nodes = std::move(std::get<2>(results));
+        return seastar::when_all_succeed(std::move(start_nodes_fut), std::move(end_nodes_fut))
+        .then([stmt, row, start_node_var, end_node_var, descendants = std::move(descendants)](std::tuple<std::vector<Node>, std::vector<Node>> results) {
+            auto start_nodes = std::move(std::get<0>(results));
+            auto end_nodes = std::move(std::get<1>(results));
 
             std::vector<Node> valid_starts;
             for (const auto& node : start_nodes) {
@@ -1615,6 +1644,7 @@ seastar::future<std::vector<GqlRow>> traverse_match_statement(ragedb::Graph& gra
             }
 
             return out_rows;
+        });
         });
     }
 

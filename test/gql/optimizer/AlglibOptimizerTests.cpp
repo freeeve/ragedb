@@ -215,3 +215,31 @@ TEST_CASE("GQL Optimizer Phase 26: Equivalence Class Coalescing", "[gql_optimize
     REQUIRE(match.pattern.edges[0].min_hops == 1);
     REQUIRE(match.pattern.edges[0].max_hops == 1);
 }
+
+// Guards (task 004): the equivalence-partition rewrite must NOT fire for patterns the fast path
+// gets wrong (bounded hops, direction, bound edge variable, predicates, path var, shortest).
+TEST_CASE("GQL Optimizer Phase 26: equivalence rewrite guards", "[gql_optimizer][alglib][task004]") {
+    GqlVirtualCatalog::local().clear();
+    GqlVirtualCatalog::local().set_relationship_algebraic_properties("same_group", {"reflexive", "symmetric", "transitive"});
+
+    SECTION("bounded hops *2..3 are not rewritten") {
+        auto q = GqlParser::parse("MATCH (a)-[:same_group*2..3]->(b) RETURN a, b");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.matches[0].equivalence_partition_lookup == false);
+    }
+    SECTION("LEFT direction is not rewritten") {
+        auto q = GqlParser::parse("MATCH (a)<-[:same_group*]-(b) RETURN a, b");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.matches[0].equivalence_partition_lookup == false);
+    }
+    SECTION("a bound edge variable is not rewritten") {
+        auto q = GqlParser::parse("MATCH (a)-[r:same_group*]->(b) RETURN r");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.matches[0].equivalence_partition_lookup == false);
+    }
+    SECTION("the safe *1.. case is still rewritten") {
+        auto q = GqlParser::parse("MATCH (a)-[:same_group*]->(b) RETURN a, b");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.matches[0].equivalence_partition_lookup == true);
+    }
+}

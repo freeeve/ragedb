@@ -20,8 +20,8 @@
 #include "../../src/gql/GqlOptimizer.h"
 #include "../../src/gql/GqlExecutor.h"
 #include "../../src/gql/GqlVirtualCatalog.h"
-#include "../../src/gql/executor/WccCache.h"
-#include "../../src/gql/executor/TransitiveReachabilityCache.h"
+#include "../../src/graph/cache/WccCache.h"
+#include "../../src/graph/cache/TransitiveReachabilityCache.h"
 
 using namespace ragedb;
 using namespace ragedb::gql;
@@ -382,7 +382,7 @@ TEST_CASE("GQL Execution Read Tests", "[gql_executor_read]") {
 
 // NOTE: the transitive/equivalence fast paths execute via seastar::async (task 002) and cannot be
 // driven from inside the Catch harness (which itself runs the session in a seastar::async), so 016 is
-// verified on the live server instead -- the unlabeled transitive query no longer OOMs and bounded
+// verified on the live server instead--the unlabeled transitive query no longer OOMs and bounded
 // queries still return the correct closure.
 
 TEST_CASE("GQL LIMIT with a residual WHERE returns the full LIMIT", "[gql_executor_read][task009]") {

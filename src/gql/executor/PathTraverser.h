@@ -41,6 +41,13 @@
  */
 namespace ragedb::gql {
 
+/**
+ * @brief Page size for chunked start-node scans: edge patterns scan the label in pages of this
+ *        many nodes instead of materialising the whole label up front (task 020). Tests shrink it
+ *        to exercise chunk boundaries on small graphs.
+ */
+inline size_t gql_scan_chunk_size = 65536;
+
 seastar::future<std::vector<Node>> get_start_nodes(
     ragedb::Graph& graph,
     const PatternNode& node,

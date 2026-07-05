@@ -24,13 +24,13 @@ using namespace ragedb;
 using namespace ragedb::gql;
 
 /*
- * Grouped aggregation over a multi-hop expansion -- the shape that OOMs at scale (task 015):
+ * Grouped aggregation over a multi-hop expansion--the shape that OOMs at scale (task 015):
  *   MATCH (c:Comment)-[:HAS_CREATOR]->(p:Person) RETURN p.name, count(c) ...
  * The executor flattens the whole (comment, person) expansion before grouping, so at SF1 scale
  * (~1.7M comments) it exhausts memory. These tests pin the CORRECT small-graph behaviour so a
  * streaming/factorized aggregate rewrite can be proven not to change results.
  *
- * Data: three people, six comments -- Alice authored 3, Bob 2, Carol 1; comment scores are
+ * Data: three people, six comments--Alice authored 3, Bob 2, Carol 1; comment scores are
  * Alice {1,2,3}, Bob {4,5}, Carol {10}.
  */
 static void populate_expansion_graph(Graph& graph) {

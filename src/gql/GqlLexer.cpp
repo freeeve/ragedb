@@ -295,6 +295,7 @@ std::vector<Token> GqlLexer::tokenize(const std::string& input) {
             else if (upper_name == "OPTIONAL") type = TokenType::OPTIONAL;
             else if (upper_name == "WHERE") type = TokenType::WHERE;
             else if (upper_name == "RETURN") type = TokenType::RETURN;
+            else if (upper_name == "WITH") type = TokenType::WITH;
             else if (upper_name == "DISTINCT") type = TokenType::DISTINCT;
             else if (upper_name == "LIMIT") type = TokenType::LIMIT;
             else if (upper_name == "ASC" || upper_name == "ASCENDING") type = TokenType::ASC;

@@ -243,3 +243,46 @@ TEST_CASE("GQL Optimizer Phase 26: equivalence rewrite guards", "[gql_optimizer]
         REQUIRE(q.matches[0].equivalence_partition_lookup == true);
     }
 }
+
+// Task 001: the antisymmetric collapser must preserve labels/constraints/bound edge variables and
+// detect the irreflexive contradiction, while still collapsing the unconstrained case.
+TEST_CASE("GQL Optimizer Phase 25: collapser preserves constraints", "[gql_optimizer][alglib][task001]") {
+    GqlVirtualCatalog::local().clear();
+
+    SECTION("a labeled single-node match is not pruned away") {
+        auto q = GqlParser::parse("MATCH (x:Person) MATCH (x)-[:KNOWS]->(y) RETURN x, y");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.matches.size() == 2);
+    }
+
+    SECTION("labels survive an antisymmetric+reflexive collapse (AND, not dropped)") {
+        GqlVirtualCatalog::local().set_relationship_algebraic_properties("po", {"antisymmetric", "reflexive"});
+        auto q = GqlParser::parse("MATCH (a:A)-[:po]->(b:B)-[:po]->(a) RETURN a");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.matches.size() == 1);
+        REQUIRE(q.matches[0].pattern.nodes[0].label_expr != nullptr);
+        REQUIRE(q.matches[0].pattern.nodes[0].label_expr->kind == LabelExprKind::AND);
+    }
+
+    SECTION("a collapse that would drop a bound edge variable is refused") {
+        GqlVirtualCatalog::local().set_relationship_algebraic_properties("po", {"antisymmetric"});
+        auto q = GqlParser::parse("MATCH (a)-[r:po]->(b)-[r2:po]->(a) RETURN a, r, r2");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.matches[0].pattern.edges.size() == 2);
+    }
+
+    SECTION("an antisymmetric + irreflexive 2-cycle is a contradiction (no_op)") {
+        GqlVirtualCatalog::local().set_relationship_algebraic_properties("po", {"antisymmetric", "irreflexive"});
+        auto q = GqlParser::parse("MATCH (a)-[:po]->(b)-[:po]->(a) RETURN a");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.no_op == true);
+    }
+
+    SECTION("positive control: an unconstrained antisymmetric 2-cycle still collapses") {
+        GqlVirtualCatalog::local().set_relationship_algebraic_properties("po", {"antisymmetric"});
+        auto q = GqlParser::parse("MATCH (a)-[:po]->(b)-[:po]->(a) RETURN a, b");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.matches.size() == 1);
+        REQUIRE(q.matches[0].pattern.edges.size() == 1);
+    }
+}

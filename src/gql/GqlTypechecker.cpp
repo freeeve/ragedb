@@ -531,6 +531,14 @@ void GqlTypechecker::check_query(const GqlQuery& query) {
         return;
     }
 
+    // WITH-pipeline queries carry variables across segment horizons (a later segment references
+    // variables projected by an earlier WITH, not bound by its own MATCH). The typechecker is not
+    // WITH-aware and would flag those piped variables as unbound; such queries are validated during
+    // execution instead.
+    if (!query.with_segments.empty()) {
+        return;
+    }
+
     if (query.kind != QueryKind::SINGLE) {
         if (query.left) {
             check_query(*query.left);

@@ -49,7 +49,6 @@ bool matches_label_expr(const std::string& actual_type, const std::shared_ptr<La
 }
 
 seastar::future<std::vector<Node>> get_start_nodes(ragedb::Graph& graph, const PatternNode& node, size_t limit, const ProjectionPruner& pruner, std::string sort_property, bool sort_ascending, bool sort_by_id) {
-    size_t scan_limit = (limit > 0) ? limit : 100000;
     std::string single_label = "";
     if (node.label_expr && node.label_expr->kind == LabelExprKind::LITERAL) {
         single_label = node.label_expr->name;
@@ -66,49 +65,6 @@ seastar::future<std::vector<Node>> get_start_nodes(ragedb::Graph& graph, const P
     }
     for (const auto& filter : node.property_filters) {
         all_filters.push_back({filter.property, filter.op, filter.value});
-    }
-    
-    seastar::future<std::vector<Node>> fut = seastar::make_ready_future<std::vector<Node>>();
-    if (all_filters.size() > 1 && !single_label.empty()) {
-        std::vector<seastar::future<std::vector<Node>>> futs;
-        for (const auto& filter : all_filters) {
-            futs.push_back(graph.shard.local().FindNodesPeered(single_label, filter.property, filter.op, filter.value, 0, scan_limit));
-        }
-        fut = seastar::when_all_succeed(futs.begin(), futs.end())
-        .then([scan_limit](std::vector<std::vector<Node>> node_lists) {
-            if (node_lists.empty()) return std::vector<Node>{};
-            
-            std::vector<std::vector<uint64_t>> id_lists;
-            for (const auto& list : node_lists) {
-                std::vector<uint64_t> ids;
-                for (const auto& n : list) {
-                    ids.push_back(n.getId());
-                }
-                std::sort(ids.begin(), ids.end());
-                id_lists.push_back(std::move(ids));
-            }
-            
-            std::vector<uint64_t> intersected_ids = leapfrogJoin(id_lists);
-            
-            std::unordered_set<uint64_t> valid_ids(intersected_ids.begin(), intersected_ids.end());
-            std::vector<Node> result;
-            for (const auto& n : node_lists[0]) {
-                if (valid_ids.count(n.getId())) {
-                    result.push_back(n);
-                    if (result.size() >= scan_limit) {
-                        break;
-                    }
-                }
-            }
-            return result;
-        });
-    } else if (all_filters.size() == 1 && !single_label.empty()) {
-        const auto& filter = all_filters[0];
-        fut = graph.shard.local().FindNodesPeered(single_label, filter.property, filter.op, filter.value, 0, scan_limit);
-    } else if (!single_label.empty()) {
-        fut = graph.shard.local().AllNodesPeered(single_label, 0, scan_limit);
-    } else {
-        fut = graph.shard.local().AllNodesPeered(0, scan_limit);
     }
 
     auto sort_nodes = [sort_property, sort_ascending, sort_by_id](std::vector<Node>& list) {
@@ -129,7 +85,60 @@ seastar::future<std::vector<Node>> get_start_nodes(ragedb::Graph& graph, const P
         }
     };
 
-    return fut.then([&graph, degree_opt_info = node.degree_opt_info, var = node.variable, pruner, sort_nodes](std::vector<Node> result_list) mutable {
+    // Determine how many candidate start nodes to scan. An explicit query LIMIT bounds the scan
+    // directly; without one we scan every candidate, deriving the bound from the actual candidate
+    // count so results (and aggregates built on them) are never silently truncated, while the
+    // underlying reserve()/accumulation stays bounded. The multi-filter intersection relies on this
+    // too: each per-filter list is bounded by the label's total node count, so no filter list is
+    // truncated before the leapfrog join.
+    seastar::future<size_t> scan_limit_fut = (limit > 0)
+        ? seastar::make_ready_future<size_t>(limit)
+        : (single_label.empty()
+            ? graph.shard.local().AllNodesCountPeered().then([](uint64_t count) { return static_cast<size_t>(count); })
+            : graph.shard.local().AllNodesCountPeered(single_label).then([](uint64_t count) { return static_cast<size_t>(count); }));
+
+    return scan_limit_fut.then([&graph, single_label, all_filters](size_t scan_limit) {
+        if (all_filters.size() > 1 && !single_label.empty()) {
+            std::vector<seastar::future<std::vector<Node>>> futs;
+            for (const auto& filter : all_filters) {
+                futs.push_back(graph.shard.local().FindNodesPeered(single_label, filter.property, filter.op, filter.value, 0, scan_limit));
+            }
+            return seastar::when_all_succeed(futs.begin(), futs.end())
+            .then([scan_limit](std::vector<std::vector<Node>> node_lists) {
+                if (node_lists.empty()) return std::vector<Node>{};
+
+                std::vector<std::vector<uint64_t>> id_lists;
+                for (const auto& list : node_lists) {
+                    std::vector<uint64_t> ids;
+                    for (const auto& n : list) {
+                        ids.push_back(n.getId());
+                    }
+                    std::sort(ids.begin(), ids.end());
+                    id_lists.push_back(std::move(ids));
+                }
+
+                std::vector<uint64_t> intersected_ids = leapfrogJoin(id_lists);
+
+                std::unordered_set<uint64_t> valid_ids(intersected_ids.begin(), intersected_ids.end());
+                std::vector<Node> result;
+                for (const auto& n : node_lists[0]) {
+                    if (valid_ids.count(n.getId())) {
+                        result.push_back(n);
+                        if (result.size() >= scan_limit) {
+                            break;
+                        }
+                    }
+                }
+                return result;
+            });
+        } else if (all_filters.size() == 1 && !single_label.empty()) {
+            const auto& filter = all_filters[0];
+            return graph.shard.local().FindNodesPeered(single_label, filter.property, filter.op, filter.value, 0, scan_limit);
+        } else if (!single_label.empty()) {
+            return graph.shard.local().AllNodesPeered(single_label, 0, scan_limit);
+        }
+        return graph.shard.local().AllNodesPeered(0, scan_limit);
+    }).then([&graph, degree_opt_info = node.degree_opt_info, var = node.variable, pruner, sort_nodes](std::vector<Node> result_list) mutable {
         if (degree_opt_info.empty()) {
             sort_nodes(result_list);
             if (pruner.should_prune(var)) {
@@ -704,7 +713,6 @@ static seastar::future<std::vector<GqlRow>> traverse_from_relationship_index(
     const ProjectionPruner& pruner,
     PathMode path_mode
 ) {
-    size_t scan_limit = (limit > 0) ? limit : 100000;
     const auto& edge = prep_pattern.edges[0];
     std::string single_label = "";
     if (edge.label_expr && edge.label_expr->kind == LabelExprKind::LITERAL) {
@@ -740,8 +748,16 @@ static seastar::future<std::vector<GqlRow>> traverse_from_relationship_index(
         return seastar::make_ready_future<std::vector<GqlRow>>();
     }
 
-    return graph.shard.local().FindRelationshipsPeered(single_label, indexed_prop, indexed_op, indexed_val, 0, scan_limit)
-    .then([&graph, prep_pattern, base_row, limit, pruner, path_mode](std::vector<Relationship> rels) {
+    // Without an explicit LIMIT, scan every matching relationship. The bound comes from the actual
+    // match count so results and aggregates are never silently truncated while the underlying
+    // reserve()/accumulation stays bounded.
+    seastar::future<size_t> scan_limit_fut = (limit > 0)
+        ? seastar::make_ready_future<size_t>(limit)
+        : graph.shard.local().FindRelationshipCountPeered(single_label, indexed_prop, indexed_op, indexed_val).then([](uint64_t count) { return static_cast<size_t>(count); });
+
+    return scan_limit_fut.then([&graph, single_label, indexed_prop, indexed_op, indexed_val](size_t scan_limit) {
+        return graph.shard.local().FindRelationshipsPeered(single_label, indexed_prop, indexed_op, indexed_val, 0, scan_limit);
+    }).then([&graph, prep_pattern, base_row, limit, pruner, path_mode](std::vector<Relationship> rels) {
         const auto& pattern_edge = prep_pattern.edges[0];
         
         std::vector<Relationship> matched_rels;

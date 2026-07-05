@@ -108,10 +108,17 @@ static void validate_insert_label_expr(const std::shared_ptr<LabelExpression>& e
  * @throws std::runtime_error If syntax errors are encountered.
  */
 GqlQuery GqlParser::parse_single_query() {
-    GqlQuery query;
-
+    std::vector<std::shared_ptr<GqlQuery>> with_segments;
+    std::unique_ptr<Expression> pending_having;
     int match_id_counter = 0;
     int optional_group_counter = 0;
+
+    while (true) {
+    GqlQuery query;
+    // A WHERE that followed a preceding WITH filters the rows piped into this segment.
+    if (pending_having) {
+        query.where_expr = std::move(pending_having);
+    }
     // Parse MATCH/OPTIONAL MATCH clauses
     while (check(TokenType::MATCH) || (check(TokenType::OPTIONAL) && peek(1).type == TokenType::MATCH)) {
         MatchStatement stmt;
@@ -315,9 +322,14 @@ GqlQuery GqlParser::parse_single_query() {
         }
     }
 
-    // Parse optional global WHERE clause
+    // Parse optional global WHERE clause (AND-combined with any HAVING carried in from a prior WITH).
     if (match(TokenType::WHERE)) {
-        query.where_expr = parse_expression();
+        auto w = parse_expression();
+        if (query.where_expr) {
+            query.where_expr = std::make_unique<BinaryOpExpr>(BinaryOpKind::AND, std::move(query.where_expr), std::move(w));
+        } else {
+            query.where_expr = std::move(w);
+        }
     }
 
     // Parse Write Operations (INSERT, SET, REMOVE, DELETE, DETACH)
@@ -385,9 +397,56 @@ GqlQuery GqlParser::parse_single_query() {
         }
     }
 
-    // Verify we have at least one MATCH or write operation
-    if (query.matches.empty() && query.writes.empty()) {
+    // Verify we have at least one MATCH or write operation (a continuation segment after WITH may
+    // have neither -- it operates on the rows piped in from the previous segment).
+    if (query.matches.empty() && query.writes.empty() && with_segments.empty()) {
         throw std::runtime_error("Query must contain at least one MATCH or write clause");
+    }
+
+    // A WITH clause closes a pipeline segment: project (optionally DISTINCT / ORDER BY / LIMIT) and
+    // feed the projected rows forward as bindings to the next segment.
+    if (match(TokenType::WITH)) {
+        if (match(TokenType::DISTINCT)) {
+            query.distinct = true;
+        }
+        do {
+            ReturnItem item;
+            item.expr = parse_expression();
+            if (match(TokenType::AS)) {
+                std::string alias = peek().text;
+                consume(TokenType::NAME, "Expected alias name after 'AS'");
+                item.alias = alias;
+            }
+            query.returns.push_back(std::move(item));
+        } while (match(TokenType::COMMA));
+
+        if (match(TokenType::ORDER_BY)) {
+            do {
+                SortSpec spec;
+                spec.expr = parse_expression();
+                if (match(TokenType::ASC)) {
+                    spec.ascending = true;
+                } else if (match(TokenType::DESC)) {
+                    spec.ascending = false;
+                } else {
+                    spec.ascending = true;
+                }
+                query.order_by.push_back(std::move(spec));
+            } while (match(TokenType::COMMA));
+        }
+        if (match(TokenType::LIMIT)) {
+            std::string num_str = peek().text;
+            consume(TokenType::NUMBER, "Expected integer limit value");
+            query.limit = std::stoull(num_str);
+        }
+        // A WHERE right after WITH is a HAVING filter on the projected rows; it applies to the next
+        // segment, which sees the projected bindings.
+        if (match(TokenType::WHERE)) {
+            pending_having = parse_expression();
+        }
+
+        with_segments.push_back(std::make_shared<GqlQuery>(std::move(query)));
+        continue;
     }
 
     // Parse RETURN clause (optional if we performed writes, otherwise mandatory)
@@ -412,7 +471,9 @@ GqlQuery GqlParser::parse_single_query() {
         }
     }
 
+    query.with_segments = std::move(with_segments);
     return query;
+    }  // end while(true) over pipeline segments
 }
 
 GqlQuery GqlParser::parse_query() {

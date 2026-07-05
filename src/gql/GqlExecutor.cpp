@@ -36,6 +36,7 @@
 #include "executor/LftjExecutor.h"
 
 #include <sstream>
+#include <optional>
 #include <unordered_set>
 #include <unordered_map>
 #include <set>
@@ -157,7 +158,49 @@ struct GqlRowOuterVarsLess {
  * @param query_ptr Shared pointer to the GQL query.
  * @return A future resolving to a QueryResult containing columns and values.
  */
-static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph, std::shared_ptr<GqlQuery> query_ptr) {
+static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph, std::shared_ptr<GqlQuery> query_ptr, std::optional<std::vector<GqlRow>> incoming = std::nullopt);
+
+/**
+ * @brief Convert a completed segment's QueryResult into input rows for the next WITH-pipeline
+ *        segment: each projected output column becomes a binding under its column name.
+ */
+static std::vector<GqlRow> query_result_to_rows(const QueryResult& res) {
+    std::vector<GqlRow> rows;
+    rows.reserve(res.rows.size());
+    for (const auto& r : res.rows) {
+        GqlRow gr;
+        for (size_t i = 0; i < res.column_names.size() && i < r.size(); ++i) {
+            gr.bindings[res.column_names[i]] = r[i];
+        }
+        rows.push_back(std::move(gr));
+    }
+    return rows;
+}
+
+/**
+ * @brief Execute WITH-pipeline segments [idx..], piping each one's projected rows into the next, and
+ *        return the rows to feed into the final (RETURN) segment. Stops early if a segment is empty.
+ */
+static seastar::future<std::vector<GqlRow>> execute_with_segments(
+        ragedb::Graph& graph, std::shared_ptr<GqlQuery> query_ptr, size_t idx,
+        std::optional<std::vector<GqlRow>> incoming) {
+    if (idx >= query_ptr->with_segments.size()) {
+        return seastar::make_ready_future<std::vector<GqlRow>>(
+            incoming.has_value() ? std::move(*incoming) : std::vector<GqlRow>{});
+    }
+    auto seg = query_ptr->with_segments[idx];
+    return execute_query_internal(graph, seg, std::move(incoming)).then(
+        [&graph, query_ptr, idx](QueryResult res) {
+            std::vector<GqlRow> rows = query_result_to_rows(res);
+            if (rows.empty()) {
+                return seastar::make_ready_future<std::vector<GqlRow>>(std::vector<GqlRow>{});
+            }
+            return execute_with_segments(graph, query_ptr, idx + 1,
+                std::optional<std::vector<GqlRow>>(std::move(rows)));
+        });
+}
+
+static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph, std::shared_ptr<GqlQuery> query_ptr, std::optional<std::vector<GqlRow>> incoming) {
     if (query_ptr->no_op) {
         QueryResult query_res;
         for (size_t i = 0; i < query_ptr->returns.size(); ++i) {
@@ -199,6 +242,17 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
             query_res.column_names.push_back(key);
         }
         return seastar::make_ready_future<QueryResult>(std::move(query_res));
+    }
+
+    // WITH pipeline: execute the prefix segments (each projecting rows forward), then run the final
+    // RETURN segment on the piped rows. The final segment is this query with its with_segments removed.
+    if (!query_ptr->with_segments.empty()) {
+        return execute_with_segments(graph, query_ptr, 0, std::move(incoming))
+        .then([&graph, query_ptr](std::vector<GqlRow> piped) {
+            auto final_seg = std::make_shared<GqlQuery>(query_ptr->clone());
+            final_seg->with_segments.clear();
+            return execute_query_internal(graph, final_seg, std::optional<std::vector<GqlRow>>(std::move(piped)));
+        });
     }
 
     // 1. Handle Set Operations (UNION, UNION ALL, INTERSECT, INTERSECT ALL)
@@ -437,8 +491,11 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
         }
     }
 
-    // 5. Execute matching patterns recursively using sharded traversal
-    IntermediateResult initial_res(std::vector<GqlRow>{ GqlRow{} });
+    // 5. Execute matching patterns recursively using sharded traversal. WITH-pipeline continuation
+    // segments start from the rows piped in from the previous segment rather than a single empty row.
+    IntermediateResult initial_res = incoming.has_value()
+        ? IntermediateResult(std::move(*incoming))
+        : IntermediateResult(std::vector<GqlRow>{ GqlRow{} });
     auto is_sorted_shared = std::make_shared<bool>(false);
 
     auto is_query_cyclic = [](const std::vector<MatchStatement>& matches) -> bool {

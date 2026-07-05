@@ -42,6 +42,7 @@ enum class TokenType {
     MATCH,
     OPTIONAL,
     RETURN,
+    WITH,
     DISTINCT,
     ORDER_BY,
     LIMIT,

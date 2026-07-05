@@ -499,6 +499,11 @@ struct GqlQuery {
     std::vector<SortSpec> order_by;          ///< Sequence of sort specifications.
     std::optional<uint64_t> limit;           ///< Optional maximum number of rows to return.
 
+    /// WITH-pipeline prefix segments. Each entry is a sub-query (matches + WHERE + WITH projection +
+    /// ORDER BY/LIMIT/DISTINCT) whose projected rows feed forward as input bindings to the next
+    /// segment; the enclosing GqlQuery is the final segment ending in RETURN. Empty means no WITH.
+    std::vector<std::shared_ptr<GqlQuery>> with_segments;
+
     // DDL schema controls
     std::optional<SchemaOperation> schema_op;
 
@@ -545,6 +550,10 @@ struct GqlQuery {
         }
         
         copy.limit = limit;
+        copy.with_segments.reserve(with_segments.size());
+        for (const auto& seg : with_segments) {
+            copy.with_segments.push_back(std::make_shared<GqlQuery>(seg->clone()));
+        }
         copy.schema_op = schema_op;
         copy.outer_vars = outer_vars;
         copy.has_unnested_subquery = has_unnested_subquery;

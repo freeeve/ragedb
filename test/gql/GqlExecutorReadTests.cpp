@@ -378,3 +378,47 @@ TEST_CASE("GQL Execution Read Tests", "[gql_executor_read]") {
 
     guard.stop();
 }
+
+TEST_CASE("GQL WITH query pipelining", "[gql_executor_read][task_with]") {
+    auto graph = Graph("gql_with_test");
+    graph.Start().get();
+    graph.Clear();
+    graph.shard.local().NodeTypeInsertPeered("Person").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "name", "string").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "age", "integer").get();
+    graph.shard.local().RelationshipTypeInsertPeered("KNOWS").get();
+    uint64_t a = graph.shard.local().NodeAddPeered("Person", "alice", "{\"name\": \"Alice\", \"age\": 30}").get();
+    uint64_t b = graph.shard.local().NodeAddPeered("Person", "bob", "{\"name\": \"Bob\", \"age\": 35}").get();
+    uint64_t c = graph.shard.local().NodeAddPeered("Person", "carol", "{\"name\": \"Carol\", \"age\": 40}").get();
+    graph.shard.local().RelationshipAddPeered("KNOWS", a, b, "{}").get();
+    graph.shard.local().RelationshipAddPeered("KNOWS", a, c, "{}").get();
+
+    SECTION("a trivial WITH passes a node through to RETURN") {
+        std::string res = GqlExecutor::execute(graph,
+            std::string("MATCH (p:Person {name: 'Alice'}) WITH p RETURN p.name AS n")).get();
+        REQUIRE(res.find("Alice") != std::string::npos);
+    }
+
+    SECTION("WITH stages a node into a second MATCH") {
+        std::string res = GqlExecutor::execute(graph,
+            std::string("MATCH (a:Person {name: 'Alice'}) WITH a MATCH (a)-[:KNOWS]->(f:Person) RETURN f.name AS fn")).get();
+        REQUIRE(res.find("Bob") != std::string::npos);
+        REQUIRE(res.find("Carol") != std::string::npos);
+    }
+
+    SECTION("WITH mid-pipeline aggregation") {
+        std::string res = GqlExecutor::execute(graph,
+            std::string("MATCH (a:Person)-[:KNOWS]->(f:Person) WITH a, count(f) AS cnt RETURN a.name AS n, cnt")).get();
+        REQUIRE(res.find("\"n\": \"Alice\", \"cnt\": 2") != std::string::npos);
+    }
+
+    SECTION("WITH ORDER BY + LIMIT stages the top row into the next segment") {
+        std::string res = GqlExecutor::execute(graph,
+            std::string("MATCH (p:Person) WITH p ORDER BY p.age DESC LIMIT 1 RETURN p.name AS n")).get();
+        REQUIRE(res.find("Carol") != std::string::npos);
+        REQUIRE(res.find("Alice") == std::string::npos);
+        REQUIRE(res.find("Bob") == std::string::npos);
+    }
+
+    graph.Stop().get();
+}

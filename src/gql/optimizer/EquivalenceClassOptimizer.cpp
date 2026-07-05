@@ -16,6 +16,7 @@
 
 #include "EquivalenceClassOptimizer.h"
 #include "../GqlVirtualCatalog.h"
+#include <limits>
 
 namespace ragedb::gql {
 
@@ -35,7 +36,19 @@ void EquivalenceClassOptimizer::equivalence_class_pass(GqlQuery& query) {
                     GqlVirtualCatalog::local().has_relationship_algebraic_property(rel_type, "symmetric") &&
                     GqlVirtualCatalog::local().has_relationship_algebraic_property(rel_type, "transitive");
 
-                if (is_equivalence) {
+                // The equivalence-partition fast path (Case 0.5) only reproduces the original
+                // traversal for a simple, unbounded, RIGHT-directed hop with no edge binding/
+                // predicates, no path variable, and no shortest-path selector. Guard against every
+                // case it would silently get wrong (hop bounds, direction, predicates, bindings).
+                bool safe_to_rewrite =
+                    edge.direction == EdgeDirection::RIGHT &&
+                    edge.min_hops == 1 && edge.max_hops == std::numeric_limits<uint64_t>::max() &&
+                    edge.variable.empty() &&
+                    edge.properties.empty() && edge.property_filters.empty() && !edge.where_expr &&
+                    match.path_variable.empty() &&
+                    match.shortest_path_kind == ShortestPathKind::NONE;
+
+                if (is_equivalence && safe_to_rewrite) {
                     match.equivalence_partition_lookup = true;
                     edge.is_variable_length = false;
                     edge.min_hops = 1;

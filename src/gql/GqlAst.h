@@ -199,13 +199,15 @@ struct IsNullExpr : public Expression {
 struct AggregateExpr : public Expression {
     AggregateKind fn_kind;              ///< The kind of aggregate function.
     std::unique_ptr<Expression> expr;   ///< Expression target to aggregate (nullptr for COUNT(*)).
-    AggregateExpr(AggregateKind kind_val, std::unique_ptr<Expression> e) {
+    bool distinct = false;              ///< True for DISTINCT aggregates, e.g. count(DISTINCT x).
+    AggregateExpr(AggregateKind kind_val, std::unique_ptr<Expression> e, bool distinct_val = false) {
         kind = ExpressionKind::AGGREGATION;
         fn_kind = kind_val;
         expr = std::move(e);
+        distinct = distinct_val;
     }
     std::unique_ptr<Expression> clone() const override {
-        return std::make_unique<AggregateExpr>(fn_kind, expr ? expr->clone() : nullptr);
+        return std::make_unique<AggregateExpr>(fn_kind, expr ? expr->clone() : nullptr, distinct);
     }
 };
 
@@ -499,6 +501,11 @@ struct GqlQuery {
     std::vector<SortSpec> order_by;          ///< Sequence of sort specifications.
     std::optional<uint64_t> limit;           ///< Optional maximum number of rows to return.
 
+    /// WITH-pipeline prefix segments. Each entry is a sub-query (matches + WHERE + WITH projection +
+    /// ORDER BY/LIMIT/DISTINCT) whose projected rows feed forward as input bindings to the next
+    /// segment; the enclosing GqlQuery is the final segment ending in RETURN. Empty means no WITH.
+    std::vector<std::shared_ptr<GqlQuery>> with_segments;
+
     // DDL schema controls
     std::optional<SchemaOperation> schema_op;
 
@@ -545,6 +552,10 @@ struct GqlQuery {
         }
         
         copy.limit = limit;
+        copy.with_segments.reserve(with_segments.size());
+        for (const auto& seg : with_segments) {
+            copy.with_segments.push_back(std::make_shared<GqlQuery>(seg->clone()));
+        }
         copy.schema_op = schema_op;
         copy.outer_vars = outer_vars;
         copy.has_unnested_subquery = has_unnested_subquery;

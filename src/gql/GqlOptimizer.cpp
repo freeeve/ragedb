@@ -411,6 +411,16 @@ void GqlOptimizer::optimize(GqlQuery& query) {
         return;
     }
 
+    // Optimize each WITH-pipeline segment (each is a sub-query with its own patterns).
+    for (auto& seg : query.with_segments) {
+        if (seg) optimize(*seg);
+    }
+    // A segment with no MATCH (e.g. WITH p RETURN p.name) has no pattern to optimize, and the
+    // match-oriented passes below assume at least one MATCH -- skip them.
+    if (query.matches.empty()) {
+        return;
+    }
+
     // Phase 1: Expand any virtual views recursively up to a limit of 20.
     expand_views_recursive(query);
 

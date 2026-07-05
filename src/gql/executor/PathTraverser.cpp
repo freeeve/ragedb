@@ -20,6 +20,7 @@
 #include "WccCache.h"
 #include "TransitiveReachabilityCache.h"
 #include <seastar/core/when_all.hh>
+#include <seastar/core/thread.hh>
 #include <seastar/util/later.hh>
 #include <algorithm>
 #include <unordered_set>
@@ -1382,9 +1383,15 @@ seastar::future<std::vector<GqlRow>> traverse_match_statement(ragedb::Graph& gra
         if (WccCache::local().has(rel_type)) {
             partitions_fut = seastar::make_ready_future<std::map<uint64_t, uint64_t>>(WccCache::local().get(rel_type));
         } else {
-            std::map<uint64_t, uint64_t> wcc = graph.shard.local().WeaklyConnectedComponentsPeered(rel_type, "", "", "", "", true, false);
-            WccCache::local().set(rel_type, std::move(wcc));
-            partitions_fut = seastar::make_ready_future<std::map<uint64_t, uint64_t>>(WccCache::local().get(rel_type));
+            // WeaklyConnectedComponentsPeered blocks on cross-shard futures internally (.get0()),
+            // which aborts when run on the reactor thread (the HTTP/GQL path, smp>1). Run it inside a
+            // seastar::thread where waiting is legal, then cache and continue asynchronously.
+            partitions_fut = seastar::async([&graph, rel_type] {
+                return graph.shard.local().WeaklyConnectedComponentsPeered(rel_type, "", "", "", "", true, false);
+            }).then([rel_type](std::map<uint64_t, uint64_t> wcc) {
+                WccCache::local().set(rel_type, std::move(wcc));
+                return WccCache::local().get(rel_type);
+            });
         }
 
         seastar::future<std::vector<Node>> start_nodes_fut = seastar::make_ready_future<std::vector<Node>>();
@@ -1496,16 +1503,24 @@ seastar::future<std::vector<GqlRow>> traverse_match_statement(ragedb::Graph& gra
             rel_type = edge.label_expr->name;
         }
 
-        std::map<uint64_t, std::unordered_set<uint64_t>> descendants;
+        seastar::future<std::map<uint64_t, std::unordered_set<uint64_t>>> descendants_fut =
+            seastar::make_ready_future<std::map<uint64_t, std::unordered_set<uint64_t>>>();
         if (TransitiveReachabilityCache::local().has(rel_type)) {
-            descendants = TransitiveReachabilityCache::local().get(rel_type);
+            descendants_fut = seastar::make_ready_future<std::map<uint64_t, std::unordered_set<uint64_t>>>(TransitiveReachabilityCache::local().get(rel_type));
         } else {
-            std::vector<std::pair<uint64_t, uint64_t>> pairs = graph.shard.local().ReachablePeered(rel_type, "", "", "", "", true, false);
-            for (const auto& p : pairs) {
-                descendants[p.first].insert(p.second);
-            }
-            TransitiveReachabilityCache::local().set(rel_type, std::move(descendants));
-            descendants = TransitiveReachabilityCache::local().get(rel_type);
+            // ReachablePeered blocks on cross-shard futures internally (.get0()), which aborts on the
+            // reactor thread (the HTTP/GQL path, smp>1). Run it inside a seastar::thread where waiting
+            // is legal, then build the descendants index and cache it asynchronously.
+            descendants_fut = seastar::async([&graph, rel_type] {
+                return graph.shard.local().ReachablePeered(rel_type, "", "", "", "", true, false);
+            }).then([rel_type](std::vector<std::pair<uint64_t, uint64_t>> pairs) {
+                std::map<uint64_t, std::unordered_set<uint64_t>> descendants;
+                for (const auto& p : pairs) {
+                    descendants[p.first].insert(p.second);
+                }
+                TransitiveReachabilityCache::local().set(rel_type, std::move(descendants));
+                return TransitiveReachabilityCache::local().get(rel_type);
+            });
         }
 
         seastar::future<std::vector<Node>> start_nodes_fut = seastar::make_ready_future<std::vector<Node>>();
@@ -1532,10 +1547,11 @@ seastar::future<std::vector<GqlRow>> traverse_match_statement(ragedb::Graph& gra
             end_nodes_fut = get_start_nodes(graph, stmt.pattern.nodes[1], 0, pruner);
         }
 
-        return seastar::when_all_succeed(std::move(start_nodes_fut), std::move(end_nodes_fut))
-        .then([&graph, stmt, row, start_node_var, end_node_var, descendants = std::move(descendants)](std::tuple<std::vector<Node>, std::vector<Node>> results) {
-            auto start_nodes = std::move(std::get<0>(results));
-            auto end_nodes = std::move(std::get<1>(results));
+        return seastar::when_all_succeed(std::move(descendants_fut), std::move(start_nodes_fut), std::move(end_nodes_fut))
+        .then([&graph, stmt, row, start_node_var, end_node_var](std::tuple<std::map<uint64_t, std::unordered_set<uint64_t>>, std::vector<Node>, std::vector<Node>> results) {
+            auto descendants = std::move(std::get<0>(results));
+            auto start_nodes = std::move(std::get<1>(results));
+            auto end_nodes = std::move(std::get<2>(results));
 
             std::vector<Node> valid_starts;
             for (const auto& node : start_nodes) {

@@ -28,6 +28,19 @@ namespace ragedb::gql {
 namespace {
 
 void merge_pattern_nodes(PatternNode& dest, PatternNode& src) {
+    // Preserve src's label constraint: the merged node must satisfy BOTH labels, so combine them
+    // with AND rather than dropping src's label (which silently widened the result).
+    if (src.label_expr) {
+        if (dest.label_expr) {
+            auto both = std::make_shared<LabelExpression>();
+            both->kind = LabelExprKind::AND;
+            both->left = dest.label_expr;
+            both->right = src.label_expr;
+            dest.label_expr = both;
+        } else {
+            dest.label_expr = src.label_expr;
+        }
+    }
     for (const auto& [k, v] : src.properties) {
         dest.properties[k] = v;
     }
@@ -107,6 +120,7 @@ void prune_redundant_single_node_matches(GqlQuery& query) {
             it->pattern.edges.empty() && it->pattern.nodes.size() == 1) {
             std::string var = it->pattern.nodes[0].variable;
             if (bound_vars.count(var) > 0 &&
+                !it->pattern.nodes[0].label_expr &&
                 it->pattern.nodes[0].properties.empty() &&
                 it->pattern.nodes[0].property_filters.empty() &&
                 !it->pattern.nodes[0].where_expr) {
@@ -141,7 +155,12 @@ void AntisymmetricLoopCollapser::antisymmetric_loop_pass(GqlQuery& query) {
             if (match.is_optional || match.is_search || match.is_khop) continue;
             for (size_t e_idx = 0; e_idx < match.pattern.edges.size(); ++e_idx) {
                 const auto& edge = match.pattern.edges[e_idx];
-                if (!edge.is_variable_length && edge.label_expr && edge.label_expr->kind == LabelExprKind::LITERAL) {
+                // Only collapse a totally-unconstrained edge: collapse deletes one edge, which would
+                // otherwise silently drop its predicates or leave its bound variable unbound.
+                bool edge_unconstrained = edge.variable.empty() && edge.properties.empty() &&
+                    edge.property_filters.empty() && !edge.where_expr;
+                if (!edge.is_variable_length && edge_unconstrained &&
+                    edge.label_expr && edge.label_expr->kind == LabelExprKind::LITERAL) {
                     std::string rel_type = edge.label_expr->name;
                     if (GqlVirtualCatalog::local().has_relationship_algebraic_property(rel_type, "antisymmetric")) {
                         std::string src = match.pattern.nodes[e_idx].variable;
@@ -163,6 +182,16 @@ void AntisymmetricLoopCollapser::antisymmetric_loop_pass(GqlQuery& query) {
                 const auto& e1 = refs[i];
                 const auto& e2 = refs[j];
                 if (e1.rel_type == e2.rel_type && e1.src == e2.tgt && e1.tgt == e2.src) {
+                    // An antisymmetric 2-cycle forces src == tgt (a self-loop). If the relation is
+                    // also irreflexive, that self-loop is impossible, so the query matches nothing.
+                    // (The irreflexive pruner runs before this pass and cannot see the folded loop.)
+                    bool rel_reflexive = GqlVirtualCatalog::local().has_relationship_algebraic_property(e1.rel_type, "reflexive");
+                    bool rel_irreflexive = GqlVirtualCatalog::local().has_relationship_algebraic_property(e1.rel_type, "irreflexive");
+                    if (rel_irreflexive && !rel_reflexive) {
+                        query.no_op = true;
+                        return;
+                    }
+
                     std::string keep_var = e1.src;
                     std::string prune_var = e1.tgt;
 

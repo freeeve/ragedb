@@ -31,6 +31,11 @@ void AutomorphicSymmetryOptimizer::automorphic_symmetry_pass(GqlQuery& query) {
     if (!ret.expr || ret.expr->kind != ExpressionKind::AGGREGATION) return;
     auto* agg = static_cast<const AggregateExpr*>(ret.expr.get());
     if (agg->fn_kind != AggregateKind::COUNT) return;
+    // count(DISTINCT x) does not scale with the automorphism factor: symmetric matches contribute
+    // the same distinct values, so multiplying the deduped count would overcount. Piped-row parts
+    // count relative to their input rows, where the symmetry argument does not hold either.
+    if (agg->distinct) return;
+    if (query.consumes_piped_rows) return;
     
     // Check that there are no global where filters or other complex expressions
     if (query.where_expr != nullptr) return;

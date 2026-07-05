@@ -137,7 +137,7 @@ TEST_CASE("GQL Optimizer Phase 24: Irreflexive Contradiction Pruner", "[gql_opti
     }
 }
 
-// Negative controls (task 005): the irreflexive pruner must NOT no_op these -- each is satisfiable.
+// Negative controls (task 005): the irreflexive pruner must NOT no_op these--each is satisfiable.
 TEST_CASE("GQL Optimizer Phase 24: Irreflexive pruner negative controls", "[gql_optimizer][alglib][task005]") {
     GqlVirtualCatalog::local().clear();
     GqlVirtualCatalog::local().set_relationship_algebraic_properties("parent_of", {"irreflexive"});

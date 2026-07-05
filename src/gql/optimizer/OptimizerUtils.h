@@ -114,6 +114,23 @@ std::vector<VarInfo> collect_query_vars(const GqlQuery& query);
 std::vector<VarInfo> collect_all_query_vars(const GqlQuery& query);
 
 bool is_variable_referenced_outside_count(const Expression* expr, const std::string& var_name);
+bool expression_has_distinct_aggregate(const Expression* expr);
+bool query_has_distinct_aggregate(const GqlQuery& query);
+bool has_post_scan_residual_predicate(const GqlQuery& query);
+bool is_simple_unbounded_right_hop(const MatchStatement& match, const PatternEdge& edge);
+
+/**
+ * @brief Selectivity estimation classes based on query predicates.
+ *        Lower value = higher selectivity (fewer rows expected).
+ */
+enum class SelectivityClass {
+    UNIQUE = 1,   ///< Filtered by a unique identifier equality (e.g. id == 1)
+    INDEXED = 2,  ///< Filtered by other property values (which can use a secondary index)
+    SCAN = 3      ///< No filter bounds, requires scanning the whole node label
+};
+
+SelectivityClass estimate_selectivity(const std::string& var_name, const std::vector<VarInfo>& q_vars);
+bool reverse_match_pattern_if_safe(MatchStatement& match);
 void rewrite_count_to_sum_degree(std::unique_ptr<Expression>& expr, const std::string& start_var, const std::string& end_var, const std::string& edge_var, const std::string& degree_prop, bool& rewritten);
 void extract_rel_types(const LabelExpression* expr, std::vector<std::string>& rel_types);
 void rewrite_khop_count_to_var(std::unique_ptr<Expression>& expr, const std::string& var_name);

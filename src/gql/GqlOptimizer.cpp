@@ -39,7 +39,6 @@
 #include "optimizer/EqualityJoinEliminator.h"
 #include "optimizer/DisjointConceptPruner.h"
 #include "optimizer/DirectionSwapOptimizer.h"
-#include "optimizer/SymmetricTraversalOptimizer.h"
 #include "optimizer/TransitivePathOptimizer.h"
 #include "optimizer/IrreflexiveContradictionPruner.h"
 #include "optimizer/AntisymmetricLoopCollapser.h"
@@ -411,12 +410,21 @@ void GqlOptimizer::optimize(GqlQuery& query) {
         return;
     }
 
-    // Optimize each WITH-pipeline segment (each is a sub-query with its own patterns).
-    for (auto& seg : query.with_segments) {
-        if (seg) optimize(*seg);
+    // Optimize each WITH-pipeline segment (each is a sub-query with its own patterns). Every part
+    // after the first segment starts from rows piped in by its predecessor, so rewrites that
+    // assume they scan the pattern from scratch must know to stand down.
+    for (size_t i = 0; i < query.with_segments.size(); ++i) {
+        auto& seg = query.with_segments[i];
+        if (seg) {
+            seg->consumes_piped_rows = (i > 0);
+            optimize(*seg);
+        }
+    }
+    if (!query.with_segments.empty()) {
+        query.consumes_piped_rows = true;
     }
     // A segment with no MATCH (e.g. WITH p RETURN p.name) has no pattern to optimize, and the
-    // match-oriented passes below assume at least one MATCH -- skip them.
+    // match-oriented passes below assume at least one MATCH--skip them.
     if (query.matches.empty()) {
         return;
     }
@@ -490,8 +498,9 @@ void GqlOptimizer::optimize(GqlQuery& query) {
     // Phase 21: Reverse inner match traversal directions to start at selective index lookups.
     DirectionSwapOptimizer::direction_swap_pass(query);
 
-    // Phase 22: Symmetric Traversal Simplification pass.
-    SymmetricTraversalOptimizer::symmetric_traversal_pass(query);
+    // Phase 22 (Symmetric Traversal Simplification) was removed: phase 21 already reverses any
+    // match by the same selectivity criterion, and reversing is semantics-preserving for every
+    // relation, so the symmetric-only gate bought nothing (task 011).
 
     // Phase 26: Equivalence Class Coalescing pass.
     EquivalenceClassOptimizer::equivalence_class_pass(query);
@@ -578,7 +587,13 @@ void GqlOptimizer::optimize(GqlQuery& query) {
                     }
                 }
                 
-                if (!referenced_outside) {
+                // DISTINCT aggregates observe the expansion's actual rows; the degree-sum rewrite
+                // (and the pattern truncation it triggers) would corrupt them. Piped-row parts
+                // bind the anchor from the pipe, where the degree property is never populated.
+                // A self-loop pattern (both endpoints one variable) carries a source==target join
+                // the plain degree sum would drop.
+                if (!referenced_outside && !query_has_distinct_aggregate(query) && !query.consumes_piped_rows &&
+                    start_var != end_var) {
                     std::string degree_prop = "_degree_" + start_var + "_opt";
                     bool rewritten = false;
                     
@@ -702,7 +717,8 @@ void GqlOptimizer::optimize(GqlQuery& query) {
     query.where_expr = rebuild_expression_without_pushed_predicates(std::move(query.where_expr), pushdowns);
 
     for (auto& match : query.matches) {
-        if (match.is_khop && match.pattern.nodes.size() == 2 && !match.pattern.nodes[1].variable.empty()) {
+        if (match.is_khop && match.pattern.nodes.size() == 2 && !match.pattern.nodes[1].variable.empty() &&
+            match.pattern.nodes[1].variable != match.pattern.nodes[0].variable) {
             std::string end_var = match.pattern.nodes[1].variable;
             bool referenced_outside = false;
             if (query.where_expr && is_variable_referenced_outside_count(query.where_expr.get(), end_var)) {
@@ -721,7 +737,7 @@ void GqlOptimizer::optimize(GqlQuery& query) {
                 }
             }
             
-            if (!referenced_outside) {
+            if (!referenced_outside && !query_has_distinct_aggregate(query) && !query.consumes_piped_rows) {
                 match.khop_count_only = true;
                 for (auto& item : query.returns) {
                     if (!item.alias.has_value()) {

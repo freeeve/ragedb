@@ -200,6 +200,9 @@ struct AggregateExpr : public Expression {
     AggregateKind fn_kind;              ///< The kind of aggregate function.
     std::unique_ptr<Expression> expr;   ///< Expression target to aggregate (nullptr for COUNT(*)).
     bool distinct = false;              ///< True for DISTINCT aggregates, e.g. count(DISTINCT x).
+    /// True when a COUNT was rewritten into a degree SUM: the empty-input result must then stay
+    /// count-shaped (0), not sum-shaped (null).
+    bool count_to_sum = false;
     AggregateExpr(AggregateKind kind_val, std::unique_ptr<Expression> e, bool distinct_val = false) {
         kind = ExpressionKind::AGGREGATION;
         fn_kind = kind_val;
@@ -207,7 +210,9 @@ struct AggregateExpr : public Expression {
         distinct = distinct_val;
     }
     std::unique_ptr<Expression> clone() const override {
-        return std::make_unique<AggregateExpr>(fn_kind, expr ? expr->clone() : nullptr, distinct);
+        auto copy = std::make_unique<AggregateExpr>(fn_kind, expr ? expr->clone() : nullptr, distinct);
+        copy->count_to_sum = count_to_sum;
+        return copy;
     }
 };
 
@@ -515,6 +520,10 @@ struct GqlQuery {
     bool no_op = false;
     bool skip_semantic = false;
     uint64_t count_multiplication_factor = 1;
+    /// True for a WITH-pipeline part that receives rows piped from a previous segment. Rewrites
+    /// whose correctness depends on input cardinality or on scanning the pattern from scratch
+    /// (count->degree-sum, path counts, symmetry multipliers, limit pushdown) must not fire then.
+    bool consumes_piped_rows = false;
 
     // Explain & Profile
     bool explain = false;
@@ -562,6 +571,7 @@ struct GqlQuery {
         copy.no_op = no_op;
         copy.skip_semantic = skip_semantic;
         copy.count_multiplication_factor = count_multiplication_factor;
+        copy.consumes_piped_rows = consumes_piped_rows;
         copy.explain = explain;
         copy.profile = profile;
         copy.plan_cache_hit = plan_cache_hit;

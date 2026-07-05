@@ -65,3 +65,6 @@ test/cmake-build-release-coverage/
 # graphify
 graphify-out/cost.json
 graphify-out/cache/
+
+# Local task-tracking workflow -- not part of this fork.
+tasks/

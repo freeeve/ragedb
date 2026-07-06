@@ -852,4 +852,23 @@ TEST_CASE("GQL scalar functions and CASE expressions (task 032 slice: length/CAS
             "ORDER BY countryXCount + countryYCount DESC, personId ASC "
             "LIMIT 20"));
     }
+    SECTION("COUNT { } subquery-count with a bare pattern") {
+        auto q = GqlParser::parse(
+            "MATCH (foaf:Person) RETURN foaf.id AS id, "
+            "COUNT { (foaf)<-[:HAS_CREATOR]-(:Post) } AS total");
+        REQUIRE(q.returns.size() == 2);
+        REQUIRE(q.returns[1].expr->kind == ExpressionKind::SIZE_OP); // COUNT{} reuses SizeExpr
+    }
+    SECTION("COUNT { MATCH ... WHERE EXISTS { ... } } (IC10 shape via LET)") {
+        REQUIRE_NOTHROW(GqlParser::parse(
+            "MATCH (p:Person {id: 1})-[:KNOWS]-(:Person)-[:KNOWS]-(foaf:Person) WHERE foaf.id <> 1 "
+            "RETURN DISTINCT p, foaf "
+            "NEXT "
+            "FILTER NOT EXISTS { (p)-[:KNOWS]-(foaf) } "
+            "LET total = COUNT { (foaf)<-[:HAS_CREATOR]-(:Post) } "
+            "LET common = COUNT { MATCH (foaf)<-[:HAS_CREATOR]-(post:Post) "
+            "                     WHERE EXISTS { (post)-[:HAS_TAG]->(:Tag)<-[:HAS_INTEREST]-(p) } } "
+            "RETURN foaf.id AS personId, 2 * common - total AS commonInterestScore "
+            "ORDER BY commonInterestScore DESC, personId ASC LIMIT 10"));
+    }
 }

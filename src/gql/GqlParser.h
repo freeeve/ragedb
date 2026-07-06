@@ -64,6 +64,9 @@ private:
     std::unique_ptr<Expression> parse_mul_div();
     std::unique_ptr<Expression> parse_unary();
     std::unique_ptr<Expression> parse_primary();
+    /// Parse a braced subquery body `{ [MATCH ...]* [<bare pattern>] [WHERE <pred>] }` shared by
+    /// EXISTS { ... } and COUNT { ... }. Assumes the next token is '{'; consumes through the '}'.
+    void parse_braced_subquery(std::vector<MatchStatement>& matches, std::unique_ptr<Expression>& sub_where);
 
 public:
     explicit GqlParser(std::vector<Token> tokens) : tokens(std::move(tokens)) {}

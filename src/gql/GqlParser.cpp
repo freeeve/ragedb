@@ -1455,11 +1455,11 @@ std::unique_ptr<Expression> GqlParser::parse_unary() {
  * @return std::unique_ptr<Expression> Parsed expression node.
  * @throws std::runtime_error If an unexpected token or syntax issue is encountered.
  */
-std::unique_ptr<Expression> GqlParser::parse_primary() {
-    if (match(TokenType::EXISTS)) {
-        consume(TokenType::LBRACE, "Expected '{' after EXISTS");
-        std::vector<MatchStatement> matches;
-        int sub_match_id = 0;
+void GqlParser::parse_braced_subquery(std::vector<MatchStatement>& matches,
+                                      std::unique_ptr<Expression>& sub_where) {
+    consume(TokenType::LBRACE, "Expected '{' to start subquery");
+    int sub_match_id = 0;
+    {
         while (check(TokenType::MATCH) || (check(TokenType::OPTIONAL) && peek(1).type == TokenType::MATCH)) {
             MatchStatement stmt;
             if (match(TokenType::OPTIONAL)) {
@@ -1550,12 +1550,34 @@ std::unique_ptr<Expression> GqlParser::parse_primary() {
             stmt.id = sub_match_id++;
             matches.push_back(std::move(stmt));
         }
-        std::unique_ptr<Expression> sub_where = nullptr;
-        if (match(TokenType::WHERE)) {
-            sub_where = parse_expression();
-        }
-        consume(TokenType::RBRACE, "Expected '}' after EXISTS subquery");
+    }
+    sub_where = nullptr;
+    if (match(TokenType::WHERE)) {
+        sub_where = parse_expression();
+    }
+    consume(TokenType::RBRACE, "Expected '}' after subquery");
+}
+
+std::unique_ptr<Expression> GqlParser::parse_primary() {
+    if (match(TokenType::EXISTS)) {
+        std::vector<MatchStatement> matches;
+        std::unique_ptr<Expression> sub_where;
+        parse_braced_subquery(matches, sub_where);
         return std::make_unique<ExistsExpr>(std::move(matches), std::move(sub_where));
+    }
+    // ISO GQL COUNT { <pattern subquery> } counts subquery matches (distinct from the count(x)
+    // aggregate). It shares the braced-subquery body with EXISTS and reuses SizeExpr (a match count).
+    if (check(TokenType::NAME) && peek(1).type == TokenType::LBRACE) {
+        std::string upper_name = peek().text;
+        std::transform(upper_name.begin(), upper_name.end(), upper_name.begin(),
+                       [](unsigned char c) { return std::toupper(c); });
+        if (upper_name == "COUNT") {
+            advance(); // consume COUNT
+            std::vector<MatchStatement> matches;
+            std::unique_ptr<Expression> sub_where;
+            parse_braced_subquery(matches, sub_where);
+            return std::make_unique<SizeExpr>(std::move(matches), std::move(sub_where));
+        }
     }
     // Searched CASE expression: CASE WHEN cond THEN val [WHEN ...] [ELSE val] END.
     if (match(TokenType::CASE_KW)) {

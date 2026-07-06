@@ -276,3 +276,69 @@ TEST_CASE("streaming edge aggregate rejects unsupported shapes", "[gql_executor_
 
     graph.Stop().get();
 }
+
+TEST_CASE("GQL expression forms execute (task 032: CASE/length/zoned_datetime/COUNT{}/collect_list/IN)",
+          "[gql_executor_with][task032]") {
+    auto graph = Graph("gql_expr_forms_test");
+    graph.Start().get();
+    graph.Clear();
+    graph.shard.local().NodeTypeInsertPeered("Person").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "name", "string").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "created", "integer").get();
+    graph.shard.local().RelationshipTypeInsertPeered("KNOWS").get();
+    // created is epoch MILLISECONDS: Alice 2011-06-01 (1306886400000), Bob 2010-06-01 (1275350400000).
+    uint64_t alice = graph.shard.local().NodeAddPeered("Person", "alice", "{\"name\": \"Alice\", \"created\": 1306886400000}").get();
+    uint64_t bob   = graph.shard.local().NodeAddPeered("Person", "bob",   "{\"name\": \"Bob\", \"created\": 1275350400000}").get();
+    uint64_t carol = graph.shard.local().NodeAddPeered("Person", "carol", "{\"name\": \"Carol\", \"created\": 1306886400000}").get();
+    graph.shard.local().RelationshipAddPeered("KNOWS", alice, bob, "{}").get();
+    graph.shard.local().RelationshipAddPeered("KNOWS", bob, carol, "{}").get();
+    graph.shard.local().RelationshipAddPeered("KNOWS", alice, carol, "{}").get();
+
+    SECTION("sum(CASE WHEN ... THEN 1 ELSE 0 END)") {
+        std::string res = GqlExecutor::execute(graph,
+            std::string("MATCH (p:Person) RETURN sum(CASE WHEN p.name = 'Alice' THEN 1 ELSE 0 END) AS n")).get();
+        INFO("result: " << res);
+        REQUIRE(res.find("\"n\": 1") != std::string::npos);
+    }
+
+    SECTION("COUNT { } subquery-count of a friend expansion") {
+        std::string res = GqlExecutor::execute(graph,
+            std::string("MATCH (p:Person {name: 'Alice'}) RETURN COUNT { (p)-[:KNOWS]->(f:Person) } AS c")).get();
+        INFO("result: " << res);
+        REQUIRE(res.find("\"c\": 2") != std::string::npos);  // Alice knows Bob and Carol
+    }
+
+    SECTION("length(path) over a shortest path is the hop count") {
+        std::string res = GqlExecutor::execute(graph,
+            std::string("MATCH p = ANY SHORTEST (a)-[:KNOWS]-{1,3}(b) "
+                        "WHERE a.name = 'Alice' AND b.name = 'Carol' RETURN length(p) AS d")).get();
+        INFO("result: " << res);
+        REQUIRE(res.find("\"d\": 1") != std::string::npos);  // Alice-[:KNOWS]->Carol is direct
+    }
+
+    SECTION("zoned_datetime() compares in epoch milliseconds (unit check)") {
+        // created >= 2011-01-01 (1293840000000 ms). Alice/Carol are 2011-06 (match); Bob is 2010-06 (no).
+        // If zoned_datetime returned SECONDS, all three would match -- so this discriminates the unit.
+        std::string res = GqlExecutor::execute(graph,
+            std::string("MATCH (p:Person) WHERE p.created >= zoned_datetime('2011-01-01') "
+                        "RETURN p.name AS n ORDER BY n")).get();
+        INFO("result: " << res);
+        REQUIRE(res.find("Alice") != std::string::npos);
+        REQUIRE(res.find("Carol") != std::string::npos);
+        REQUIRE(res.find("Bob") == std::string::npos);
+    }
+
+    SECTION("collect_list then NOT (x IN before) membership across NEXT") {
+        std::string res = GqlExecutor::execute(graph,
+            std::string("MATCH (a:Person {name: 'Alice'})-[:KNOWS]->(f:Person) "
+                        "RETURN collect_list(f) AS before "
+                        "NEXT "
+                        "MATCH (x:Person) WHERE NOT (x IN before) RETURN x.name AS n")).get();
+        INFO("result: " << res);
+        REQUIRE(res.find("Alice") != std::string::npos);  // Alice is not among her own friends
+        REQUIRE(res.find("Bob") == std::string::npos);
+        REQUIRE(res.find("Carol") == std::string::npos);
+    }
+
+    graph.Stop().get();
+}

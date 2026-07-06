@@ -156,6 +156,24 @@ static std::unique_ptr<Expression> substitute_return_aliases(
             bin->right = substitute_return_aliases(std::move(bin->right), aliases);
             return expr;
         }
+        case ExpressionKind::FUNCTION_CALL: {
+            auto* fc = static_cast<FunctionCallExpr*>(expr.get());
+            for (auto& a : fc->args) {
+                a = substitute_return_aliases(std::move(a), aliases);
+            }
+            return expr;
+        }
+        case ExpressionKind::CASE_WHEN: {
+            auto* ce = static_cast<CaseExpr*>(expr.get());
+            for (auto& b : ce->branches) {
+                b.first = substitute_return_aliases(std::move(b.first), aliases);
+                b.second = substitute_return_aliases(std::move(b.second), aliases);
+            }
+            if (ce->else_expr) {
+                ce->else_expr = substitute_return_aliases(std::move(ce->else_expr), aliases);
+            }
+            return expr;
+        }
         default:
             return expr;
     }
@@ -237,7 +255,10 @@ GqlQuery GqlParser::parse_single_query() {
     if (pending_having) {
         query.where_expr = std::move(pending_having);
     }
-    // Parse MATCH/OPTIONAL MATCH clauses
+    // Parse MATCH/OPTIONAL MATCH clauses. A WHERE may sit between MATCH groups
+    // (MATCH ... WHERE ... MATCH ... RETURN): after each group we take an optional WHERE and loop
+    // back so a following MATCH keeps extending the same segment.
+    while (true) {
     while (check(TokenType::MATCH) || (check(TokenType::OPTIONAL) && peek(1).type == TokenType::MATCH)) {
         MatchStatement stmt;
         if (match(TokenType::OPTIONAL)) {
@@ -440,14 +461,33 @@ GqlQuery GqlParser::parse_single_query() {
         }
     }
 
-    // Parse optional global WHERE clause (AND-combined with any HAVING carried in from a prior WITH).
-    if (match(TokenType::WHERE)) {
+    // A WHERE after a MATCH group filters those rows; the ISO GQL FILTER statement is its synonym on
+    // the working table. AND-combine either with any HAVING carried in from a prior WITH/NEXT and with
+    // earlier interleaved predicates in this segment.
+    if (match(TokenType::WHERE) || match(TokenType::FILTER_KW)) {
         auto w = parse_expression();
         if (query.where_expr) {
             query.where_expr = std::make_unique<BinaryOpExpr>(BinaryOpKind::AND, std::move(query.where_expr), std::move(w));
         } else {
             query.where_expr = std::move(w);
         }
+    } else if (match(TokenType::LET_KW)) {
+        // ISO GQL LET adds computed bindings to the working table, usable by the rest of the segment.
+        do {
+            ReturnItem item;
+            item.alias = consume_identifier("Expected variable name after 'LET'");
+            consume(TokenType::EQ, "Expected '=' after LET variable");
+            item.expr = parse_expression();
+            query.let_bindings.push_back(std::move(item));
+        } while (match(TokenType::COMMA));
+    }
+    // A segment is a free sequence of simple statements (MATCH / FILTER / LET); keep extending it while
+    // more of them follow. MATCH ... WHERE ... MATCH ... and FILTER ... MATCH ... both round-trip here.
+    if (check(TokenType::MATCH) || (check(TokenType::OPTIONAL) && peek(1).type == TokenType::MATCH) ||
+        check(TokenType::WHERE) || check(TokenType::FILTER_KW) || check(TokenType::LET_KW)) {
+        continue;
+    }
+    break;
     }
 
     // Parse Write Operations (INSERT, SET, REMOVE, DELETE, DETACH)
@@ -547,6 +587,31 @@ GqlQuery GqlParser::parse_single_query() {
             query.distinct = true;
         }
         parse_return_items(query, false);
+
+        // ISO GQL: `RETURN ... [ORDER BY ...] [LIMIT ...] NEXT` is an intermediate projection that
+        // feeds the next linear-query statement -- the same pipeline boundary as openCypher WITH.
+        // Detect it with a speculative scan past the optional result clauses so a final RETURN leaves
+        // any trailing ORDER BY / LIMIT for the (union-aware) top-level parser.
+        size_t saved_pos = pos;
+        {
+            GqlQuery scratch;
+            parse_order_by(scratch);
+            parse_limit(scratch);
+        }
+        bool intermediate = check(TokenType::NEXT_KW);
+        pos = saved_pos;
+        if (intermediate) {
+            parse_order_by(query);
+            resolve_order_by_aliases(query);
+            parse_limit(query);
+            consume(TokenType::NEXT_KW, "Expected 'NEXT'");
+            // A FILTER/WHERE right after NEXT is a HAVING predicate on the projected rows.
+            if (match(TokenType::FILTER_KW) || match(TokenType::WHERE)) {
+                pending_having = parse_expression();
+            }
+            with_segments.push_back(std::make_shared<GqlQuery>(std::move(query)));
+            continue;
+        }
     } else {
         if (query.writes.empty()) {
             throw std::runtime_error("Query must contain either a RETURN clause or at least one write clause");
@@ -1245,6 +1310,33 @@ std::unique_ptr<Expression> GqlParser::parse_comparison() {
             continue;
         }
 
+        // x IN [a, b, ...] desugars to (x = a OR x = b OR ...). This keeps the engine free of a
+        // dedicated list/IN node while matching membership semantics for a constant/expression list;
+        // an empty list is always false.
+        if (match(TokenType::IN_KW)) {
+            consume(TokenType::LBRACKET, "Expected '[' after 'IN'");
+            std::vector<std::unique_ptr<Expression>> items;
+            if (!check(TokenType::RBRACKET)) {
+                do {
+                    items.push_back(parse_expression());
+                } while (match(TokenType::COMMA));
+            }
+            consume(TokenType::RBRACKET, "Expected ']' to close 'IN' list");
+            if (items.empty()) {
+                expr = std::make_unique<LiteralExpr>(false);
+            } else {
+                std::unique_ptr<Expression> disjunction;
+                for (auto& item : items) {
+                    auto eq = std::make_unique<BinaryOpExpr>(BinaryOpKind::EQ, expr->clone(), std::move(item));
+                    disjunction = disjunction
+                        ? std::make_unique<BinaryOpExpr>(BinaryOpKind::OR, std::move(disjunction), std::move(eq))
+                        : std::move(eq);
+                }
+                expr = std::move(disjunction);
+            }
+            continue;
+        }
+
         if (check(TokenType::EQ) || check(TokenType::NE) ||
             check(TokenType::LT) || check(TokenType::LE) ||
             check(TokenType::GT) || check(TokenType::GE) ||
@@ -1438,6 +1530,25 @@ std::unique_ptr<Expression> GqlParser::parse_primary() {
         consume(TokenType::RBRACE, "Expected '}' after EXISTS subquery");
         return std::make_unique<ExistsExpr>(std::move(matches), std::move(sub_where));
     }
+    // Searched CASE expression: CASE WHEN cond THEN val [WHEN ...] [ELSE val] END.
+    if (match(TokenType::CASE_KW)) {
+        std::vector<std::pair<std::unique_ptr<Expression>, std::unique_ptr<Expression>>> branches;
+        while (match(TokenType::WHEN_KW)) {
+            auto cond = parse_expression();
+            consume(TokenType::THEN_KW, "Expected 'THEN' after CASE WHEN condition");
+            auto val = parse_expression();
+            branches.emplace_back(std::move(cond), std::move(val));
+        }
+        if (branches.empty()) {
+            throw std::runtime_error("CASE expression requires at least one WHEN branch");
+        }
+        std::unique_ptr<Expression> else_expr = nullptr;
+        if (match(TokenType::ELSE_KW)) {
+            else_expr = parse_expression();
+        }
+        consume(TokenType::END_KW, "Expected 'END' to close CASE expression");
+        return std::make_unique<CaseExpr>(std::move(branches), std::move(else_expr));
+    }
     if (match(TokenType::TRUE_KW)) {
         return std::make_unique<LiteralExpr>(true);
     }
@@ -1516,6 +1627,22 @@ std::unique_ptr<Expression> GqlParser::parse_primary() {
                 
                 consume(TokenType::RPAREN, "Expected ')' after size expression");
                 return std::make_unique<SizeExpr>(std::move(matches), std::move(sub_where));
+            } else {
+                // Generic scalar function call: name ( arg, ... ) -- e.g. length(p),
+                // zoned_datetime('2010-01-01'). Dispatched by name in the evaluator/typechecker.
+                advance(); // consume function name
+                consume(TokenType::LPAREN, "Expected '(' after function name");
+                std::vector<std::unique_ptr<Expression>> args;
+                if (!check(TokenType::RPAREN)) {
+                    do {
+                        args.push_back(parse_expression());
+                    } while (match(TokenType::COMMA));
+                }
+                consume(TokenType::RPAREN, "Expected ')' after function arguments");
+                std::string lname = var;
+                std::transform(lname.begin(), lname.end(), lname.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                return std::make_unique<FunctionCallExpr>(std::move(lname), std::move(args));
             }
         }
 

@@ -105,6 +105,12 @@ bool matches_filters(const std::map<std::string, property_type_t>& target, const
 GqlValue evaluate_expression(const GqlRow& row, const Expression* expr);
 
 /**
+ * @brief Evaluates a scalar function call (e.g. length(path), zoned_datetime('2010-01-01')) against a
+ *        row. Unknown functions return NIL. Shared by the row and group expression evaluators.
+ */
+GqlValue evaluate_scalar_function(const GqlRow& row, const FunctionCallExpr* fc);
+
+/**
  * @brief Serializes a GqlValue to its JSON string representation.
  */
 std::string serialize_gql_value(const GqlValue& val);

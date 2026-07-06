@@ -55,7 +55,9 @@ enum class ExpressionKind {
     AGGREGATION,      ///< GQL Aggregate function (e.g. COUNT, SUM, AVG, MIN, MAX)
     EXISTS,           ///< Exists subquery expression (e.g. EXISTS { MATCH ... })
     IS_NULL_CHECK,    ///< Null check expression (e.g. x IS NULL)
-    SIZE_OP           ///< Size function expression (e.g. size((x)-[:REL]->()))
+    SIZE_OP,          ///< Size function expression (e.g. size((x)-[:REL]->()))
+    FUNCTION_CALL,    ///< Scalar function call (e.g. length(p), zoned_datetime('2010-01-01'))
+    CASE_WHEN         ///< CASE WHEN cond THEN val [WHEN ...] [ELSE val] END conditional expression
 };
 
 /**
@@ -213,6 +215,48 @@ struct AggregateExpr : public Expression {
         auto copy = std::make_unique<AggregateExpr>(fn_kind, expr ? expr->clone() : nullptr, distinct);
         copy->count_to_sum = count_to_sum;
         return copy;
+    }
+};
+
+/**
+ * @brief Represents a scalar function call (e.g. length(p), zoned_datetime('2010-01-01')).
+ *        The function name is stored lowercased for case-insensitive dispatch.
+ */
+struct FunctionCallExpr : public Expression {
+    std::string name;                                    ///< Lowercased function name.
+    std::vector<std::unique_ptr<Expression>> args;       ///< Argument expressions.
+    FunctionCallExpr(std::string n, std::vector<std::unique_ptr<Expression>> a) {
+        kind = ExpressionKind::FUNCTION_CALL;
+        name = std::move(n);
+        args = std::move(a);
+    }
+    std::unique_ptr<Expression> clone() const override {
+        std::vector<std::unique_ptr<Expression>> copy_args;
+        copy_args.reserve(args.size());
+        for (const auto& a : args) copy_args.push_back(a ? a->clone() : nullptr);
+        return std::make_unique<FunctionCallExpr>(name, std::move(copy_args));
+    }
+};
+
+/**
+ * @brief Represents a searched CASE expression: CASE WHEN c1 THEN v1 [WHEN c2 THEN v2 ...] [ELSE e] END.
+ */
+struct CaseExpr : public Expression {
+    std::vector<std::pair<std::unique_ptr<Expression>, std::unique_ptr<Expression>>> branches; ///< (when, then) pairs.
+    std::unique_ptr<Expression> else_expr;               ///< Optional ELSE result (nullptr => NULL).
+    CaseExpr(std::vector<std::pair<std::unique_ptr<Expression>, std::unique_ptr<Expression>>> b,
+             std::unique_ptr<Expression> e) {
+        kind = ExpressionKind::CASE_WHEN;
+        branches = std::move(b);
+        else_expr = std::move(e);
+    }
+    std::unique_ptr<Expression> clone() const override {
+        std::vector<std::pair<std::unique_ptr<Expression>, std::unique_ptr<Expression>>> copy_branches;
+        copy_branches.reserve(branches.size());
+        for (const auto& [w, t] : branches) {
+            copy_branches.emplace_back(w ? w->clone() : nullptr, t ? t->clone() : nullptr);
+        }
+        return std::make_unique<CaseExpr>(std::move(copy_branches), else_expr ? else_expr->clone() : nullptr);
     }
 };
 
@@ -502,6 +546,7 @@ struct GqlQuery {
     std::unique_ptr<Expression> where_expr;  ///< Global WHERE filter expression.
     std::vector<WriteOp> writes;             ///< Sequence of write/mutation operations.
     std::vector<ReturnItem> returns;         ///< Projected RETURN clause items.
+    std::vector<ReturnItem> let_bindings;    ///< ISO GQL LET: computed bindings added to the working table before projection.
     bool distinct = false;                   ///< True if distinct results are required.
     std::vector<SortSpec> order_by;          ///< Sequence of sort specifications.
     std::optional<uint64_t> limit;           ///< Optional maximum number of rows to return.
@@ -552,7 +597,12 @@ struct GqlQuery {
         for (const auto& r : returns) {
             copy.returns.push_back(r.clone());
         }
-        
+
+        copy.let_bindings.reserve(let_bindings.size());
+        for (const auto& l : let_bindings) {
+            copy.let_bindings.push_back(l.clone());
+        }
+
         copy.distinct = distinct;
         
         copy.order_by.reserve(order_by.size());

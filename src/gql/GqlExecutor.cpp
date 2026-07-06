@@ -741,6 +741,7 @@ static bool stream_eligible(const GqlQuery& q) {
     if (!q.writes.empty()) return false;
     if (q.has_unnested_subquery) return false;
     if (q.matches.size() != 1) return false;
+    if (!q.let_bindings.empty()) return false; // LET adds computed columns; use the materialising path
     const auto& m = q.matches[0];
     if (m.is_optional || m.is_search || m.is_khop) return false;
     if (m.shortest_path_kind != ShortestPathKind::NONE) return false;
@@ -1081,7 +1082,7 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
     // count(Comment) over millions of rows) exhausts memory.
     {
         SimpleNodeCountPlan cplan;
-        if (!has_incoming && try_plan_simple_node_count(*query_ptr, cplan)) {
+        if (!has_incoming && query_ptr->let_bindings.empty() && try_plan_simple_node_count(*query_ptr, cplan)) {
             seastar::future<uint64_t> count_fut = cplan.has_filter
                 ? graph.shard.local().FindNodeCountPeered(cplan.label, cplan.filter_property, cplan.filter_op, cplan.filter_value)
                 : (cplan.has_label ? graph.shard.local().AllNodesCountPeered(cplan.label)
@@ -1106,7 +1107,7 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
     // large expansion (e.g. count(comment) per person over millions of comments) exhausts memory.
     {
         EdgeAggPlan eplan;
-        if (!has_incoming && plan_streaming_edge_aggregate(*query_ptr, eplan)) {
+        if (!has_incoming && query_ptr->let_bindings.empty() && plan_streaming_edge_aggregate(*query_ptr, eplan)) {
             return run_streaming_edge_aggregate(graph, query_ptr, std::move(eplan));
         }
     }
@@ -1151,6 +1152,11 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
     // Collect properties accessed in ORDER BY specs
     for (const auto& spec : query_ptr->order_by) {
         collect_accessed_properties(spec.expr.get(), pruner.accessed_props, pruner.whole_objects);
+    }
+
+    // Collect properties accessed in ISO GQL LET binding expressions
+    for (const auto& let : query_ptr->let_bindings) {
+        collect_accessed_properties(let.expr.get(), pruner.accessed_props, pruner.whole_objects);
     }
 
     // Collect properties accessed in WHERE filter
@@ -1488,6 +1494,18 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
                 }
             }
             matched_rows = std::move(edge_filtered_rows);
+        }
+
+        // 6b. Evaluate ISO GQL LET bindings against each matched row so the segment's WHERE/FILTER,
+        //     ORDER BY, and RETURN can reference them (LET adds computed columns to the working table).
+        if (!query.let_bindings.empty()) {
+            for (auto& row : matched_rows) {
+                for (const auto& let : query.let_bindings) {
+                    if (let.alias) {
+                        row.bindings[*let.alias] = evaluate_expression(row, let.expr.get());
+                    }
+                }
+            }
         }
 
         // 7. Evaluate GQL WHERE clause filter expression on match results

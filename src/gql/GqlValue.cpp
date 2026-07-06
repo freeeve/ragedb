@@ -15,8 +15,10 @@
  */
 
 #include "GqlValue.h"
+#include "../graph/types/Date.h"
 #include <seastar/json/json_elements.hh>
 #include <algorithm>
+#include <cmath>
 #include <sstream>
 
 namespace ragedb::gql {
@@ -204,6 +206,35 @@ bool matches_filters(const std::map<std::string, property_type_t>& target, const
  * @param expr The AST expression node to evaluate.
  * @return GqlValue The result of the evaluation.
  */
+GqlValue evaluate_scalar_function(const GqlRow& row, const FunctionCallExpr* fc) {
+    if (!fc) return GqlValue();
+    // length(path | relationship-list): number of relationships.
+    if (fc->name == "length") {
+        if (fc->args.size() != 1) return GqlValue();
+        GqlValue arg = evaluate_expression(row, fc->args[0].get());
+        if (arg.type == GqlValue::PATH) {
+            return GqlValue(static_cast<int64_t>(arg.path->length()));
+        }
+        if (arg.type == GqlValue::RELATIONSHIP_LIST) {
+            return GqlValue(static_cast<int64_t>(arg.relationship_list->size()));
+        }
+        return GqlValue();
+    }
+    // zoned_datetime / datetime / date (string): epoch MILLISECONDS as int64 (LDBC canonical unit).
+    // Date::convert yields epoch seconds (double), so scale by 1000.
+    if (fc->name == "zoned_datetime" || fc->name == "datetime" || fc->name == "date" ||
+        fc->name == "localdatetime") {
+        if (fc->args.size() != 1) return GqlValue();
+        GqlValue arg = evaluate_expression(row, fc->args[0].get());
+        if (arg.type == GqlValue::PROPERTY && std::holds_alternative<std::string>(arg.property)) {
+            double seconds = Date::convert(std::get<std::string>(arg.property));
+            return GqlValue(static_cast<int64_t>(std::llround(seconds * 1000.0)));
+        }
+        return GqlValue();
+    }
+    return GqlValue(); // unknown function
+}
+
 GqlValue evaluate_expression(const GqlRow& row, const Expression* expr) {
     if (!expr) return GqlValue();
 
@@ -224,6 +255,21 @@ GqlValue evaluate_expression(const GqlRow& row, const Expression* expr) {
         }
         case ExpressionKind::AGGREGATION: {
             return GqlValue(); // Aggregations are not evaluated on single rows
+        }
+        case ExpressionKind::CASE_WHEN: {
+            auto* ce = static_cast<const CaseExpr*>(expr);
+            for (const auto& branch : ce->branches) {
+                if (evaluate_expression(row, branch.first.get()).is_truthy()) {
+                    return evaluate_expression(row, branch.second.get());
+                }
+            }
+            if (ce->else_expr) {
+                return evaluate_expression(row, ce->else_expr.get());
+            }
+            return GqlValue();
+        }
+        case ExpressionKind::FUNCTION_CALL: {
+            return evaluate_scalar_function(row, static_cast<const FunctionCallExpr*>(expr));
         }
         case ExpressionKind::EXISTS: {
             auto* exists = static_cast<const ExistsExpr*>(expr);

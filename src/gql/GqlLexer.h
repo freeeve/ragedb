@@ -43,6 +43,14 @@ enum class TokenType {
     OPTIONAL,
     RETURN,
     WITH,
+    NEXT_KW,    // ISO GQL linear-query segment boundary
+    LET_KW,     // ISO GQL value binding (LET x = expr)
+    FILTER_KW,  // ISO GQL post-projection predicate (FILTER pred)
+    CASE_KW,    // CASE WHEN ... THEN ... ELSE ... END
+    WHEN_KW,
+    THEN_KW,
+    ELSE_KW,
+    END_KW,
     DISTINCT,
     ORDER_BY,
     LIMIT,

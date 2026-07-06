@@ -308,6 +308,16 @@ std::vector<Token> GqlLexer::tokenize(const std::string& input) {
             else if (upper_name == "NOT") type = TokenType::NOT;
             else if (upper_name == "AS") type = TokenType::AS;
             else if (upper_name == "IS") type = TokenType::IS;
+            // ISO GQL linear-query keywords
+            else if (upper_name == "NEXT") type = TokenType::NEXT_KW;
+            else if (upper_name == "LET") type = TokenType::LET_KW;
+            else if (upper_name == "FILTER") type = TokenType::FILTER_KW;
+            // CASE expression keywords
+            else if (upper_name == "CASE") type = TokenType::CASE_KW;
+            else if (upper_name == "WHEN") type = TokenType::WHEN_KW;
+            else if (upper_name == "THEN") type = TokenType::THEN_KW;
+            else if (upper_name == "ELSE") type = TokenType::ELSE_KW;
+            else if (upper_name == "END") type = TokenType::END_KW;
             // GQL Write/Modification keywords
             else if (upper_name == "INSERT") type = TokenType::INSERT;
             else if (upper_name == "DELETE") type = TokenType::DELETE;

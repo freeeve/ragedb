@@ -616,3 +616,212 @@ TEST_CASE("EXISTS accepts an openCypher-style bare pattern subquery (task 018)",
         "WHERE EXISTS { (x)-[:KNOWS]-(y:Person {id: 1}) } RETURN x.id");
     REQUIRE(q2.matches.size() == 2);
 }
+
+TEST_CASE("GQL interleaved MATCH ... WHERE ... MATCH within a segment (task 030)", "[gql_parser][task030]") {
+    SECTION("single segment: MATCH WHERE MATCH RETURN") {
+        auto q = GqlParser::parse(
+            "MATCH (a:Person)-[:KNOWS]-(f:Person) WHERE f.id <> 1 "
+            "MATCH (f)-[:HAS_CREATOR]->(post:Post) RETURN a.id");
+        REQUIRE(q.matches.size() == 2);
+        REQUIRE(q.where_expr != nullptr);
+    }
+    SECTION("across a WITH boundary (IC5 shape)") {
+        auto q = GqlParser::parse(
+            "MATCH (p:Person {id: 1})-[:KNOWS]-(f:Person) WHERE f.id <> 1 "
+            "WITH DISTINCT f "
+            "MATCH (forum:Forum)-[hm:HAS_MEMBER]->(f) WHERE hm.joinDate >= 100 "
+            "MATCH (forum)-[:CONTAINER_OF]->(post:Post)-[:HAS_CREATOR]->(f) "
+            "RETURN forum.id AS fid, count(DISTINCT post) AS cnt "
+            "ORDER BY count(DISTINCT post) DESC LIMIT 20");
+        REQUIRE(q.with_segments.size() == 1);
+        REQUIRE(q.matches.size() == 2); // final segment carries both MATCHes
+    }
+}
+
+TEST_CASE("GQL IN-list membership desugars to an OR chain (task 031)", "[gql_parser][task031]") {
+    auto q = GqlParser::parse(
+        "MATCH (c:Country) WHERE c.name IN ['China', 'Germany'] RETURN c.name");
+    REQUIRE(q.where_expr != nullptr);
+    // x IN [a, b] -> (x = a) OR (x = b)
+    REQUIRE(q.where_expr->kind == ExpressionKind::BINARY_OP);
+    auto* top = static_cast<BinaryOpExpr*>(q.where_expr.get());
+    REQUIRE(top->op == BinaryOpKind::OR);
+    REQUIRE(top->left->kind == ExpressionKind::BINARY_OP);
+    REQUIRE(static_cast<BinaryOpExpr*>(top->left.get())->op == BinaryOpKind::EQ);
+
+    SECTION("empty list is always false") {
+        auto q2 = GqlParser::parse("MATCH (c:Country) WHERE c.name IN [] RETURN c.name");
+        REQUIRE(q2.where_expr->kind == ExpressionKind::LITERAL);
+    }
+    SECTION("multi-hop EXISTS with inner IN-list WHERE (IC3 openCypher shape)") {
+        REQUIRE_NOTHROW(GqlParser::parse(
+            "MATCH (p:Person {id: 1})-[:KNOWS]-(f:Person) WHERE f.id <> 1 "
+            "WITH DISTINCT f "
+            "WHERE NOT EXISTS { MATCH (f)-[:IS_LOCATED_IN]->(:City)-[:IS_PART_OF]->(h:Country) "
+            "WHERE h.name IN ['China', 'Germany'] } "
+            "MATCH (f)<-[:HAS_CREATOR]-(m)-[:IS_LOCATED_IN]->(c:Country) "
+            "RETURN f.id AS pid, count(DISTINCT c) AS cnt"));
+    }
+}
+
+TEST_CASE("GQL ISO linear-query NEXT/FILTER lowering (task 032)", "[gql_parser][task032]") {
+    SECTION("RETURN ... NEXT is a projection boundary equivalent to WITH") {
+        auto with_q = GqlParser::parse(
+            "MATCH (a:Person) WITH a.id AS x MATCH (b:Person) WHERE b.id = x RETURN b.name");
+        auto next_q = GqlParser::parse(
+            "MATCH (a:Person) RETURN a.id AS x NEXT MATCH (b:Person) WHERE b.id = x RETURN b.name");
+        REQUIRE(next_q.with_segments.size() == with_q.with_segments.size());
+        REQUIRE(next_q.with_segments.size() == 1);
+        REQUIRE(next_q.with_segments[0]->returns.size() == with_q.with_segments[0]->returns.size());
+        REQUIRE(next_q.with_segments[0]->returns[0].alias == std::string("x"));
+        REQUIRE(next_q.returns.size() == 1);
+    }
+    SECTION("RETURN DISTINCT ... NEXT carries the distinct projection forward") {
+        auto q = GqlParser::parse(
+            "MATCH (p:Person {id: 1})-[:KNOWS]-(f:Person) WHERE f.id <> 1 "
+            "RETURN DISTINCT f "
+            "NEXT "
+            "MATCH (forum:Forum)-[:HAS_MEMBER]->(f) "
+            "MATCH (forum)-[:CONTAINER_OF]->(post:Post)-[:HAS_CREATOR]->(f) "
+            "RETURN forum.id AS forumId, count(DISTINCT post) AS postCount "
+            "ORDER BY postCount DESC, forumId ASC LIMIT 20");
+        REQUIRE(q.with_segments.size() == 1);
+        REQUIRE(q.with_segments[0]->distinct == true);
+        REQUIRE(q.matches.size() == 2);
+    }
+    SECTION("FILTER lowers to a segment predicate like WHERE") {
+        auto q = GqlParser::parse(
+            "MATCH (p:Person {id: 1})-[:KNOWS]-(f:Person) "
+            "RETURN DISTINCT f "
+            "NEXT "
+            "FILTER NOT EXISTS { (f)-[:IS_LOCATED_IN]->(:City) } "
+            "MATCH (f)<-[:HAS_CREATOR]-(m:Message)-[:IS_LOCATED_IN]->(c:Country) "
+            "WHERE c.name IN ['China', 'Germany'] "
+            "RETURN f.id AS pid, count(DISTINCT c) AS cnt");
+        REQUIRE(q.with_segments.size() == 1);
+        REQUIRE(q.where_expr != nullptr); // FILTER + WHERE combined onto the final segment
+    }
+    SECTION("intermediate RETURN keeps ORDER BY/LIMIT on its own segment") {
+        auto q = GqlParser::parse(
+            "MATCH (p:Person {id: 1})<-[:HAS_CREATOR]-(m:Message) "
+            "RETURN m ORDER BY m.creationDate DESC LIMIT 20 "
+            "NEXT "
+            "RETURN m.creationDate AS ms");
+        REQUIRE(q.with_segments.size() == 1);
+        REQUIRE(q.with_segments[0]->limit.has_value());
+        REQUIRE(q.with_segments[0]->limit.value() == 20);
+        REQUIRE(q.with_segments[0]->order_by.size() == 1);
+    }
+    SECTION("WITH still accepted alongside NEXT (additive dialect)") {
+        REQUIRE_NOTHROW(GqlParser::parse("MATCH (a:Person) WITH a AS x RETURN x.name"));
+    }
+    SECTION("LET binds a computed column usable by a later FILTER/RETURN") {
+        auto q = GqlParser::parse(
+            "MATCH (p:Person) LET fullName = p.firstName || ' ' || p.lastName "
+            "FILTER fullName <> '' RETURN fullName");
+        REQUIRE(q.let_bindings.size() == 1);
+        REQUIRE(q.let_bindings[0].alias.has_value());
+        REQUIRE(q.let_bindings[0].alias.value() == "fullName");
+        REQUIRE(q.where_expr != nullptr); // FILTER lowered to a predicate
+    }
+    SECTION("multiple LET bindings, comma-separated") {
+        auto q = GqlParser::parse("MATCH (p:Person) LET a = p.x, b = p.y RETURN a, b");
+        REQUIRE(q.let_bindings.size() == 2);
+    }
+    SECTION("full pure-GQL IC5 shape parses (RETURN DISTINCT ... NEXT ... aggregate)") {
+        REQUIRE_NOTHROW(GqlParser::parse(
+            "MATCH TRAIL (p:Person {id: 4398046519825})-[:KNOWS]-{1,2}(f:Person) "
+            "WHERE f.id <> 4398046519825 "
+            "RETURN DISTINCT f "
+            "NEXT "
+            "MATCH (forum:Forum)-[hm:HAS_MEMBER]->(f) "
+            "WHERE hm.joinDate >= 100 "
+            "MATCH (forum)-[:CONTAINER_OF]->(post:Post)-[:HAS_CREATOR]->(f) "
+            "RETURN forum.id AS forumId, count(DISTINCT post) AS postCount "
+            "ORDER BY postCount DESC, forumId ASC LIMIT 20"));
+    }
+    SECTION("full pure-GQL IC3 shape parses (FILTER + NOT EXISTS + IN + multi-NEXT)") {
+        REQUIRE_NOTHROW(GqlParser::parse(
+            "MATCH TRAIL (p:Person {id: 1})-[:KNOWS]-{1,2}(f:Person) WHERE f.id <> 1 "
+            "RETURN DISTINCT f "
+            "NEXT "
+            "FILTER NOT EXISTS { (f)-[:IS_LOCATED_IN]->(:City)-[:IS_PART_OF]->(:Country {name: 'China'}) } "
+            "  AND NOT EXISTS { (f)-[:IS_LOCATED_IN]->(:City)-[:IS_PART_OF]->(:Country {name: 'Germany'}) } "
+            "MATCH (f)<-[:HAS_CREATOR]-(m:Message)-[:IS_LOCATED_IN]->(c:Country) "
+            "WHERE c.name IN ['China', 'Germany'] "
+            "RETURN f.id AS personId, count(DISTINCT c) AS cnt "
+            "ORDER BY cnt DESC, personId ASC LIMIT 20"));
+    }
+}
+
+TEST_CASE("GQL scalar functions and CASE expressions (task 032 slice: length/CASE/zoned_datetime)", "[gql_parser][task032_expr]") {
+    SECTION("length(p) is a scalar function call") {
+        auto q = GqlParser::parse(
+            "MATCH p = ANY SHORTEST (a)-[:KNOWS]-{1,3}(f) RETURN length(p) AS d");
+        REQUIRE(q.returns.size() == 1);
+        REQUIRE(q.returns[0].expr->kind == ExpressionKind::FUNCTION_CALL);
+        auto* fc = static_cast<FunctionCallExpr*>(q.returns[0].expr.get());
+        REQUIRE(fc->name == "length"); // lowercased
+        REQUIRE(fc->args.size() == 1);
+    }
+    SECTION("full pure-GQL IC1 shape parses (ANY SHORTEST + length + ORDER BY alias)") {
+        REQUIRE_NOTHROW(GqlParser::parse(
+            "MATCH (a:Person {id: 4398046519825}), (f:Person {firstName: 'John'}) "
+            "MATCH p = ANY SHORTEST (a)-[:KNOWS]-{1,3}(f) "
+            "RETURN length(p) AS dist, f.lastName AS lname, f.id AS pid "
+            "ORDER BY dist, lname, pid LIMIT 20"));
+    }
+    SECTION("full pure-GQL IC13 shape parses (unbounded + length)") {
+        REQUIRE_NOTHROW(GqlParser::parse(
+            "MATCH (a:Person {id: 1}), (b:Person {id: 2}) "
+            "MATCH pth = ANY SHORTEST (a)-[:KNOWS]-+(b) "
+            "RETURN length(pth) AS hops"));
+    }
+    SECTION("searched CASE WHEN ... THEN ... ELSE ... END") {
+        auto q = GqlParser::parse(
+            "MATCH (c:Country) RETURN CASE WHEN c.name = 'China' THEN 1 ELSE 0 END AS x");
+        REQUIRE(q.returns[0].expr->kind == ExpressionKind::CASE_WHEN);
+        auto* ce = static_cast<CaseExpr*>(q.returns[0].expr.get());
+        REQUIRE(ce->branches.size() == 1);
+        REQUIRE(ce->else_expr != nullptr);
+    }
+    SECTION("CASE with multiple WHEN branches and no ELSE") {
+        auto q = GqlParser::parse(
+            "MATCH (p:Person) RETURN CASE WHEN p.age < 18 THEN 'minor' "
+            "WHEN p.age < 65 THEN 'adult' END AS bucket");
+        auto* ce = static_cast<CaseExpr*>(q.returns[0].expr.get());
+        REQUIRE(ce->branches.size() == 2);
+        REQUIRE(ce->else_expr == nullptr);
+    }
+    SECTION("aggregated CASE: sum(CASE WHEN ... THEN 1 ELSE 0 END)") {
+        REQUIRE_NOTHROW(GqlParser::parse(
+            "MATCH (f:Person)-[:IS_LOCATED_IN]->(c:Country) "
+            "RETURN f, sum(CASE WHEN c.name = 'China' THEN 1 ELSE 0 END) AS xc, "
+            "sum(CASE WHEN c.name = 'Germany' THEN 1 ELSE 0 END) AS yc"));
+    }
+    SECTION("zoned_datetime() scalar function in a WHERE comparison") {
+        auto q = GqlParser::parse(
+            "MATCH (m:Message) WHERE m.creationDate >= zoned_datetime('2010-01-01') "
+            "AND m.creationDate < zoned_datetime('2014-02-09') RETURN m");
+        REQUIRE(q.where_expr != nullptr);
+    }
+    SECTION("full pure-GQL IC3 shape with CASE + zoned_datetime parses") {
+        REQUIRE_NOTHROW(GqlParser::parse(
+            "MATCH TRAIL (p:Person {id: 1})-[:KNOWS]-{1,2}(f:Person) WHERE f.id <> 1 "
+            "RETURN DISTINCT f "
+            "NEXT "
+            "FILTER NOT EXISTS { (f)-[:IS_LOCATED_IN]->(:City)-[:IS_PART_OF]->(:Country {name: 'China'}) } "
+            "MATCH (f)<-[:HAS_CREATOR]-(m:Message)-[:IS_LOCATED_IN]->(c:Country) "
+            "WHERE c.name IN ['China', 'Germany'] "
+            "  AND m.creationDate >= zoned_datetime('2010-01-01') "
+            "  AND m.creationDate < zoned_datetime('2014-02-09') "
+            "RETURN f, "
+            "  sum(CASE WHEN c.name = 'China' THEN 1 ELSE 0 END) AS countryXCount, "
+            "  sum(CASE WHEN c.name = 'Germany' THEN 1 ELSE 0 END) AS countryYCount "
+            "NEXT "
+            "FILTER countryXCount > 0 AND countryYCount > 0 "
+            "RETURN f.id AS personId, countryXCount, countryYCount "
+            "ORDER BY countryXCount + countryYCount DESC, personId ASC "
+            "LIMIT 20"));
+    }
+}

@@ -50,10 +50,10 @@ namespace ragedb::gql {
 inline size_t gql_scan_chunk_size = 65536;
 
 /**
- * @brief Frontier chunk size for streamed traversals: with a row sink attached, each traversal
- *        level processes its rows in chunks that drain all the way to the sink before the next
- *        chunk expands, so no level's row set is ever fully materialised. Tests shrink it to
- *        exercise chunk boundaries on small graphs.
+ * @brief Retained tuning knob for streamed traversals. The streamed drive is row-by-row (each
+ *        frontier row's expansion drains to the sink through all remaining hops before the next
+ *        row expands), so this no longer bounds anything by itself; it is kept for tests and as
+ *        the batching knob if bounded-concurrency expansion is added later.
  */
 inline size_t gql_stream_chunk_size = 256;
 

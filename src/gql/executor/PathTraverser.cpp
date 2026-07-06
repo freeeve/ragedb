@@ -708,26 +708,30 @@ static seastar::future<std::vector<GqlRow>> traverse_path_pattern_iterative(rage
         return seastar::make_ready_future<std::vector<GqlRow>>(std::move(current_step_rows));
     }
 
-    // Streamed traversal: process the frontier in chunks that each drain all the way to the sink
-    // before the next chunk expands, so no level's full row set is ever materialised at once.
-    if (sink && current_step_rows.size() > gql_stream_chunk_size) {
-        struct ChunkState {
+    // Streamed traversal: expand the frontier row by row, each row's expansion draining through
+    // all remaining hops to the sink before the next row starts. Peak memory is one row's fanout
+    // per level plus the sink's own state, never a whole level's row set (even a modest chunk of
+    // hub nodes crossed with their expansions was enough to exhaust memory at SF1).
+    if (sink) {
+        struct RowLoopState {
             std::vector<GqlRow> rows;
-            size_t offset = 0;
+            size_t idx = 0;
         };
-        auto st = std::make_shared<ChunkState>();
+        auto st = std::make_shared<RowLoopState>();
         st->rows = std::move(current_step_rows);
-        const size_t chunk = gql_stream_chunk_size > 0 ? gql_stream_chunk_size : 256;
-        return seastar::repeat([st, chunk, &graph, prep_pattern, step_idx, limit, pruner, path_mode, sink] {
-            if (st->offset >= st->rows.size()) {
+        return seastar::repeat([st, &graph, prep_pattern, step_idx, limit, pruner, path_mode, sink] {
+            if (st->idx >= st->rows.size()) {
                 return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::yes);
             }
-            size_t end = std::min(st->offset + chunk, st->rows.size());
-            std::vector<GqlRow> slice(std::make_move_iterator(st->rows.begin() + static_cast<std::ptrdiff_t>(st->offset)),
-                                      std::make_move_iterator(st->rows.begin() + static_cast<std::ptrdiff_t>(end)));
-            st->offset = end;
-            return traverse_path_pattern_iterative(graph, prep_pattern, step_idx, std::move(slice), limit, pruner, path_mode, sink)
-                .then([](std::vector<GqlRow>) { return seastar::stop_iteration::no; });
+            const GqlRow& row = st->rows[st->idx++];
+            return traverse_step(graph, row, prep_pattern.edges[step_idx], prep_pattern.nodes[step_idx + 1], step_idx, 0, pruner, path_mode)
+            .then([st, &graph, prep_pattern, step_idx, limit, pruner, path_mode, sink](std::vector<GqlRow> step_rows) {
+                if (step_rows.empty()) {
+                    return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::no);
+                }
+                return traverse_path_pattern_iterative(graph, prep_pattern, step_idx + 1, std::move(step_rows), limit, pruner, path_mode, sink)
+                    .then([](std::vector<GqlRow>) { return seastar::stop_iteration::no; });
+            });
         }).then([st] { return std::vector<GqlRow>{}; });
     }
 

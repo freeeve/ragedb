@@ -128,6 +128,58 @@ void GqlParser::parse_return_items(GqlQuery& query, bool require_alias_for_expre
 }
 
 /**
+ * @brief Replace references to the projection's output aliases inside an ORDER BY sort key with
+ *        clones of the aliased expressions. ORDER BY is evaluated after the projection, so its
+ *        aliases are in scope for the sort keys (as in Cypher and SQL); the executor evaluates
+ *        sort keys against pre-projection rows, so the substitution reconstructs that scope.
+ *        Aggregation arguments are not descended into (an alias cannot appear there).
+ */
+static std::unique_ptr<Expression> substitute_return_aliases(
+        std::unique_ptr<Expression> expr, const std::map<std::string, const Expression*>& aliases) {
+    if (!expr) return expr;
+    switch (expr->kind) {
+        case ExpressionKind::VARIABLE: {
+            auto it = aliases.find(static_cast<const VariableExpr*>(expr.get())->name);
+            if (it != aliases.end()) {
+                return it->second->clone();
+            }
+            return expr;
+        }
+        case ExpressionKind::UNARY_OP: {
+            auto* un = static_cast<UnaryOpExpr*>(expr.get());
+            un->expr = substitute_return_aliases(std::move(un->expr), aliases);
+            return expr;
+        }
+        case ExpressionKind::BINARY_OP: {
+            auto* bin = static_cast<BinaryOpExpr*>(expr.get());
+            bin->left = substitute_return_aliases(std::move(bin->left), aliases);
+            bin->right = substitute_return_aliases(std::move(bin->right), aliases);
+            return expr;
+        }
+        default:
+            return expr;
+    }
+}
+
+/**
+ * @brief Bind the RETURN/WITH projection's output aliases into the ORDER BY sort-key scope by
+ *        substituting them with their defining expressions (task 027).
+ */
+static void resolve_order_by_aliases(GqlQuery& query) {
+    if (query.order_by.empty() || query.returns.empty()) return;
+    std::map<std::string, const Expression*> aliases;
+    for (const auto& item : query.returns) {
+        if (item.alias && item.expr) {
+            aliases[*item.alias] = item.expr.get();
+        }
+    }
+    if (aliases.empty()) return;
+    for (auto& spec : query.order_by) {
+        spec.expr = substitute_return_aliases(std::move(spec.expr), aliases);
+    }
+}
+
+/**
  * @brief Parse an optional ORDER BY clause (with per-key ASC/DESC) into query.order_by.
  */
 void GqlParser::parse_order_by(GqlQuery& query) {
@@ -477,6 +529,7 @@ GqlQuery GqlParser::parse_single_query() {
         }
         parse_return_items(query, true);
         parse_order_by(query);
+        resolve_order_by_aliases(query);
         parse_limit(query);
         // A WHERE right after WITH is a HAVING filter on the projected rows; it applies to the next
         // segment, which sees the projected bindings.
@@ -766,6 +819,9 @@ GqlQuery GqlParser::parse_query() {
 
     // Parse optional top-level ORDER BY / LIMIT clauses
     parse_order_by(query);
+    if (query.kind == QueryKind::SINGLE) {
+        resolve_order_by_aliases(query);
+    }
     parse_limit(query);
 
     query.explain = explain;

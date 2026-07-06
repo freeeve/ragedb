@@ -191,6 +191,50 @@ TEST_CASE("streamed top-K and group folds match materialised results", "[gql_exe
     graph.Stop().get();
 }
 
+TEST_CASE("ORDER BY over RETURN aliases executes correctly (task 027)", "[gql_executor_with][task027]") {
+    auto graph = Graph("gql_orderby_alias_test");
+    graph.Start().get();
+    graph.Clear();
+    graph.shard.local().NodeTypeInsertPeered("Person").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "name", "string").get();
+    graph.shard.local().NodeTypeInsertPeered("Comment").get();
+    graph.shard.local().RelationshipTypeInsertPeered("HAS_CREATOR").get();
+
+    uint64_t alice = graph.shard.local().NodeAddPeered("Person", "alice", "{\"name\": \"Alice\"}").get();
+    uint64_t bob = graph.shard.local().NodeAddPeered("Person", "bob", "{\"name\": \"Bob\"}").get();
+    uint64_t carol = graph.shard.local().NodeAddPeered("Person", "carol", "{\"name\": \"Carol\"}").get();
+    auto comment = [&](const std::string& key, uint64_t creator) {
+        uint64_t c = graph.shard.local().NodeAddPeered("Comment", key, "{}").get();
+        graph.shard.local().RelationshipAddPeered("HAS_CREATOR", c, creator, "{}").get();
+    };
+    comment("c1", alice); comment("c2", alice); comment("c3", alice);
+    comment("c4", bob);
+    comment("c5", carol); comment("c6", carol);
+
+    SECTION("sort by projected aggregate alias, then by projected name alias") {
+        std::string res = GqlExecutor::execute(graph,
+            std::string("MATCH (p:Person)<-[:HAS_CREATOR]-(m:Comment) "
+                        "RETURN p.name AS name, count(DISTINCT m) AS cnt "
+                        "ORDER BY cnt DESC, name ASC LIMIT 2")).get();
+        INFO("result: " << res);
+        REQUIRE(res.find("\"name\": \"Alice\", \"cnt\": 3") != std::string::npos);
+        REQUIRE(res.find("\"name\": \"Carol\", \"cnt\": 2") != std::string::npos);
+        REQUIRE(res.find("Bob") == std::string::npos);
+        REQUIRE(res.find("Alice") < res.find("Carol"));
+    }
+
+    SECTION("alias sort keys work in a WITH segment") {
+        std::string res = GqlExecutor::execute(graph,
+            std::string("MATCH (p:Person)<-[:HAS_CREATOR]-(m:Comment) "
+                        "WITH p, count(m) AS cnt ORDER BY cnt DESC LIMIT 1 "
+                        "RETURN p.name AS n, cnt")).get();
+        INFO("result: " << res);
+        REQUIRE(res.find("\"n\": \"Alice\", \"cnt\": 3") != std::string::npos);
+    }
+
+    graph.Stop().get();
+}
+
 TEST_CASE("count over an empty expansion is 0 even when rewritten to a degree sum", "[gql_executor_with][task019]") {
     auto graph = Graph("gql_count_to_sum_empty_test");
     graph.Start().get();

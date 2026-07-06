@@ -204,7 +204,7 @@ TEST_CASE("GQL Static Typechecker Tests", "[gql_typechecker]") {
     graph.Stop().get();
 }
 
-TEST_CASE("Typechecker is WITH-aware (task 022)", "[gql_typechecker][task022]") {
+TEST_CASE("Typechecker is linear-query (NEXT) aware (task 022)", "[gql_typechecker][task022]") {
     auto graph = Graph("gql_typechecker_with_test");
     graph.Start().get();
     graph.Clear();
@@ -214,31 +214,31 @@ TEST_CASE("Typechecker is WITH-aware (task 022)", "[gql_typechecker][task022]") 
     graph.shard.local().RelationshipTypeInsertPeered("FRIEND_OF").get();
 
     SECTION("piped variables are visible in later segments") {
-        auto query = GqlParser::parse("MATCH (p:Person) WITH p RETURN p.name");
+        auto query = GqlParser::parse("MATCH (p:Person) RETURN p NEXT RETURN p.name");
         REQUIRE_NOTHROW(GqlTypechecker::typecheck(graph, query));
 
         auto staged = GqlParser::parse(
-            "MATCH (p:Person) WITH p MATCH (p)-[:FRIEND_OF]->(f:Person) RETURN f.name");
+            "MATCH (p:Person) RETURN p NEXT MATCH (p)-[:FRIEND_OF]->(f:Person) RETURN f.name");
         REQUIRE_NOTHROW(GqlTypechecker::typecheck(graph, staged));
 
-        auto aliased = GqlParser::parse("MATCH (p:Person) WITH p.age AS a RETURN a");
+        auto aliased = GqlParser::parse("MATCH (p:Person) RETURN p.age AS a NEXT RETURN a");
         REQUIRE_NOTHROW(GqlTypechecker::typecheck(graph, aliased));
     }
 
-    SECTION("an unbound variable after WITH throws instead of returning nulls") {
-        auto query = GqlParser::parse("MATCH (p:Person) WITH p RETURN q.name");
+    SECTION("an unbound variable after NEXT throws instead of returning nulls") {
+        auto query = GqlParser::parse("MATCH (p:Person) RETURN p NEXT RETURN q.name");
         REQUIRE_THROWS_WITH(GqlTypechecker::typecheck(graph, query), Catch::Contains("q"));
     }
 
     SECTION("a type error inside the first segment is still caught") {
-        auto query = GqlParser::parse("MATCH (p:Person) WHERE p.salary > 1 WITH p RETURN p.name");
+        auto query = GqlParser::parse("MATCH (p:Person) WHERE p.salary > 1 RETURN p NEXT RETURN p.name");
         REQUIRE_THROWS_WITH(GqlTypechecker::typecheck(graph, query),
             Catch::Contains("Property 'salary' does not exist"));
     }
 
-    SECTION("variables not projected by WITH are out of scope downstream") {
+    SECTION("variables not projected before NEXT are out of scope downstream") {
         auto query = GqlParser::parse(
-            "MATCH (p:Person)-[:FRIEND_OF]->(r:Person) WITH p RETURN r.name");
+            "MATCH (p:Person)-[:FRIEND_OF]->(r:Person) RETURN p NEXT RETURN r.name");
         REQUIRE_THROWS_WITH(GqlTypechecker::typecheck(graph, query), Catch::Contains("r"));
     }
 

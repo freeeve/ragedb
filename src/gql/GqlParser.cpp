@@ -174,6 +174,12 @@ static std::unique_ptr<Expression> substitute_return_aliases(
             }
             return expr;
         }
+        case ExpressionKind::IN_LIST: {
+            auto* in = static_cast<InExpr*>(expr.get());
+            in->value = substitute_return_aliases(std::move(in->value), aliases);
+            in->list = substitute_return_aliases(std::move(in->list), aliases);
+            return expr;
+        }
         default:
             return expr;
     }
@@ -1337,29 +1343,34 @@ std::unique_ptr<Expression> GqlParser::parse_comparison() {
             continue;
         }
 
-        // x IN [a, b, ...] desugars to (x = a OR x = b OR ...). This keeps the engine free of a
-        // dedicated list/IN node while matching membership semantics for a constant/expression list;
-        // an empty list is always false.
+        // x IN [a, b, ...] (a literal list) desugars to (x = a OR x = b OR ...), reusing tested EQ/OR
+        // execution; an empty list is always false. x IN <expr> (a list-valued right operand, e.g. a
+        // collect_list result) becomes an InExpr evaluated as runtime membership.
         if (match(TokenType::IN_KW)) {
-            consume(TokenType::LBRACKET, "Expected '[' after 'IN'");
-            std::vector<std::unique_ptr<Expression>> items;
-            if (!check(TokenType::RBRACKET)) {
-                do {
-                    items.push_back(parse_expression());
-                } while (match(TokenType::COMMA));
-            }
-            consume(TokenType::RBRACKET, "Expected ']' to close 'IN' list");
-            if (items.empty()) {
-                expr = std::make_unique<LiteralExpr>(false);
-            } else {
-                std::unique_ptr<Expression> disjunction;
-                for (auto& item : items) {
-                    auto eq = std::make_unique<BinaryOpExpr>(BinaryOpKind::EQ, expr->clone(), std::move(item));
-                    disjunction = disjunction
-                        ? std::make_unique<BinaryOpExpr>(BinaryOpKind::OR, std::move(disjunction), std::move(eq))
-                        : std::move(eq);
+            if (check(TokenType::LBRACKET)) {
+                advance(); // consume '['
+                std::vector<std::unique_ptr<Expression>> items;
+                if (!check(TokenType::RBRACKET)) {
+                    do {
+                        items.push_back(parse_expression());
+                    } while (match(TokenType::COMMA));
                 }
-                expr = std::move(disjunction);
+                consume(TokenType::RBRACKET, "Expected ']' to close 'IN' list");
+                if (items.empty()) {
+                    expr = std::make_unique<LiteralExpr>(false);
+                } else {
+                    std::unique_ptr<Expression> disjunction;
+                    for (auto& item : items) {
+                        auto eq = std::make_unique<BinaryOpExpr>(BinaryOpKind::EQ, expr->clone(), std::move(item));
+                        disjunction = disjunction
+                            ? std::make_unique<BinaryOpExpr>(BinaryOpKind::OR, std::move(disjunction), std::move(eq))
+                            : std::move(eq);
+                    }
+                    expr = std::move(disjunction);
+                }
+            } else {
+                auto list_expr = parse_add_sub();
+                expr = std::make_unique<InExpr>(std::move(expr), std::move(list_expr));
             }
             continue;
         }
@@ -1633,7 +1644,8 @@ std::unique_ptr<Expression> GqlParser::parse_primary() {
         if (peek(1).type == TokenType::LPAREN) {
             std::string upper_name = var;
             std::transform(upper_name.begin(), upper_name.end(), upper_name.begin(), [](unsigned char c){ return std::toupper(c); });
-            if (upper_name == "COUNT" || upper_name == "SUM" || upper_name == "AVG" || upper_name == "MIN" || upper_name == "MAX") {
+            if (upper_name == "COUNT" || upper_name == "SUM" || upper_name == "AVG" || upper_name == "MIN" || upper_name == "MAX" ||
+                upper_name == "COLLECT" || upper_name == "COLLECT_LIST") {
                 advance(); // consume function name
                 consume(TokenType::LPAREN, "Expected '(' after aggregate function");
                 
@@ -1656,6 +1668,7 @@ std::unique_ptr<Expression> GqlParser::parse_primary() {
                 else if (upper_name == "SUM") fn = AggregateKind::SUM;
                 else if (upper_name == "AVG") fn = AggregateKind::AVG;
                 else if (upper_name == "MIN") fn = AggregateKind::MIN;
+                else if (upper_name == "COLLECT" || upper_name == "COLLECT_LIST") fn = AggregateKind::COLLECT;
                 else fn = AggregateKind::MAX;
 
                 return std::make_unique<AggregateExpr>(fn, std::move(arg), distinct);

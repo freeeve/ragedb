@@ -533,6 +533,11 @@ bool is_variable_referenced_outside_count(const Expression* expr, const std::str
             }
             return ce->else_expr && is_variable_referenced_outside_count(ce->else_expr.get(), var_name);
         }
+        case ExpressionKind::IN_LIST: {
+            auto* in = static_cast<const InExpr*>(expr);
+            return is_variable_referenced_outside_count(in->value.get(), var_name) ||
+                   is_variable_referenced_outside_count(in->list.get(), var_name);
+        }
         default:
             return false;
     }

@@ -347,9 +347,11 @@ static bool plan_streaming_edge_aggregate(const GqlQuery& q, EdgeAggPlan& out) {
     if (out.aggs.empty()) return false;
 
     // DISTINCT aggregates (e.g. count(DISTINCT x)) need per-group value dedup, which the streaming
-    // accumulator does not perform; fall back to the normal grouped aggregation path.
+    // accumulator does not perform; collect_list gathers a list the accumulator does not build. Both
+    // fall back to the normal grouped aggregation path.
     for (const auto* agg : out.aggs) {
         if (agg->distinct) return false;
+        if (agg->fn_kind == AggregateKind::COLLECT) return false;
     }
 
     // Aggregates must be count(*) or over a single variable / one of its properties.
@@ -1278,7 +1280,13 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
             std::vector<const AggregateExpr*> aggs;
             for (const auto& item : query_ptr->returns) find_aggregates(item.expr.get(), aggs);
             for (const auto& spec : query_ptr->order_by) find_aggregates(spec.expr.get(), aggs);
-            if (!aggs.empty()) {
+            // collect_list gathers a list the streaming accumulator does not build; use the
+            // materialising group path for it.
+            bool has_collect = false;
+            for (const auto* a : aggs) {
+                if (a->fn_kind == AggregateKind::COLLECT) { has_collect = true; break; }
+            }
+            if (!aggs.empty() && !has_collect) {
                 return run_streaming_group_fold(graph, query_ptr, std::move(incoming), pruner,
                                                 std::move(grouping_keys), std::move(aggs));
             }
@@ -1670,6 +1678,8 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
                             aggregate_results[agg] = distinct_vals.empty() ? GqlValue() : *distinct_vals.begin();
                         } else if (agg->fn_kind == AggregateKind::MAX) {
                             aggregate_results[agg] = distinct_vals.empty() ? GqlValue() : *distinct_vals.rbegin();
+                        } else if (agg->fn_kind == AggregateKind::COLLECT) {
+                            aggregate_results[agg] = GqlValue(std::vector<GqlValue>(distinct_vals.begin(), distinct_vals.end()));
                         } else {  // SUM / AVG with int->double promotion, mirroring the row fold below
                             int64_t sum_int = 0;
                             double sum_double = 0.0;
@@ -1783,6 +1793,13 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
                             }
                         }
                         aggregate_results[agg] = max_val;
+                    } else if (agg->fn_kind == AggregateKind::COLLECT) {
+                        std::vector<GqlValue> items;
+                        for (const auto& r : agg_rows) {
+                            GqlValue v = evaluate_expression(r, agg->expr.get());
+                            if (v.type != GqlValue::NIL) items.push_back(std::move(v));
+                        }
+                        aggregate_results[agg] = GqlValue(std::move(items));
                     }
                 }
 

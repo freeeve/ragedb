@@ -57,7 +57,8 @@ enum class ExpressionKind {
     IS_NULL_CHECK,    ///< Null check expression (e.g. x IS NULL)
     SIZE_OP,          ///< Size function expression (e.g. size((x)-[:REL]->()))
     FUNCTION_CALL,    ///< Scalar function call (e.g. length(p), zoned_datetime('2010-01-01'))
-    CASE_WHEN         ///< CASE WHEN cond THEN val [WHEN ...] [ELSE val] END conditional expression
+    CASE_WHEN,        ///< CASE WHEN cond THEN val [WHEN ...] [ELSE val] END conditional expression
+    IN_LIST           ///< Membership test against a list value: x IN <listExpr>
 };
 
 /**
@@ -68,7 +69,8 @@ enum class AggregateKind {
     SUM,
     AVG,
     MIN,
-    MAX
+    MAX,
+    COLLECT   ///< collect / collect_list: gather values into a LIST (DISTINCT dedups).
 };
 
 /**
@@ -235,6 +237,24 @@ struct FunctionCallExpr : public Expression {
         copy_args.reserve(args.size());
         for (const auto& a : args) copy_args.push_back(a ? a->clone() : nullptr);
         return std::make_unique<FunctionCallExpr>(name, std::move(copy_args));
+    }
+};
+
+/**
+ * @brief Membership test against a list value: `x IN <listExpr>` (e.g. `t IN before` where `before`
+ *        is a collect_list result). The literal form `x IN [a, b]` is desugared to an OR chain in the
+ *        parser instead; this node is for a list-valued right operand.
+ */
+struct InExpr : public Expression {
+    std::unique_ptr<Expression> value;   ///< The candidate element.
+    std::unique_ptr<Expression> list;    ///< The list-valued expression to search.
+    InExpr(std::unique_ptr<Expression> v, std::unique_ptr<Expression> l) {
+        kind = ExpressionKind::IN_LIST;
+        value = std::move(v);
+        list = std::move(l);
+    }
+    std::unique_ptr<Expression> clone() const override {
+        return std::make_unique<InExpr>(value ? value->clone() : nullptr, list ? list->clone() : nullptr);
     }
 };
 

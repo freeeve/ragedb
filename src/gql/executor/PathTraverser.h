@@ -23,6 +23,7 @@
 #include <map>
 #include <optional>
 #include <seastar/core/future.hh>
+#include <functional>
 #include "../graph/Graph.h"
 #include "GqlAst.h"
 #include "FactorNode.h"
@@ -48,6 +49,25 @@ namespace ragedb::gql {
  */
 inline size_t gql_scan_chunk_size = 65536;
 
+/**
+ * @brief Frontier chunk size for streamed traversals: with a row sink attached, each traversal
+ *        level processes its rows in chunks that drain all the way to the sink before the next
+ *        chunk expands, so no level's row set is ever fully materialised. Tests shrink it to
+ *        exercise chunk boundaries on small graphs.
+ */
+inline size_t gql_stream_chunk_size = 256;
+
+/**
+ * @brief Consumer for streamed traversal output: when passed to traverse_path_pattern, matched
+ *        rows are handed to consume() in bounded batches instead of being collected and returned
+ *        (the traversal then resolves with an empty vector). Batches arrive sequentially.
+ */
+struct GqlRowSink {
+    std::function<seastar::future<>(std::vector<GqlRow>)> consume;
+};
+
+bool satisfies_match_path_modes(const GqlRow& row, MatchMode match_mode, PathMode path_mode, const PathPattern& pattern);
+
 seastar::future<std::vector<Node>> get_start_nodes(
     ragedb::Graph& graph,
     const PatternNode& node,
@@ -67,7 +87,8 @@ seastar::future<std::vector<GqlRow>> traverse_path_pattern(
     std::string sort_property = "",
     bool sort_ascending = true,
     bool sort_by_id = false,
-    PathMode path_mode = PathMode::TRAIL
+    PathMode path_mode = PathMode::TRAIL,
+    GqlRowSink* sink = nullptr
 );
 
 seastar::future<std::vector<GqlRow>> traverse_match_statement(

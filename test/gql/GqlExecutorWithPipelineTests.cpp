@@ -18,6 +18,7 @@
 #include <Graph.h>
 #include "../../src/gql/GqlParser.h"
 #include "../../src/gql/GqlExecutor.h"
+#include "../../src/gql/executor/PathTraverser.h"
 
 using namespace ragedb;
 using namespace ragedb::gql;
@@ -110,6 +111,83 @@ TEST_CASE("WITH continuation segments must consume piped rows", "[gql_executor_w
         REQUIRE(res.find("\"n\": 1") != std::string::npos);
     }
 
+    graph.Stop().get();
+}
+
+TEST_CASE("streamed top-K and group folds match materialised results", "[gql_executor_with][task018][stream]") {
+    auto graph = Graph("gql_streaming_fold_test");
+    graph.Start().get();
+    graph.Clear();
+    graph.shard.local().NodeTypeInsertPeered("Person").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "name", "string").get();
+    graph.shard.local().NodeTypeInsertPeered("Comment").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Comment", "score", "integer").get();
+    graph.shard.local().RelationshipTypeInsertPeered("KNOWS").get();
+    graph.shard.local().RelationshipTypeInsertPeered("HAS_CREATOR").get();
+
+    uint64_t alice = graph.shard.local().NodeAddPeered("Person", "alice", "{\"name\": \"Alice\"}").get();
+    uint64_t bob = graph.shard.local().NodeAddPeered("Person", "bob", "{\"name\": \"Bob\"}").get();
+    uint64_t carol = graph.shard.local().NodeAddPeered("Person", "carol", "{\"name\": \"Carol\"}").get();
+    uint64_t dave = graph.shard.local().NodeAddPeered("Person", "dave", "{\"name\": \"Dave\"}").get();
+    graph.shard.local().RelationshipAddPeered("KNOWS", alice, bob, "{}").get();
+    graph.shard.local().RelationshipAddPeered("KNOWS", alice, carol, "{}").get();
+    graph.shard.local().RelationshipAddPeered("KNOWS", dave, bob, "{}").get();
+
+    auto comment = [&](const std::string& key, int64_t score, uint64_t creator) {
+        uint64_t c = graph.shard.local().NodeAddPeered("Comment", key,
+            "{\"score\": " + std::to_string(score) + "}").get();
+        graph.shard.local().RelationshipAddPeered("HAS_CREATOR", c, creator, "{}").get();
+    };
+    // Bob: scores 1, 5, 1 (three comments, two distinct scores); Carol: 2, 4.
+    comment("b1", 1, bob); comment("b2", 5, bob); comment("b3", 1, bob);
+    comment("c1", 2, carol); comment("c2", 4, carol);
+
+    const size_t saved = gql_stream_chunk_size;
+    gql_stream_chunk_size = 2;  // force multi-chunk streaming on this tiny graph
+
+    SECTION("IC2 shape: WITH ... ORDER BY ... LIMIT over a two-hop expansion (top-K)") {
+        std::string res = GqlExecutor::execute(graph,
+            std::string("MATCH (a:Person {name: 'Alice'})-[:KNOWS]-(f:Person)<-[:HAS_CREATOR]-(m:Comment) "
+                        "WHERE m.score > 1 WITH m ORDER BY m.score DESC LIMIT 2 RETURN m.score AS s")).get();
+        INFO("result: " << res);
+        // Friend comments with score > 1: {5, 2, 4}; top 2 descending = 5, 4.
+        REQUIRE(res.find("[{\"s\": 5}, {\"s\": 4}]") != std::string::npos);
+    }
+
+    SECTION("WITH DISTINCT then expand then count (the crash shape, group fold)") {
+        std::string res = GqlExecutor::execute(graph,
+            std::string("MATCH (a:Person {name: 'Alice'})-[:KNOWS]-(f:Person) WITH DISTINCT f "
+                        "MATCH (f)<-[:HAS_CREATOR]-(m:Comment) RETURN count(m) AS n")).get();
+        INFO("result: " << res);
+        REQUIRE(res.find("\"n\": 5") != std::string::npos);
+    }
+
+    SECTION("grouped fold over a two-hop expansion with DISTINCT aggregate and ORDER BY") {
+        std::string res = GqlExecutor::execute(graph,
+            std::string("MATCH (a:Person {name: 'Alice'})-[:KNOWS]-(f:Person)<-[:HAS_CREATOR]-(m:Comment) "
+                        "RETURN f.name AS fn, count(m) AS n, count(DISTINCT m.score) AS d "
+                        "ORDER BY count(m) DESC")).get();
+        INFO("result: " << res);
+        REQUIRE(res.find("\"fn\": \"Bob\", \"n\": 3, \"d\": 2") != std::string::npos);
+        REQUIRE(res.find("\"fn\": \"Carol\", \"n\": 2, \"d\": 2") != std::string::npos);
+        REQUIRE(res.find("Bob") < res.find("Carol"));
+    }
+
+    SECTION("streamed results equal materialised results (no LIMIT control)") {
+        // Without a LIMIT the top-K gate does not fire, so this exercises the ordinary path on
+        // the same data; the LIMIT 3 variant must be its prefix.
+        std::string full = GqlExecutor::execute(graph,
+            std::string("MATCH (a:Person {name: 'Alice'})-[:KNOWS]-(f:Person)<-[:HAS_CREATOR]-(m:Comment) "
+                        "WITH m ORDER BY m.score DESC RETURN m.score AS s")).get();
+        std::string streamed = GqlExecutor::execute(graph,
+            std::string("MATCH (a:Person {name: 'Alice'})-[:KNOWS]-(f:Person)<-[:HAS_CREATOR]-(m:Comment) "
+                        "WITH m ORDER BY m.score DESC LIMIT 3 RETURN m.score AS s")).get();
+        INFO("full: " << full << " streamed: " << streamed);
+        REQUIRE(full.find("[{\"s\": 5}, {\"s\": 4}, {\"s\": 2}") != std::string::npos);
+        REQUIRE(streamed.find("[{\"s\": 5}, {\"s\": 4}, {\"s\": 2}]") != std::string::npos);
+    }
+
+    gql_stream_chunk_size = saved;
     graph.Stop().get();
 }
 

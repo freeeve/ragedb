@@ -232,7 +232,7 @@ struct PathHop {
     std::vector<Node> nodes;
 };
 
-static bool satisfies_match_path_modes(const GqlRow& row, MatchMode match_mode, PathMode path_mode, const PathPattern& pattern) {
+bool satisfies_match_path_modes(const GqlRow& row, MatchMode match_mode, PathMode path_mode, const PathPattern& pattern) {
     // 1. Path Mode constraints
     std::vector<uint64_t> node_ids;
     std::vector<uint64_t> rel_ids;
@@ -700,9 +700,35 @@ static seastar::future<std::vector<GqlRow>> traverse_step(ragedb::Graph& graph, 
     }
 }
 
-static seastar::future<std::vector<GqlRow>> traverse_path_pattern_iterative(ragedb::Graph& graph, const PathPattern& prep_pattern, size_t step_idx, std::vector<GqlRow> current_step_rows, size_t limit, const ProjectionPruner& pruner, PathMode path_mode) {
+static seastar::future<std::vector<GqlRow>> traverse_path_pattern_iterative(ragedb::Graph& graph, const PathPattern& prep_pattern, size_t step_idx, std::vector<GqlRow> current_step_rows, size_t limit, const ProjectionPruner& pruner, PathMode path_mode, GqlRowSink* sink = nullptr) {
     if (step_idx >= prep_pattern.edges.size()) {
+        if (sink) {
+            return sink->consume(std::move(current_step_rows)).then([] { return std::vector<GqlRow>{}; });
+        }
         return seastar::make_ready_future<std::vector<GqlRow>>(std::move(current_step_rows));
+    }
+
+    // Streamed traversal: process the frontier in chunks that each drain all the way to the sink
+    // before the next chunk expands, so no level's full row set is ever materialised at once.
+    if (sink && current_step_rows.size() > gql_stream_chunk_size) {
+        struct ChunkState {
+            std::vector<GqlRow> rows;
+            size_t offset = 0;
+        };
+        auto st = std::make_shared<ChunkState>();
+        st->rows = std::move(current_step_rows);
+        const size_t chunk = gql_stream_chunk_size > 0 ? gql_stream_chunk_size : 256;
+        return seastar::repeat([st, chunk, &graph, prep_pattern, step_idx, limit, pruner, path_mode, sink] {
+            if (st->offset >= st->rows.size()) {
+                return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::yes);
+            }
+            size_t end = std::min(st->offset + chunk, st->rows.size());
+            std::vector<GqlRow> slice(std::make_move_iterator(st->rows.begin() + static_cast<std::ptrdiff_t>(st->offset)),
+                                      std::make_move_iterator(st->rows.begin() + static_cast<std::ptrdiff_t>(end)));
+            st->offset = end;
+            return traverse_path_pattern_iterative(graph, prep_pattern, step_idx, std::move(slice), limit, pruner, path_mode, sink)
+                .then([](std::vector<GqlRow>) { return seastar::stop_iteration::no; });
+        }).then([st] { return std::vector<GqlRow>{}; });
     }
 
     const auto& edge = prep_pattern.edges[step_idx];
@@ -729,8 +755,8 @@ static seastar::future<std::vector<GqlRow>> traverse_path_pattern_iterative(rage
                 return (*run_loop)();
             });
         };
-        return (*run_loop)().then([&graph, prep_pattern, step_idx, limit, pruner, path_mode](std::vector<GqlRow> next_rows) {
-            return traverse_path_pattern_iterative(graph, prep_pattern, step_idx + 1, std::move(next_rows), limit, pruner, path_mode);
+        return (*run_loop)().then([&graph, prep_pattern, step_idx, limit, pruner, path_mode, sink](std::vector<GqlRow> next_rows) {
+            return traverse_path_pattern_iterative(graph, prep_pattern, step_idx + 1, std::move(next_rows), limit, pruner, path_mode, sink);
         });
     } else {
         std::vector<seastar::future<std::vector<GqlRow>>> futs;
@@ -739,12 +765,12 @@ static seastar::future<std::vector<GqlRow>> traverse_path_pattern_iterative(rage
         }
 
         return seastar::when_all_succeed(futs.begin(), futs.end())
-        .then([&graph, prep_pattern, step_idx, limit, pruner, path_mode](std::vector<std::vector<GqlRow>> nested) {
+        .then([&graph, prep_pattern, step_idx, limit, pruner, path_mode, sink](std::vector<std::vector<GqlRow>> nested) {
             std::vector<GqlRow> next_rows;
             for (const auto& vec : nested) {
                 next_rows.insert(next_rows.end(), vec.begin(), vec.end());
             }
-            return traverse_path_pattern_iterative(graph, prep_pattern, step_idx + 1, std::move(next_rows), limit, pruner, path_mode);
+            return traverse_path_pattern_iterative(graph, prep_pattern, step_idx + 1, std::move(next_rows), limit, pruner, path_mode, sink);
         });
     }
 }
@@ -755,7 +781,8 @@ static seastar::future<std::vector<GqlRow>> traverse_from_relationship_index(
     const GqlRow& base_row,
     size_t limit,
     const ProjectionPruner& pruner,
-    PathMode path_mode
+    PathMode path_mode,
+    GqlRowSink* sink = nullptr
 ) {
     const auto& edge = prep_pattern.edges[0];
     std::string single_label = "";
@@ -801,7 +828,7 @@ static seastar::future<std::vector<GqlRow>> traverse_from_relationship_index(
 
     return scan_limit_fut.then([&graph, single_label, indexed_prop, indexed_op, indexed_val](size_t scan_limit) {
         return graph.shard.local().FindRelationshipsPeered(single_label, indexed_prop, indexed_op, indexed_val, 0, scan_limit);
-    }).then([&graph, prep_pattern, base_row, limit, pruner, path_mode](std::vector<Relationship> rels) {
+    }).then([&graph, prep_pattern, base_row, limit, pruner, path_mode, sink](std::vector<Relationship> rels) {
         const auto& pattern_edge = prep_pattern.edges[0];
         
         std::vector<Relationship> matched_rels;
@@ -905,7 +932,7 @@ static seastar::future<std::vector<GqlRow>> traverse_from_relationship_index(
         }
         
         return seastar::when_all_succeed(row_futs.begin(), row_futs.end())
-        .then([&graph, prep_pattern, limit, pruner, path_mode](std::vector<std::vector<GqlRow>> nested_rows) {
+        .then([&graph, prep_pattern, limit, pruner, path_mode, sink](std::vector<std::vector<GqlRow>> nested_rows) {
             std::vector<GqlRow> initial_rows;
             for (const auto& vec : nested_rows) {
                 for (const auto& row : vec) {
@@ -919,12 +946,12 @@ static seastar::future<std::vector<GqlRow>> traverse_from_relationship_index(
                 }
             }
             
-            return traverse_path_pattern_iterative(graph, prep_pattern, 1, std::move(initial_rows), limit, pruner, path_mode);
+            return traverse_path_pattern_iterative(graph, prep_pattern, 1, std::move(initial_rows), limit, pruner, path_mode, sink);
         });
      });
 }
 
-seastar::future<std::vector<GqlRow>> traverse_path_pattern(ragedb::Graph& graph, const PathPattern& pattern, const GqlRow& base_row, size_t limit, const ProjectionPruner& pruner, std::string sort_property, bool sort_ascending, bool sort_by_id, PathMode path_mode) {
+seastar::future<std::vector<GqlRow>> traverse_path_pattern(ragedb::Graph& graph, const PathPattern& pattern, const GqlRow& base_row, size_t limit, const ProjectionPruner& pruner, std::string sort_property, bool sort_ascending, bool sort_by_id, PathMode path_mode, GqlRowSink* sink) {
     PathPattern prep_pattern = pattern;
     for (size_t j = 0; j < prep_pattern.nodes.size(); ++j) {
         if (prep_pattern.nodes[j].variable.empty()) {
@@ -982,7 +1009,7 @@ seastar::future<std::vector<GqlRow>> traverse_path_pattern(ragedb::Graph& graph,
     auto bound_it = base_row.bindings.find(start_node_var);
 
     if (bound_it == base_row.bindings.end() && !has_node_seek && has_edge_seek) {
-        return traverse_from_relationship_index(graph, prep_pattern, base_row, limit, pruner, path_mode);
+        return traverse_from_relationship_index(graph, prep_pattern, base_row, limit, pruner, path_mode, sink);
     }
 
     // Edge patterns cannot bound the anchor scan by the LIMIT (a start node may yield no match),
@@ -998,9 +1025,9 @@ seastar::future<std::vector<GqlRow>> traverse_path_pattern(ragedb::Graph& graph,
         };
         auto state = std::make_shared<ChunkScanState>();
         const uint64_t chunk = gql_scan_chunk_size > 0 ? gql_scan_chunk_size : 65536;
-        return seastar::repeat([state, chunk, &graph, prep_pattern, base_row, limit, pruner, path_mode]() {
+        return seastar::repeat([state, chunk, &graph, prep_pattern, base_row, limit, pruner, path_mode, sink]() {
             return get_start_nodes_page(graph, prep_pattern.nodes[0], state->skip, chunk, pruner)
-            .then([state, chunk, &graph, prep_pattern, base_row, limit, pruner, path_mode](std::vector<Node> page) {
+            .then([state, chunk, &graph, prep_pattern, base_row, limit, pruner, path_mode, sink](std::vector<Node> page) {
                 state->exhausted = page.size() < chunk;
                 state->skip += page.size();
 
@@ -1022,7 +1049,7 @@ seastar::future<std::vector<GqlRow>> traverse_path_pattern(ragedb::Graph& graph,
                     return seastar::make_ready_future<seastar::stop_iteration>(
                         state->exhausted ? seastar::stop_iteration::yes : seastar::stop_iteration::no);
                 }
-                return traverse_path_pattern_iterative(graph, prep_pattern, 0, std::move(initial_rows), limit, pruner, path_mode)
+                return traverse_path_pattern_iterative(graph, prep_pattern, 0, std::move(initial_rows), limit, pruner, path_mode, sink)
                 .then([state, limit](std::vector<GqlRow> matched) {
                     for (auto& r : matched) {
                         state->rows.push_back(std::move(r));
@@ -1045,7 +1072,7 @@ seastar::future<std::vector<GqlRow>> traverse_path_pattern(ragedb::Graph& graph,
         start_nodes_fut = get_start_nodes(graph, prep_pattern.nodes[0], start_node_limit, pruner, sort_property, sort_ascending, sort_by_id);
     }
 
-    return start_nodes_fut.then([base_row, prep_pattern, &graph, limit, pruner, path_mode](std::vector<Node> start_nodes) {
+    return start_nodes_fut.then([base_row, prep_pattern, &graph, limit, pruner, path_mode, sink](std::vector<Node> start_nodes) {
         std::vector<GqlRow> initial_rows;
         for (const auto& node : start_nodes) {
             if (prep_pattern.nodes[0].label_expr && !matches_label_expr(node.getType(), prep_pattern.nodes[0].label_expr)) {
@@ -1066,7 +1093,7 @@ seastar::future<std::vector<GqlRow>> traverse_path_pattern(ragedb::Graph& graph,
             }
         }
 
-        return traverse_path_pattern_iterative(graph, prep_pattern, 0, std::move(initial_rows), limit, pruner, path_mode);
+        return traverse_path_pattern_iterative(graph, prep_pattern, 0, std::move(initial_rows), limit, pruner, path_mode, sink);
     });
 }
 

@@ -472,6 +472,28 @@ GqlType GqlTypechecker::check_expression(const Expression& expr) {
             this->env = std::move(parent_env);
             return GqlType::BOOLEAN;
         }
+        case ExpressionKind::FUNCTION_CALL: {
+            const auto& fc = static_cast<const FunctionCallExpr&>(expr);
+            for (const auto& a : fc.args) {
+                check_expression(*a);
+            }
+            if (fc.name == "length" || fc.name == "zoned_datetime" || fc.name == "datetime" ||
+                fc.name == "date" || fc.name == "localdatetime") {
+                return GqlType::INTEGER;
+            }
+            return GqlType::ANY;
+        }
+        case ExpressionKind::CASE_WHEN: {
+            const auto& ce = static_cast<const CaseExpr&>(expr);
+            for (const auto& branch : ce.branches) {
+                check_expression(*branch.first);
+                check_expression(*branch.second);
+            }
+            if (ce.else_expr) {
+                check_expression(*ce.else_expr);
+            }
+            return GqlType::ANY;
+        }
     }
     return GqlType::ANY;
 }
@@ -637,6 +659,14 @@ void GqlTypechecker::check_segment_body(const GqlQuery& query) {
                 meet_variable(match.path_count_target_var, GqlType::INTEGER, {});
             }
             // cost_expr typechecking is now performed inside check_path_pattern per edge.
+        }
+    }
+
+    // Register ISO GQL LET bindings so the segment's WHERE/FILTER/RETURN can reference them.
+    for (const auto& let : query.let_bindings) {
+        GqlType t = check_expression(*let.expr);
+        if (let.alias) {
+            meet_variable(*let.alias, t, {});
         }
     }
 

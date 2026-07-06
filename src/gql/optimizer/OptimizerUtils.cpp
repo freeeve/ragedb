@@ -518,6 +518,21 @@ bool is_variable_referenced_outside_count(const Expression* expr, const std::str
             }
             return is_variable_referenced_outside_count(agg->expr.get(), var_name);
         }
+        case ExpressionKind::FUNCTION_CALL: {
+            auto* fc = static_cast<const FunctionCallExpr*>(expr);
+            for (const auto& a : fc->args) {
+                if (is_variable_referenced_outside_count(a.get(), var_name)) return true;
+            }
+            return false;
+        }
+        case ExpressionKind::CASE_WHEN: {
+            auto* ce = static_cast<const CaseExpr*>(expr);
+            for (const auto& b : ce->branches) {
+                if (is_variable_referenced_outside_count(b.first.get(), var_name) ||
+                    is_variable_referenced_outside_count(b.second.get(), var_name)) return true;
+            }
+            return ce->else_expr && is_variable_referenced_outside_count(ce->else_expr.get(), var_name);
+        }
         default:
             return false;
     }

@@ -50,6 +50,20 @@ bool has_aggregates(const Expression* expr) {
         auto* is_null = static_cast<const IsNullExpr*>(expr);
         return has_aggregates(is_null->expr.get());
     }
+    if (expr->kind == ExpressionKind::CASE_WHEN) {
+        auto* ce = static_cast<const CaseExpr*>(expr);
+        for (const auto& b : ce->branches) {
+            if (has_aggregates(b.first.get()) || has_aggregates(b.second.get())) return true;
+        }
+        return ce->else_expr && has_aggregates(ce->else_expr.get());
+    }
+    if (expr->kind == ExpressionKind::FUNCTION_CALL) {
+        auto* fc = static_cast<const FunctionCallExpr*>(expr);
+        for (const auto& a : fc->args) {
+            if (has_aggregates(a.get())) return true;
+        }
+        return false;
+    }
     return false;
 }
 
@@ -75,6 +89,16 @@ void find_aggregates(const Expression* expr, std::vector<const AggregateExpr*>& 
     } else if (expr->kind == ExpressionKind::IS_NULL_CHECK) {
         auto* is_null = static_cast<const IsNullExpr*>(expr);
         find_aggregates(is_null->expr.get(), aggregates);
+    } else if (expr->kind == ExpressionKind::CASE_WHEN) {
+        auto* ce = static_cast<const CaseExpr*>(expr);
+        for (const auto& b : ce->branches) {
+            find_aggregates(b.first.get(), aggregates);
+            find_aggregates(b.second.get(), aggregates);
+        }
+        if (ce->else_expr) find_aggregates(ce->else_expr.get(), aggregates);
+    } else if (expr->kind == ExpressionKind::FUNCTION_CALL) {
+        auto* fc = static_cast<const FunctionCallExpr*>(expr);
+        for (const auto& a : fc->args) find_aggregates(a.get(), aggregates);
     }
 }
 
@@ -107,6 +131,22 @@ GqlValue evaluate_group_expression(const GqlRow& representative, const std::map<
                 return it->second;
             }
             return GqlValue();
+        }
+        case ExpressionKind::CASE_WHEN: {
+            auto* ce = static_cast<const CaseExpr*>(expr);
+            for (const auto& branch : ce->branches) {
+                if (evaluate_group_expression(representative, aggregate_results, branch.first.get()).is_truthy()) {
+                    return evaluate_group_expression(representative, aggregate_results, branch.second.get());
+                }
+            }
+            if (ce->else_expr) {
+                return evaluate_group_expression(representative, aggregate_results, ce->else_expr.get());
+            }
+            return GqlValue();
+        }
+        case ExpressionKind::FUNCTION_CALL: {
+            // Scalar functions evaluate over the representative row's bindings (grouping keys).
+            return evaluate_scalar_function(representative, static_cast<const FunctionCallExpr*>(expr));
         }
         case ExpressionKind::LITERAL: {
             // Literal: Convert literal value from AST to runtime GqlValue

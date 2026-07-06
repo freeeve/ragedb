@@ -570,6 +570,42 @@ TEST_CASE("WITH items and reserved-word identifiers (task 019)", "[gql_parser][t
     }
 }
 
+TEST_CASE("ORDER BY resolves RETURN aliases into sort keys (task 027)", "[gql_parser][task027]") {
+    SECTION("aggregate alias becomes the aggregate expression") {
+        auto q = GqlParser::parse(
+            "MATCH (t:Tag)<-[:HAS_TAG]-(post) RETURN t.name AS name, count(DISTINCT post) AS cnt "
+            "ORDER BY cnt DESC, name ASC LIMIT 10");
+        REQUIRE(q.order_by.size() == 2);
+        REQUIRE(q.order_by[0].expr->kind == ExpressionKind::AGGREGATION);
+        auto* agg = static_cast<const AggregateExpr*>(q.order_by[0].expr.get());
+        REQUIRE(agg->fn_kind == AggregateKind::COUNT);
+        REQUIRE(agg->distinct);
+        REQUIRE(q.order_by[1].expr->kind == ExpressionKind::PROPERTY_LOOKUP);
+    }
+
+    SECTION("alias inside an arithmetic sort key is substituted") {
+        auto q = GqlParser::parse(
+            "MATCH (p:Person) RETURN p.age AS a ORDER BY a + 1 DESC");
+        REQUIRE(q.order_by[0].expr->kind == ExpressionKind::BINARY_OP);
+        auto* bin = static_cast<const BinaryOpExpr*>(q.order_by[0].expr.get());
+        REQUIRE(bin->left->kind == ExpressionKind::PROPERTY_LOOKUP);
+    }
+
+    SECTION("WITH segment ORDER BY resolves that segment's aliases") {
+        auto q = GqlParser::parse(
+            "MATCH (p:Person)<-[:HAS_CREATOR]-(m) WITH p, count(m) AS cnt ORDER BY cnt DESC LIMIT 3 "
+            "RETURN p.name");
+        REQUIRE(q.with_segments.size() == 1);
+        REQUIRE(q.with_segments[0]->order_by.size() == 1);
+        REQUIRE(q.with_segments[0]->order_by[0].expr->kind == ExpressionKind::AGGREGATION);
+    }
+
+    SECTION("non-alias variables in ORDER BY are untouched") {
+        auto q = GqlParser::parse("MATCH (p:Person) RETURN p.name AS n ORDER BY p");
+        REQUIRE(q.order_by[0].expr->kind == ExpressionKind::VARIABLE);
+    }
+}
+
 TEST_CASE("EXISTS accepts an openCypher-style bare pattern subquery (task 018)", "[gql_parser][task018]") {
     auto q = GqlParser::parse(
         "MATCH (a:Person) WHERE EXISTS { (a)-[:KNOWS]->(b:Person) } RETURN a.name");

@@ -457,6 +457,8 @@ struct EdgeAggAccumulator {
     GqlValue extreme;
     bool extreme_set = false;
     std::set<GqlValue, GqlValueLess> distinct_vals;
+    std::unordered_set<uint64_t> distinct_node_ids;
+    std::unordered_set<uint64_t> distinct_rel_ids;
 
     static EdgeAggAccumulator make(const AggregateExpr* agg) {
         EdgeAggAccumulator acc{agg->fn_kind, agg->expr.get()};
@@ -468,7 +470,19 @@ struct EdgeAggAccumulator {
     void add(const GqlRow& row) {
         if (distinct) {
             GqlValue v = evaluate_expression(row, expr);
-            if (v.type != GqlValue::NIL) distinct_vals.insert(std::move(v));
+            if (v.type == GqlValue::NIL) return;
+            // count(DISTINCT node/rel) only needs cardinality and entities dedup by id, so store
+            // raw ids: a GqlValue set costs ~10x more per entry, which is the difference between
+            // fitting and bad_alloc for multi-million-entry distinct sets at SF1.
+            if (kind == AggregateKind::COUNT && v.type == GqlValue::NODE) {
+                distinct_node_ids.insert(v.node->getId());
+                return;
+            }
+            if (kind == AggregateKind::COUNT && v.type == GqlValue::RELATIONSHIP) {
+                distinct_rel_ids.insert(v.relationship->getId());
+                return;
+            }
+            distinct_vals.insert(std::move(v));
             return;
         }
         if (kind == AggregateKind::COUNT) {
@@ -517,7 +531,7 @@ struct EdgeAggAccumulator {
 
     GqlValue finalize_distinct(uint64_t multiplier) const {
         if (kind == AggregateKind::COUNT) {
-            int64_t c = static_cast<int64_t>(distinct_vals.size());
+            int64_t c = static_cast<int64_t>(distinct_vals.size() + distinct_node_ids.size() + distinct_rel_ids.size());
             if (multiplier > 1) c *= static_cast<int64_t>(multiplier);
             return GqlValue(c);
         }

@@ -64,6 +64,10 @@ bool has_aggregates(const Expression* expr) {
         }
         return false;
     }
+    if (expr->kind == ExpressionKind::IN_LIST) {
+        auto* in = static_cast<const InExpr*>(expr);
+        return has_aggregates(in->value.get()) || has_aggregates(in->list.get());
+    }
     return false;
 }
 
@@ -99,6 +103,10 @@ void find_aggregates(const Expression* expr, std::vector<const AggregateExpr*>& 
     } else if (expr->kind == ExpressionKind::FUNCTION_CALL) {
         auto* fc = static_cast<const FunctionCallExpr*>(expr);
         for (const auto& a : fc->args) find_aggregates(a.get(), aggregates);
+    } else if (expr->kind == ExpressionKind::IN_LIST) {
+        auto* in = static_cast<const InExpr*>(expr);
+        find_aggregates(in->value.get(), aggregates);
+        find_aggregates(in->list.get(), aggregates);
     }
 }
 
@@ -147,6 +155,16 @@ GqlValue evaluate_group_expression(const GqlRow& representative, const std::map<
         case ExpressionKind::FUNCTION_CALL: {
             // Scalar functions evaluate over the representative row's bindings (grouping keys).
             return evaluate_scalar_function(representative, static_cast<const FunctionCallExpr*>(expr));
+        }
+        case ExpressionKind::IN_LIST: {
+            auto* in = static_cast<const InExpr*>(expr);
+            GqlValue needle = evaluate_group_expression(representative, aggregate_results, in->value.get());
+            GqlValue hay = evaluate_group_expression(representative, aggregate_results, in->list.get());
+            if (needle.type == GqlValue::NIL || hay.type != GqlValue::LIST) return GqlValue();
+            for (const auto& item : *hay.list) {
+                if (compare_gql_values(needle, item) == 0) return GqlValue(true);
+            }
+            return GqlValue(false);
         }
         case ExpressionKind::LITERAL: {
             // Literal: Convert literal value from AST to runtime GqlValue

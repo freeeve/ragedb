@@ -142,6 +142,17 @@ int compare_gql_values(const GqlValue& a, const GqlValue& b) {
         }
         return 0;
     }
+    // Compare two list values by length, then element by element.
+    if (a.type == GqlValue::LIST) {
+        const auto& al = *a.list;
+        const auto& bl = *b.list;
+        if (al.size() != bl.size()) return (al.size() < bl.size()) ? -1 : 1;
+        for (size_t i = 0; i < al.size(); ++i) {
+            int c = compare_gql_values(al[i], bl[i]);
+            if (c != 0) return c;
+        }
+        return 0;
+    }
     return 0;
 }
 
@@ -270,6 +281,20 @@ GqlValue evaluate_expression(const GqlRow& row, const Expression* expr) {
         }
         case ExpressionKind::FUNCTION_CALL: {
             return evaluate_scalar_function(row, static_cast<const FunctionCallExpr*>(expr));
+        }
+        case ExpressionKind::IN_LIST: {
+            auto* in = static_cast<const InExpr*>(expr);
+            GqlValue needle = evaluate_expression(row, in->value.get());
+            GqlValue hay = evaluate_expression(row, in->list.get());
+            if (needle.type == GqlValue::NIL || hay.type != GqlValue::LIST) {
+                return GqlValue();
+            }
+            for (const auto& item : *hay.list) {
+                if (compare_gql_values(needle, item) == 0) {
+                    return GqlValue(true);
+                }
+            }
+            return GqlValue(false);
         }
         case ExpressionKind::EXISTS: {
             auto* exists = static_cast<const ExistsExpr*>(expr);
@@ -509,6 +534,18 @@ std::string serialize_gql_value(const GqlValue& val) {
         for (const auto& rel : *val.relationship_list) {
             if (!init) s += ",";
             s += serialize_gql_value(GqlValue(rel));
+            init = false;
+        }
+        s += "]";
+        return s;
+    }
+    // Serialize a heterogeneous list (collect_list result) to a JSON array.
+    if (val.type == GqlValue::LIST) {
+        std::string s = "[";
+        bool init = true;
+        for (const auto& item : *val.list) {
+            if (!init) s += ", ";
+            s += serialize_gql_value(item);
             init = false;
         }
         s += "]";

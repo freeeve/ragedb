@@ -494,6 +494,12 @@ GqlType GqlTypechecker::check_expression(const Expression& expr) {
             }
             return GqlType::ANY;
         }
+        case ExpressionKind::IN_LIST: {
+            const auto& in = static_cast<const InExpr&>(expr);
+            check_expression(*in.value);
+            check_expression(*in.list);
+            return GqlType::BOOLEAN;
+        }
     }
     return GqlType::ANY;
 }

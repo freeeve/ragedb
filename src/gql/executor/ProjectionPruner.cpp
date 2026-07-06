@@ -70,6 +70,12 @@ void collect_accessed_properties(const Expression* expr,
             collect_accessed_properties(ce->else_expr.get(), accessed_props, whole_objects);
             break;
         }
+        case ExpressionKind::IN_LIST: {
+            auto* in = static_cast<const InExpr*>(expr);
+            collect_accessed_properties(in->value.get(), accessed_props, whole_objects);
+            collect_accessed_properties(in->list.get(), accessed_props, whole_objects);
+            break;
+        }
         case ExpressionKind::LITERAL:
         default:
             break;

@@ -871,4 +871,35 @@ TEST_CASE("GQL scalar functions and CASE expressions (task 032 slice: length/CAS
             "RETURN foaf.id AS personId, 2 * common - total AS commonInterestScore "
             "ORDER BY commonInterestScore DESC, personId ASC LIMIT 10"));
     }
+    SECTION("collect_list(DISTINCT x) is a COLLECT aggregate") {
+        auto q = GqlParser::parse("MATCH (t:Tag) RETURN collect_list(DISTINCT t) AS tags");
+        REQUIRE(q.returns[0].expr->kind == ExpressionKind::AGGREGATION);
+        auto* agg = static_cast<AggregateExpr*>(q.returns[0].expr.get());
+        REQUIRE(agg->fn_kind == AggregateKind::COLLECT);
+        REQUIRE(agg->distinct);
+    }
+    SECTION("x IN <listExpr> (non-literal) is an InExpr membership test") {
+        auto q = GqlParser::parse("MATCH (t:Tag) WHERE NOT (t IN before) RETURN t.name");
+        // NOT ( t IN before ) -> UNARY_OP(NOT, IN_LIST)
+        REQUIRE(q.where_expr->kind == ExpressionKind::UNARY_OP);
+        auto* un = static_cast<UnaryOpExpr*>(q.where_expr.get());
+        REQUIRE(un->expr->kind == ExpressionKind::IN_LIST);
+    }
+    SECTION("x IN [literal] still desugars to OR (not an InExpr)") {
+        auto q = GqlParser::parse("MATCH (c:Country) WHERE c.name IN ['A', 'B'] RETURN c.name");
+        REQUIRE(q.where_expr->kind == ExpressionKind::BINARY_OP); // OR chain, not IN_LIST
+    }
+    SECTION("full pure-GQL IC4 shape parses (collect_list + IN list-value)") {
+        REQUIRE_NOTHROW(GqlParser::parse(
+            "MATCH (:Person {id: 1})-[:KNOWS]-(:Person)<-[:HAS_CREATOR]-(pre:Post)-[:HAS_TAG]->(tb:Tag) "
+            "WHERE pre.creationDate < zoned_datetime('2011-01-01') "
+            "RETURN collect_list(DISTINCT tb) AS before "
+            "NEXT "
+            "MATCH (:Person {id: 1})-[:KNOWS]-(:Person)<-[:HAS_CREATOR]-(post:Post)-[:HAS_TAG]->(t:Tag) "
+            "WHERE post.creationDate >= zoned_datetime('2011-01-01') "
+            "  AND post.creationDate < zoned_datetime('2012-01-01') "
+            "  AND NOT (t IN before) "
+            "RETURN t.name AS tagName, count(DISTINCT post) AS postCount "
+            "ORDER BY postCount DESC, tagName ASC LIMIT 10"));
+    }
 }

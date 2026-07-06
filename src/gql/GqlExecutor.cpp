@@ -1197,6 +1197,40 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
         }
     }
 
+    // A variable used ONLY as a bare count(...) / count(DISTINCT ...) argument contributes just
+    // its identity (node comparison and dedup are by id), so its properties can be pruned: a
+    // count(DISTINCT post) over a large expansion otherwise carries every post's full property
+    // map through traversal and into the distinct set. Skipped when a path variable is bound
+    // (paths embed the nodes wholesale) or when writes are present.
+    if (query_ptr->writes.empty() &&
+        std::none_of(query_ptr->matches.begin(), query_ptr->matches.end(),
+                     [](const MatchStatement& m) { return !m.path_variable.empty(); })) {
+        std::vector<const AggregateExpr*> pruning_aggs;
+        for (const auto& item : query_ptr->returns) find_aggregates(item.expr.get(), pruning_aggs);
+        for (const auto& spec : query_ptr->order_by) find_aggregates(spec.expr.get(), pruning_aggs);
+        for (const auto* agg : pruning_aggs) {
+            if (agg->fn_kind != AggregateKind::COUNT || !agg->expr ||
+                agg->expr->kind != ExpressionKind::VARIABLE) {
+                continue;
+            }
+            const std::string& v = static_cast<const VariableExpr*>(agg->expr.get())->name;
+            bool outside = query_ptr->where_expr &&
+                is_variable_referenced_outside_count(query_ptr->where_expr.get(), v);
+            for (const auto& item : query_ptr->returns) {
+                if (outside) break;
+                outside = is_variable_referenced_outside_count(item.expr.get(), v);
+            }
+            for (const auto& spec : query_ptr->order_by) {
+                if (outside) break;
+                outside = is_variable_referenced_outside_count(spec.expr.get(), v);
+            }
+            if (!outside) {
+                pruner.whole_objects.erase(v);
+                pruner.accessed_props.try_emplace(v);
+            }
+        }
+    }
+
     // Streaming execution (tasks 018/020): expansion-heavy shapes fold matched rows as they are
     // produced instead of materialising the whole expansion, bounding peak memory.
     if (stream_eligible(*query_ptr) && !query_ptr->distinct) {

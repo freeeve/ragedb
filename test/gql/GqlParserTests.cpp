@@ -543,15 +543,15 @@ TEST_CASE("GQL Parser parses VIEW and CONSTRAINT DDL", "[gql_parser]") {
 
 
 
-TEST_CASE("WITH items and reserved-word identifiers (task 019)", "[gql_parser][task019]") {
-    SECTION("non-variable WITH items require an alias") {
+TEST_CASE("NEXT projection items and reserved-word identifiers (task 019)", "[gql_parser][task019]") {
+    SECTION("non-variable RETURN items before NEXT require an alias") {
         REQUIRE_THROWS_WITH(
-            GqlParser::parse("MATCH (p:Person) WITH p.name MATCH (q:Person) RETURN q"),
+            GqlParser::parse("MATCH (p:Person) RETURN p.name NEXT MATCH (q:Person) RETURN q"),
             Catch::Contains("aliased"));
     }
 
-    SECTION("aliased expression and plain variable WITH items parse") {
-        auto q = GqlParser::parse("MATCH (p:Person) WITH p, p.name AS name RETURN name");
+    SECTION("aliased expression and plain variable projection items parse") {
+        auto q = GqlParser::parse("MATCH (p:Person) RETURN p, p.name AS name NEXT RETURN name");
         REQUIRE(q.with_segments.size() == 1);
         REQUIRE(q.with_segments[0]->returns.size() == 2);
         REQUIRE(q.with_segments[0]->returns[1].alias == "name");
@@ -564,7 +564,7 @@ TEST_CASE("WITH items and reserved-word identifiers (task 019)", "[gql_parser][t
         auto q2 = GqlParser::parse("MATCH (n:Doc) RETURN n.name AS with");
         REQUIRE(q2.returns[0].alias == "with");
 
-        auto q3 = GqlParser::parse("MATCH (n:Doc) WITH n.with AS with RETURN with");
+        auto q3 = GqlParser::parse("MATCH (n:Doc) RETURN n.with AS with NEXT RETURN with");
         REQUIRE(q3.with_segments.size() == 1);
         REQUIRE(q3.with_segments[0]->returns[0].alias == "with");
     }
@@ -591,10 +591,10 @@ TEST_CASE("ORDER BY resolves RETURN aliases into sort keys (task 027)", "[gql_pa
         REQUIRE(bin->left->kind == ExpressionKind::PROPERTY_LOOKUP);
     }
 
-    SECTION("WITH segment ORDER BY resolves that segment's aliases") {
+    SECTION("intermediate NEXT segment ORDER BY resolves that segment's aliases") {
         auto q = GqlParser::parse(
-            "MATCH (p:Person)<-[:HAS_CREATOR]-(m) WITH p, count(m) AS cnt ORDER BY cnt DESC LIMIT 3 "
-            "RETURN p.name");
+            "MATCH (p:Person)<-[:HAS_CREATOR]-(m) RETURN p, count(m) AS cnt ORDER BY cnt DESC LIMIT 3 "
+            "NEXT RETURN p.name");
         REQUIRE(q.with_segments.size() == 1);
         REQUIRE(q.with_segments[0]->order_by.size() == 1);
         REQUIRE(q.with_segments[0]->order_by[0].expr->kind == ExpressionKind::AGGREGATION);
@@ -625,10 +625,11 @@ TEST_CASE("GQL interleaved MATCH ... WHERE ... MATCH within a segment (task 030)
         REQUIRE(q.matches.size() == 2);
         REQUIRE(q.where_expr != nullptr);
     }
-    SECTION("across a WITH boundary (IC5 shape)") {
+    SECTION("across a NEXT boundary (IC5 shape)") {
         auto q = GqlParser::parse(
             "MATCH (p:Person {id: 1})-[:KNOWS]-(f:Person) WHERE f.id <> 1 "
-            "WITH DISTINCT f "
+            "RETURN DISTINCT f "
+            "NEXT "
             "MATCH (forum:Forum)-[hm:HAS_MEMBER]->(f) WHERE hm.joinDate >= 100 "
             "MATCH (forum)-[:CONTAINER_OF]->(post:Post)-[:HAS_CREATOR]->(f) "
             "RETURN forum.id AS fid, count(DISTINCT post) AS cnt "
@@ -653,11 +654,12 @@ TEST_CASE("GQL IN-list membership desugars to an OR chain (task 031)", "[gql_par
         auto q2 = GqlParser::parse("MATCH (c:Country) WHERE c.name IN [] RETURN c.name");
         REQUIRE(q2.where_expr->kind == ExpressionKind::LITERAL);
     }
-    SECTION("multi-hop EXISTS with inner IN-list WHERE (IC3 openCypher shape)") {
+    SECTION("multi-hop EXISTS with inner IN-list WHERE (IC3 shape)") {
         REQUIRE_NOTHROW(GqlParser::parse(
             "MATCH (p:Person {id: 1})-[:KNOWS]-(f:Person) WHERE f.id <> 1 "
-            "WITH DISTINCT f "
-            "WHERE NOT EXISTS { MATCH (f)-[:IS_LOCATED_IN]->(:City)-[:IS_PART_OF]->(h:Country) "
+            "RETURN DISTINCT f "
+            "NEXT "
+            "FILTER NOT EXISTS { MATCH (f)-[:IS_LOCATED_IN]->(:City)-[:IS_PART_OF]->(h:Country) "
             "WHERE h.name IN ['China', 'Germany'] } "
             "MATCH (f)<-[:HAS_CREATOR]-(m)-[:IS_LOCATED_IN]->(c:Country) "
             "RETURN f.id AS pid, count(DISTINCT c) AS cnt"));
@@ -665,15 +667,13 @@ TEST_CASE("GQL IN-list membership desugars to an OR chain (task 031)", "[gql_par
 }
 
 TEST_CASE("GQL ISO linear-query NEXT/FILTER lowering (task 032)", "[gql_parser][task032]") {
-    SECTION("RETURN ... NEXT is a projection boundary equivalent to WITH") {
-        auto with_q = GqlParser::parse(
-            "MATCH (a:Person) WITH a.id AS x MATCH (b:Person) WHERE b.id = x RETURN b.name");
+    SECTION("RETURN ... NEXT is a projection boundary that feeds the next statement") {
         auto next_q = GqlParser::parse(
             "MATCH (a:Person) RETURN a.id AS x NEXT MATCH (b:Person) WHERE b.id = x RETURN b.name");
-        REQUIRE(next_q.with_segments.size() == with_q.with_segments.size());
         REQUIRE(next_q.with_segments.size() == 1);
-        REQUIRE(next_q.with_segments[0]->returns.size() == with_q.with_segments[0]->returns.size());
+        REQUIRE(next_q.with_segments[0]->returns.size() == 1);
         REQUIRE(next_q.with_segments[0]->returns[0].alias == std::string("x"));
+        REQUIRE(next_q.matches.size() == 1); // the post-NEXT MATCH is the final segment
         REQUIRE(next_q.returns.size() == 1);
     }
     SECTION("RETURN DISTINCT ... NEXT carries the distinct projection forward") {
@@ -712,8 +712,36 @@ TEST_CASE("GQL ISO linear-query NEXT/FILTER lowering (task 032)", "[gql_parser][
         REQUIRE(q.with_segments[0]->limit.value() == 20);
         REQUIRE(q.with_segments[0]->order_by.size() == 1);
     }
-    SECTION("WITH still accepted alongside NEXT (additive dialect)") {
-        REQUIRE_NOTHROW(GqlParser::parse("MATCH (a:Person) WITH a AS x RETURN x.name"));
+    SECTION("openCypher WITH is rejected (pure GQL dialect, task 033)") {
+        REQUIRE_THROWS_WITH(
+            GqlParser::parse("MATCH (a:Person) WITH a AS x RETURN x.name"),
+            Catch::Contains("WITH is not GQL"));
+    }
+    SECTION("standalone ORDER BY/LIMIT sort-page then RETURN (IC2/IS2 shape)") {
+        auto q = GqlParser::parse(
+            "MATCH (p:Person {id: 1})<-[:HAS_CREATOR]-(m:Message) "
+            "RETURN m.creationDate AS ms, m.id AS mid "
+            "NEXT "
+            "ORDER BY ms DESC, mid ASC LIMIT 20 "
+            "RETURN ms");
+        REQUIRE(q.with_segments.size() == 1);
+        REQUIRE(q.order_by.size() == 2);   // final segment carries the sort/page
+        REQUIRE(q.limit.value() == 20);
+    }
+    SECTION("standalone ORDER BY/LIMIT sort-page then MATCH (IS5 top-1 then expand)") {
+        auto q = GqlParser::parse(
+            "MATCH (p:Person {id: 1})<-[:HAS_CREATOR]-(m:Message) "
+            "RETURN m "
+            "NEXT "
+            "ORDER BY m.creationDate DESC LIMIT 1 "
+            "MATCH (m)-[:HAS_CREATOR]->(creator:Person) "
+            "RETURN creator.id AS creatorId");
+        // Two pipeline segments: the RETURN m projection and the sort/page passthrough of m.
+        REQUIRE(q.with_segments.size() == 2);
+        REQUIRE(q.with_segments[1]->limit.value() == 1);
+        REQUIRE(q.with_segments[1]->order_by.size() == 1);
+        REQUIRE(q.with_segments[1]->returns.size() == 1); // passthrough of m
+        REQUIRE(q.matches.size() == 1);                    // the post-sort MATCH
     }
     SECTION("LET binds a computed column usable by a later FILTER/RETURN") {
         auto q = GqlParser::parse(

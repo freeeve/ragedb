@@ -59,14 +59,14 @@ static void populate_with_pipeline_graph(Graph& graph) {
     graph.shard.local().NodeAddPeered("Comment", "c2", "{\"score\": 2}").get();
 }
 
-TEST_CASE("WITH continuation segments must consume piped rows", "[gql_executor_with][task019]") {
+TEST_CASE("NEXT continuation segments must consume piped rows", "[gql_executor_with][task019]") {
     auto graph = Graph("gql_with_piped_rows_test");
     graph.Start().get();
     populate_with_pipeline_graph(graph);
 
     SECTION("count fast path must not fire on a continuation segment: empty pipe means count 0") {
         std::string res = GqlExecutor::execute(graph,
-            std::string("MATCH (p:Person {name: 'Nobody'}) WITH p MATCH (c:Comment) RETURN count(c) AS n")).get();
+            std::string("MATCH (p:Person {name: 'Nobody'}) RETURN p NEXT MATCH (c:Comment) RETURN count(c) AS n")).get();
         INFO("result: " << res);
         REQUIRE(res.find("\"n\": 0") != std::string::npos);
         REQUIRE(res.find("\"n\": 2") == std::string::npos);
@@ -75,14 +75,14 @@ TEST_CASE("WITH continuation segments must consume piped rows", "[gql_executor_w
     SECTION("count after a non-empty pipe is per-row (cartesian), not the global label count") {
         // 6 piped persons x 2 comments = 12, not 2.
         std::string res = GqlExecutor::execute(graph,
-            std::string("MATCH (p:Person) WITH p MATCH (c:Comment) RETURN count(c) AS n")).get();
+            std::string("MATCH (p:Person) RETURN p NEXT MATCH (c:Comment) RETURN count(c) AS n")).get();
         INFO("result: " << res);
         REQUIRE(res.find("\"n\": 12") != std::string::npos);
     }
 
-    SECTION("cyclic pattern after WITH is anchored to the piped binding, not every cycle") {
+    SECTION("cyclic pattern after NEXT is anchored to the piped binding, not every cycle") {
         std::string res = GqlExecutor::execute(graph,
-            std::string("MATCH (a:Person {name: 'Alice'}) WITH a "
+            std::string("MATCH (a:Person {name: 'Alice'}) RETURN a NEXT "
                         "MATCH (a)-[:KNOWS]->(b)-[:KNOWS]->(c)-[:KNOWS]->(a) "
                         "RETURN b.name AS bn, c.name AS cn")).get();
         INFO("result: " << res);
@@ -95,17 +95,17 @@ TEST_CASE("WITH continuation segments must consume piped rows", "[gql_executor_w
 
     SECTION("an empty segment still reaches a later ungrouped aggregate: one row with count 0") {
         std::string res = GqlExecutor::execute(graph,
-            std::string("MATCH (a:Person {name: 'Nobody'}) WITH a "
-                        "MATCH (a)-[:KNOWS]->(b) WITH count(b) AS n RETURN n")).get();
+            std::string("MATCH (a:Person {name: 'Nobody'}) RETURN a NEXT "
+                        "MATCH (a)-[:KNOWS]->(b) RETURN count(b) AS n NEXT RETURN n")).get();
         INFO("result: " << res);
         REQUIRE(res.find("\"n\": 0") != std::string::npos);
     }
 
-    SECTION("edge-expansion count after WITH is anchored to the piped node") {
+    SECTION("edge-expansion count after NEXT is anchored to the piped node") {
         // Alice has exactly one outgoing KNOWS edge (to Bob); the count->degree-sum rewrite must
         // not fire on the continuation part (its anchor is piped in, never degree-populated).
         std::string res = GqlExecutor::execute(graph,
-            std::string("MATCH (a:Person {name: 'Alice'}) WITH a "
+            std::string("MATCH (a:Person {name: 'Alice'}) RETURN a NEXT "
                         "MATCH (a)-[:KNOWS]->(b) RETURN count(b) AS n")).get();
         INFO("result: " << res);
         REQUIRE(res.find("\"n\": 1") != std::string::npos);
@@ -145,19 +145,19 @@ TEST_CASE("streamed top-K and group folds match materialised results", "[gql_exe
     const size_t saved = gql_stream_chunk_size;
     gql_stream_chunk_size = 2;  // force multi-chunk streaming on this tiny graph
 
-    SECTION("IC2 shape: WITH ... ORDER BY ... LIMIT over a two-hop expansion (top-K)") {
+    SECTION("IC2 shape: RETURN ... ORDER BY ... LIMIT NEXT over a two-hop expansion (top-K)") {
         std::string res = GqlExecutor::execute(graph,
             std::string("MATCH (a:Person {name: 'Alice'})-[:KNOWS]-(f:Person)<-[:HAS_CREATOR]-(m:Comment) "
-                        "WHERE m.score > 1 WITH m ORDER BY m.score DESC LIMIT 2 RETURN m.score AS s")).get();
+                        "WHERE m.score > 1 RETURN m ORDER BY m.score DESC LIMIT 2 NEXT RETURN m.score AS s")).get();
         INFO("result: " << res);
         // Friend comments with score > 1: {5, 2, 4}; top 2 descending = 5, 4.
         REQUIRE(res.find("[{\"s\": 5}, {\"s\": 4}]") != std::string::npos);
     }
 
-    SECTION("WITH DISTINCT then expand then count (the crash shape, group fold)") {
+    SECTION("RETURN DISTINCT then expand then count (the crash shape, group fold)") {
         std::string res = GqlExecutor::execute(graph,
-            std::string("MATCH (a:Person {name: 'Alice'})-[:KNOWS]-(f:Person) WITH DISTINCT f "
-                        "MATCH (f)<-[:HAS_CREATOR]-(m:Comment) RETURN count(m) AS n")).get();
+            std::string("MATCH (a:Person {name: 'Alice'})-[:KNOWS]-(f:Person) RETURN DISTINCT f "
+                        "NEXT MATCH (f)<-[:HAS_CREATOR]-(m:Comment) RETURN count(m) AS n")).get();
         INFO("result: " << res);
         REQUIRE(res.find("\"n\": 5") != std::string::npos);
     }
@@ -178,10 +178,10 @@ TEST_CASE("streamed top-K and group folds match materialised results", "[gql_exe
         // the same data; the LIMIT 3 variant must be its prefix.
         std::string full = GqlExecutor::execute(graph,
             std::string("MATCH (a:Person {name: 'Alice'})-[:KNOWS]-(f:Person)<-[:HAS_CREATOR]-(m:Comment) "
-                        "WITH m ORDER BY m.score DESC RETURN m.score AS s")).get();
+                        "RETURN m ORDER BY m.score DESC NEXT RETURN m.score AS s")).get();
         std::string streamed = GqlExecutor::execute(graph,
             std::string("MATCH (a:Person {name: 'Alice'})-[:KNOWS]-(f:Person)<-[:HAS_CREATOR]-(m:Comment) "
-                        "WITH m ORDER BY m.score DESC LIMIT 3 RETURN m.score AS s")).get();
+                        "RETURN m ORDER BY m.score DESC LIMIT 3 NEXT RETURN m.score AS s")).get();
         INFO("full: " << full << " streamed: " << streamed);
         REQUIRE(full.find("[{\"s\": 5}, {\"s\": 4}, {\"s\": 2}") != std::string::npos);
         REQUIRE(streamed.find("[{\"s\": 5}, {\"s\": 4}, {\"s\": 2}]") != std::string::npos);
@@ -223,11 +223,11 @@ TEST_CASE("ORDER BY over RETURN aliases executes correctly (task 027)", "[gql_ex
         REQUIRE(res.find("Alice") < res.find("Carol"));
     }
 
-    SECTION("alias sort keys work in a WITH segment") {
+    SECTION("alias sort keys work in an intermediate NEXT segment") {
         std::string res = GqlExecutor::execute(graph,
             std::string("MATCH (p:Person)<-[:HAS_CREATOR]-(m:Comment) "
-                        "WITH p, count(m) AS cnt ORDER BY cnt DESC LIMIT 1 "
-                        "RETURN p.name AS n, cnt")).get();
+                        "RETURN p, count(m) AS cnt ORDER BY cnt DESC LIMIT 1 "
+                        "NEXT RETURN p.name AS n, cnt")).get();
         INFO("result: " << res);
         REQUIRE(res.find("\"n\": \"Alice\", \"cnt\": 3") != std::string::npos);
     }

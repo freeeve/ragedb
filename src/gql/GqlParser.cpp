@@ -561,24 +561,44 @@ GqlQuery GqlParser::parse_single_query() {
         throw std::runtime_error("Query must contain at least one MATCH or write clause");
     }
 
-    // A WITH clause closes a pipeline segment: project (optionally DISTINCT / ORDER BY / LIMIT) and
-    // feed the projected rows forward as bindings to the next segment.
-    if (match(TokenType::WITH)) {
-        if (match(TokenType::DISTINCT)) {
-            query.distinct = true;
-        }
-        parse_return_items(query, true);
+    // ISO GQL standalone ordering/paging statement: a segment may begin with ORDER BY [LIMIT] operating
+    // on the working table piped in from the previous segment (no MATCH/RETURN of its own yet).
+    if ((check(TokenType::ORDER_BY) || check(TokenType::LIMIT)) &&
+        query.matches.empty() && query.returns.empty() && query.let_bindings.empty() &&
+        !with_segments.empty()) {
         parse_order_by(query);
-        resolve_order_by_aliases(query);
         parse_limit(query);
-        // A WHERE right after WITH is a HAVING filter on the projected rows; it applies to the next
-        // segment, which sees the projected bindings.
-        if (match(TokenType::WHERE)) {
-            pending_having = parse_expression();
+        // If a MATCH follows, the sort/page is a segment boundary: it must forward the sorted+limited
+        // working table to the next MATCH. Synthesize a passthrough projection of the previous segment's
+        // output columns so the existing projection pipeline carries every binding forward.
+        if (check(TokenType::MATCH) || (check(TokenType::OPTIONAL) && peek(1).type == TokenType::MATCH)) {
+            for (const auto& item : with_segments.back()->returns) {
+                std::string col = item.alias
+                    ? *item.alias
+                    : (item.expr && item.expr->kind == ExpressionKind::VARIABLE
+                           ? static_cast<VariableExpr*>(item.expr.get())->name
+                           : std::string());
+                if (!col.empty()) {
+                    ReturnItem pass;
+                    pass.expr = std::make_unique<VariableExpr>(col);
+                    pass.alias = col;
+                    query.returns.push_back(std::move(pass));
+                }
+            }
+            resolve_order_by_aliases(query);
+            with_segments.push_back(std::make_shared<GqlQuery>(std::move(query)));
+            continue;
         }
+        // Otherwise a RETURN follows and projects the ordered/paged rows (order_by/limit stay on query).
+    }
 
-        with_segments.push_back(std::make_shared<GqlQuery>(std::move(query)));
-        continue;
+    // openCypher WITH is not ISO GQL. RageDB is a pure GQL dialect: reject WITH with guidance toward
+    // the linear-query equivalents (RETURN ... NEXT for a projection boundary, LET for a value binding,
+    // FILTER for a post-projection predicate). See task 033.
+    if (check(TokenType::WITH)) {
+        throw std::runtime_error(
+            "WITH is not GQL: use 'RETURN ... NEXT' for a projection boundary, 'LET x = ...' for a "
+            "value binding, or 'FILTER ...' for a post-projection predicate");
     }
 
     // Parse RETURN clause (optional if we performed writes, otherwise mandatory)
@@ -601,6 +621,13 @@ GqlQuery GqlParser::parse_single_query() {
         bool intermediate = check(TokenType::NEXT_KW);
         pos = saved_pos;
         if (intermediate) {
+            // A RETURN feeding NEXT projects columns that bind forward, so a non-variable projection
+            // needs an alias to name its forwarded column (as the openCypher WITH form required).
+            for (const auto& item : query.returns) {
+                if (!item.alias && item.expr && item.expr->kind != ExpressionKind::VARIABLE) {
+                    throw std::runtime_error("RETURN items before NEXT other than a plain variable must be aliased with AS");
+                }
+            }
             parse_order_by(query);
             resolve_order_by_aliases(query);
             parse_limit(query);

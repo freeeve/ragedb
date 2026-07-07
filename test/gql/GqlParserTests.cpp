@@ -717,7 +717,7 @@ TEST_CASE("GQL ISO linear-query NEXT/FILTER lowering (task 032)", "[gql_parser][
             GqlParser::parse("MATCH (a:Person) WITH a AS x RETURN x.name"),
             Catch::Contains("WITH is not GQL"));
     }
-    SECTION("standalone ORDER BY/LIMIT sort-page then RETURN (IC2/IS2 shape)") {
+    SECTION("standalone ORDER BY/LIMIT sort-page then RETURN pushes top-K to producer (IC2/IS2, task 034)") {
         auto q = GqlParser::parse(
             "MATCH (p:Person {id: 1})<-[:HAS_CREATOR]-(m:Message) "
             "RETURN m.creationDate AS ms, m.id AS mid "
@@ -725,8 +725,14 @@ TEST_CASE("GQL ISO linear-query NEXT/FILTER lowering (task 032)", "[gql_parser][
             "ORDER BY ms DESC, mid ASC LIMIT 20 "
             "RETURN ms");
         REQUIRE(q.with_segments.size() == 1);
-        REQUIRE(q.order_by.size() == 2);   // final segment carries the sort/page
-        REQUIRE(q.limit.value() == 20);
+        // The ORDER BY/LIMIT is pushed onto the producing segment (which has the MATCH) so its
+        // streaming top-K bounds the sort; the final segment carries neither.
+        REQUIRE(q.with_segments[0]->order_by.size() == 2);
+        REQUIRE(q.with_segments[0]->limit.value() == 20);
+        // The producer's ORDER BY alias `ms` was resolved to its projected expression (m.creationDate).
+        REQUIRE(q.with_segments[0]->order_by[0].expr->kind == ExpressionKind::PROPERTY_LOOKUP);
+        REQUIRE(q.order_by.empty());
+        REQUIRE(!q.limit.has_value());
     }
     SECTION("standalone ORDER BY/LIMIT sort-page then MATCH (IS5 top-1 then expand)") {
         auto q = GqlParser::parse(

@@ -446,3 +446,46 @@ TEST_CASE("GQL IC5 shape executes without crashing (task 032 crash repro)", "[gq
 
     graph.Stop().get();
 }
+
+TEST_CASE("NEXT ORDER BY LIMIT pushes a bounded top-K into the producing segment (task 034)", "[gql_executor_with][task034]") {
+    auto graph = Graph("gql_topk_pushdown_test");
+    graph.Start().get();
+    graph.Clear();
+    graph.shard.local().NodeTypeInsertPeered("Person").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "id", "integer").get();
+    graph.shard.local().NodeTypeInsertPeered("Post").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Post", "id", "integer").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Post", "creationDate", "integer").get();
+    graph.shard.local().RelationshipTypeInsertPeered("HAS_CREATOR").get();
+    uint64_t p = graph.shard.local().NodeAddPeered("Person", "1", "{\"id\": 1}").get();
+    // Five posts with distinct creationDates; the top-2 by creationDate DESC are ids 105 and 104.
+    for (int i = 0; i < 5; ++i) {
+        int id = 101 + i;
+        int cd = 1000 + i * 10;  // 1000,1010,1020,1030,1040
+        uint64_t post = graph.shard.local().NodeAddPeered("Post", std::to_string(id),
+            "{\"id\": " + std::to_string(id) + ", \"creationDate\": " + std::to_string(cd) + "}").get();
+        graph.shard.local().RelationshipAddPeered("HAS_CREATOR", post, p, "{}").get();
+    }
+
+    const size_t saved = gql_stream_chunk_size;
+    gql_stream_chunk_size = 1;  // force the producing segment's traversal to stream in chunks
+
+    std::string res = GqlExecutor::execute(graph,
+        std::string("MATCH (p:Person {id: 1})<-[:HAS_CREATOR]-(m:Post) "
+                    "RETURN m.creationDate AS ms, m.id AS mid "
+                    "NEXT "
+                    "ORDER BY ms DESC, mid ASC LIMIT 2 "
+                    "RETURN mid, ms")).get();
+    INFO("result: " << res);
+    gql_stream_chunk_size = saved;
+
+    // Only the top 2 by creationDate DESC survive: post 105 (1040) then post 104 (1030).
+    REQUIRE(res.find("\"mid\": 105, \"ms\": 1040") != std::string::npos);
+    REQUIRE(res.find("\"mid\": 104, \"ms\": 1030") != std::string::npos);
+    REQUIRE(res.find("\"mid\": 103") == std::string::npos);
+    REQUIRE(res.find("\"mid\": 102") == std::string::npos);
+    REQUIRE(res.find("\"mid\": 101") == std::string::npos);
+    REQUIRE(res.find("105") < res.find("104"));  // DESC order preserved
+
+    graph.Stop().get();
+}

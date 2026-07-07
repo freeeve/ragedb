@@ -595,7 +595,19 @@ GqlQuery GqlParser::parse_single_query() {
             with_segments.push_back(std::make_shared<GqlQuery>(std::move(query)));
             continue;
         }
-        // Otherwise a RETURN follows and projects the ordered/paged rows (order_by/limit stay on query).
+        // Otherwise a RETURN follows and re-projects the ordered/paged rows. Push the ORDER BY/LIMIT
+        // into the producing (previous) segment so its streaming top-K bounds the sort during the
+        // traversal, instead of materialising the whole intermediate to sort it here (task 034). Valid
+        // because the order keys are the previous segment's output columns and this segment only
+        // re-projects; only push when that segment has no ordering/paging of its own to clobber.
+        auto& producer = with_segments.back();
+        if (producer->order_by.empty() && !producer->limit.has_value()) {
+            producer->order_by = std::move(query.order_by);
+            producer->limit = query.limit;
+            query.order_by.clear();
+            query.limit.reset();
+            resolve_order_by_aliases(*producer);
+        }
     }
 
     // openCypher WITH is not ISO GQL. RageDB is a pure GQL dialect: reject WITH with guidance toward

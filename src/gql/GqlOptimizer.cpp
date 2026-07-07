@@ -767,10 +767,173 @@ void GqlOptimizer::optimize(GqlQuery& query) {
  * @param graph The database graph instance.
  * @param query The GQL query to optimize.
  */
+namespace {
+
+static std::string node_literal_label(const PatternNode& node) {
+    return (node.label_expr && node.label_expr->kind == LabelExprKind::LITERAL) ? node.label_expr->name : "";
+}
+// A variable's label is often declared only on its first occurrence (`(f:Person) ... RETURN f NEXT
+// MATCH (forum)->(f)`), so fall back to the label the variable carried elsewhere in the query.
+static std::string node_effective_label(const PatternNode& node,
+                                        const std::map<std::string, std::string>& var_labels) {
+    std::string lbl = node_literal_label(node);
+    if (!lbl.empty()) return lbl;
+    if (!node.variable.empty()) {
+        auto it = var_labels.find(node.variable);
+        if (it != var_labels.end()) return it->second;
+    }
+    return "";
+}
+static std::string edge_literal_type(const PatternEdge& edge) {
+    return (edge.label_expr && edge.label_expr->kind == LabelExprKind::LITERAL) ? edge.label_expr->name : "";
+}
+static uint64_t label_node_count(ragedb::Graph& graph, const std::string& lbl) {
+    return lbl.empty() ? graph.shard.local().AllNodesCount() : graph.shard.local().NodeCount(lbl);
+}
+
+// Approximate fan-out of stepping across `edge_type` from an average node of `from_label`:
+// (edges of that type) / (nodes of that label). Direction-agnostic degree estimate, floored at 1.
+static double avg_edge_degree(ragedb::Graph& graph, const std::string& edge_type, const std::string& from_label) {
+    uint64_t rels = edge_type.empty() ? graph.shard.local().AllRelationshipsCount()
+                                      : graph.shard.local().RelationshipCount(edge_type);
+    uint64_t nodes = from_label.empty() ? graph.shard.local().AllNodesCount()
+                                        : graph.shard.local().NodeCount(from_label);
+    if (nodes == 0) return static_cast<double>(rels ? rels : 1);
+    double d = static_cast<double>(rels) / static_cast<double>(nodes);
+    return d < 1.0 ? 1.0 : d;
+}
+
+// Estimated fan-out multiplier of driving `match` given the already-bound variables. A node is bound if
+// its variable is in `bound` or it has a selective index seek (id lookup). Walking from a bound
+// endpoint, each hop to an unbound node multiplies by that hop's avg degree; a hop to an already-bound
+// node is a join constraint (selectivity < 1). With no bound endpoint the match must scan, so its cost
+// is the smaller labelled endpoint's node count (task 035).
+static double estimate_match_fanout(ragedb::Graph& graph, const MatchStatement& match,
+                                    const std::set<std::string>& bound,
+                                    const std::map<std::string, std::string>& var_labels) {
+    const auto& nodes = match.pattern.nodes;
+    const auto& edges = match.pattern.edges;
+    size_t n = nodes.size();
+    if (n < 2 || edges.size() + 1 != n) return 1.0;
+    auto is_bound = [&](const PatternNode& nd) {
+        return (!nd.variable.empty() && bound.count(nd.variable)) || has_node_index_seek(graph, nd);
+    };
+    bool front = is_bound(nodes.front());
+    bool back = is_bound(nodes.back());
+    if (!front && !back) {
+        return static_cast<double>(std::min(label_node_count(graph, node_effective_label(nodes.front(), var_labels)),
+                                            label_node_count(graph, node_effective_label(nodes.back(), var_labels))));
+    }
+    std::set<std::string> local = bound;
+    double fanout = 1.0;
+    if (front) {
+        for (size_t k = 0; k + 1 < n; ++k) {
+            const auto& to = nodes[k + 1];
+            if (!to.variable.empty() && local.count(to.variable)) { fanout *= 0.5; }
+            else {
+                fanout *= avg_edge_degree(graph, edge_literal_type(edges[k]), node_effective_label(nodes[k], var_labels));
+                if (!to.variable.empty()) local.insert(to.variable);
+            }
+        }
+    } else {
+        for (size_t k = n - 1; k > 0; --k) {
+            const auto& to = nodes[k - 1];
+            if (!to.variable.empty() && local.count(to.variable)) { fanout *= 0.5; }
+            else {
+                fanout *= avg_edge_degree(graph, edge_literal_type(edges[k - 1]), node_effective_label(nodes[k], var_labels));
+                if (!to.variable.empty()) local.insert(to.variable);
+            }
+        }
+    }
+    return fanout;
+}
+
+static void collect_match_vars(const MatchStatement& m, std::set<std::string>& out) {
+    for (const auto& nd : m.pattern.nodes) if (!nd.variable.empty()) out.insert(nd.variable);
+    for (const auto& e : m.pattern.edges) if (!e.variable.empty()) out.insert(e.variable);
+}
+
+static std::set<std::string> segment_output_vars(const GqlQuery& seg) {
+    std::set<std::string> out;
+    for (const auto& item : seg.returns) {
+        if (item.alias) out.insert(*item.alias);
+        else if (item.expr && item.expr->kind == ExpressionKind::VARIABLE)
+            out.insert(static_cast<const VariableExpr*>(item.expr.get())->name);
+    }
+    return out;
+}
+
+// Reorder a segment's MATCH statements to minimise total intermediate size, given the variables bound
+// on entry (piped in). Reordering is result-preserving (the matches are conjunctive), so it only
+// changes speed; applied only when a strictly cheaper order exists by a clear margin, to avoid churn
+// from estimate noise. This is what lets the FoF shape run the cheap expansion first (task 035).
+static void reorder_matches_by_cost(ragedb::Graph& graph, std::vector<MatchStatement>& matches,
+                                    const std::set<std::string>& initial_bound,
+                                    const std::map<std::string, std::string>& var_labels) {
+    size_t n = matches.size();
+    if (n < 2 || n > 6) return;
+    for (const auto& m : matches) {
+        if (m.is_search || m.is_khop || m.shortest_path_kind != ShortestPathKind::NONE ||
+            !m.path_variable.empty() || m.is_optional) {
+            return;  // special shapes: keep the written order
+        }
+    }
+    auto order_cost = [&](const std::vector<size_t>& perm) {
+        std::set<std::string> bound = initial_bound;
+        double intermediate = 1.0, total = 0.0;
+        for (size_t idx : perm) {
+            intermediate *= estimate_match_fanout(graph, matches[idx], bound, var_labels);
+            total += intermediate;
+            collect_match_vars(matches[idx], bound);
+        }
+        return total;
+    };
+    std::vector<size_t> identity(n);
+    for (size_t i = 0; i < n; ++i) identity[i] = i;
+    double base_cost = order_cost(identity);
+    std::vector<size_t> best = identity, perm = identity;
+    double best_cost = base_cost;
+    while (std::next_permutation(perm.begin(), perm.end())) {
+        double c = order_cost(perm);
+        if (c < best_cost) { best_cost = c; best = perm; }
+    }
+    if (best != identity && best_cost < base_cost * 0.9) {
+        std::vector<MatchStatement> reordered;
+        reordered.reserve(n);
+        for (size_t idx : best) reordered.push_back(std::move(matches[idx]));
+        matches = std::move(reordered);
+    }
+}
+
+} // namespace
+
 void GqlOptimizer::optimize(ragedb::Graph& graph, GqlQuery& query) {
     optimize(query);
 
     if (query.kind == QueryKind::SINGLE) {
+        // Task 035: reorder each segment's MATCHes by estimated cardinality so the cheap expansion runs
+        // first (piped-frontier FoF -> the low-fan-out side), turning the rest into verifications.
+        // A variable's label is often declared only on its first occurrence and reused unlabelled in a
+        // later segment, so collect labels across the whole query for the degree estimates.
+        std::map<std::string, std::string> var_labels;
+        auto learn_labels = [&](const std::vector<MatchStatement>& ms) {
+            for (const auto& m : ms) {
+                for (const auto& nd : m.pattern.nodes) {
+                    std::string lbl = node_literal_label(nd);
+                    if (!nd.variable.empty() && !lbl.empty()) var_labels.emplace(nd.variable, lbl);
+                }
+            }
+        };
+        for (auto& seg : query.with_segments) if (seg) learn_labels(seg->matches);
+        learn_labels(query.matches);
+
+        std::set<std::string> incoming;
+        for (auto& seg : query.with_segments) {
+            if (seg && !seg->matches.empty()) reorder_matches_by_cost(graph, seg->matches, incoming, var_labels);
+            if (seg) incoming = segment_output_vars(*seg);
+        }
+        if (!query.matches.empty()) reorder_matches_by_cost(graph, query.matches, incoming, var_labels);
+
         for (auto& match : query.matches) {
             if (match.is_search) continue;
             auto& pattern = match.pattern;

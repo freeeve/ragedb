@@ -17,6 +17,7 @@
 #include <catch2/catch.hpp>
 #include <Graph.h>
 #include "../../src/gql/GqlParser.h"
+#include "../../src/gql/GqlOptimizer.h"
 #include "../../src/gql/GqlExecutor.h"
 #include "../../src/gql/executor/PathTraverser.h"
 
@@ -486,6 +487,54 @@ TEST_CASE("NEXT ORDER BY LIMIT pushes a bounded top-K into the producing segment
     REQUIRE(res.find("\"mid\": 102") == std::string::npos);
     REQUIRE(res.find("\"mid\": 101") == std::string::npos);
     REQUIRE(res.find("105") < res.find("104"));  // DESC order preserved
+
+    graph.Stop().get();
+}
+
+TEST_CASE("cost-based reorder runs the cheap match first (task 035)", "[gql_executor_with][task035]") {
+    auto graph = Graph("gql_reorder_test");
+    graph.Start().get();
+    graph.Clear();
+    graph.shard.local().NodeTypeInsertPeered("Person").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "id", "integer").get();
+    graph.shard.local().NodeTypeInsertPeered("Forum").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Forum", "id", "integer").get();
+    graph.shard.local().NodeTypeInsertPeered("Post").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Post", "id", "integer").get();
+    graph.shard.local().RelationshipTypeInsertPeered("KNOWS").get();
+    graph.shard.local().RelationshipTypeInsertPeered("HAS_MEMBER").get();
+    graph.shard.local().RelationshipTypeInsertPeered("CONTAINER_OF").get();
+    graph.shard.local().RelationshipTypeInsertPeered("HAS_CREATOR").get();
+    uint64_t p1 = graph.shard.local().NodeAddPeered("Person", "1", "{\"id\": 1}").get();
+    uint64_t p2 = graph.shard.local().NodeAddPeered("Person", "2", "{\"id\": 2}").get();
+    graph.shard.local().RelationshipAddPeered("KNOWS", p1, p2, "{}").get();
+    // Skew so that driving forum-first (HAS_MEMBER 5 x CONTAINER_OF 3) is far dearer than post-first
+    // (HAS_CREATOR ~1 x CONTAINER_OF-back 1): 5 forums each with p2 as member and 3 posts; p2 created 2.
+    int post_key = 100;
+    for (int i = 0; i < 5; ++i) {
+        uint64_t forum = graph.shard.local().NodeAddPeered("Forum", std::to_string(10 + i), "{\"id\": " + std::to_string(10 + i) + "}").get();
+        graph.shard.local().RelationshipAddPeered("HAS_MEMBER", forum, p2, "{}").get();
+        for (int j = 0; j < 3; ++j) {
+            uint64_t post = graph.shard.local().NodeAddPeered("Post", std::to_string(post_key), "{\"id\": " + std::to_string(post_key) + "}").get();
+            graph.shard.local().RelationshipAddPeered("CONTAINER_OF", forum, post, "{}").get();
+            if (i == 0 && j < 2) graph.shard.local().RelationshipAddPeered("HAS_CREATOR", post, p2, "{}").get();
+            ++post_key;
+        }
+    }
+
+    auto q = GqlParser::parse(
+        "MATCH (p:Person {id: 1})-[:KNOWS]-(f:Person) RETURN DISTINCT f "
+        "NEXT "
+        "MATCH (forum:Forum)-[:HAS_MEMBER]->(f) "
+        "MATCH (forum)-[:CONTAINER_OF]->(post:Post)-[:HAS_CREATOR]->(f) "
+        "RETURN forum.id AS forumId, count(DISTINCT post) AS postCount");
+    GqlOptimizer::optimize(graph, q);
+
+    // The final segment's MATCHes are reordered so the cheap post expansion (3-node) runs first and the
+    // membership match (2-node) becomes a trailing verification.
+    REQUIRE(q.matches.size() == 2);
+    REQUIRE(q.matches[0].pattern.nodes.size() == 3);
+    REQUIRE(q.matches[1].pattern.nodes.size() == 2);
 
     graph.Stop().get();
 }

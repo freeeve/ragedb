@@ -342,3 +342,54 @@ TEST_CASE("GQL expression forms execute (task 032: CASE/length/zoned_datetime/CO
 
     graph.Stop().get();
 }
+
+TEST_CASE("GQL IC5 shape executes without crashing (task 032 crash repro)", "[gql_executor_with][task032ic5]") {
+    auto graph = Graph("gql_ic5_shape_test");
+    graph.Start().get();
+    graph.Clear();
+    graph.shard.local().NodeTypeInsertPeered("Person").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "id", "integer").get();
+    graph.shard.local().NodeTypeInsertPeered("Forum").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Forum", "id", "integer").get();
+    graph.shard.local().NodeTypeInsertPeered("Post").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Post", "id", "integer").get();
+    graph.shard.local().RelationshipTypeInsertPeered("KNOWS").get();
+    graph.shard.local().RelationshipTypeInsertPeered("HAS_MEMBER").get();
+    graph.shard.local().RelationshipTypeInsertPeered("CONTAINER_OF").get();
+    graph.shard.local().RelationshipTypeInsertPeered("HAS_CREATOR").get();
+    uint64_t p1 = graph.shard.local().NodeAddPeered("Person", "1", "{\"id\": 1}").get();
+    uint64_t f1 = graph.shard.local().NodeAddPeered("Person", "2", "{\"id\": 2}").get();
+    uint64_t f2 = graph.shard.local().NodeAddPeered("Person", "3", "{\"id\": 3}").get();
+    uint64_t forum = graph.shard.local().NodeAddPeered("Forum", "10", "{\"id\": 10}").get();
+    uint64_t post1 = graph.shard.local().NodeAddPeered("Post", "100", "{\"id\": 100}").get();
+    uint64_t post2 = graph.shard.local().NodeAddPeered("Post", "101", "{\"id\": 101}").get();
+    graph.shard.local().RelationshipAddPeered("KNOWS", p1, f1, "{}").get();
+    graph.shard.local().RelationshipAddPeered("KNOWS", f1, f2, "{}").get();
+    graph.shard.local().RelationshipAddPeered("HAS_MEMBER", forum, f1, "{}").get();
+    graph.shard.local().RelationshipAddPeered("CONTAINER_OF", forum, post1, "{}").get();
+    graph.shard.local().RelationshipAddPeered("CONTAINER_OF", forum, post2, "{}").get();
+    graph.shard.local().RelationshipAddPeered("HAS_CREATOR", post1, f1, "{}").get();
+    graph.shard.local().RelationshipAddPeered("HAS_CREATOR", post2, f1, "{}").get();
+
+    SECTION("RETURN DISTINCT f NEXT (frontier only)") {
+        std::string res = GqlExecutor::execute(graph,
+            std::string("MATCH (p:Person {id: 1})-[:KNOWS]-{1,2}(f:Person) WHERE f.id <> 1 "
+                        "RETURN DISTINCT f NEXT RETURN f.id AS fid ORDER BY fid")).get();
+        INFO("result: " << res);
+        REQUIRE(res.find("\"fid\": 2") != std::string::npos);
+    }
+    SECTION("full IC5 shape") {
+        std::string res = GqlExecutor::execute(graph,
+            std::string("MATCH (p:Person {id: 1})-[:KNOWS]-{1,2}(f:Person) WHERE f.id <> 1 "
+                        "RETURN DISTINCT f "
+                        "NEXT "
+                        "MATCH (forum:Forum)-[:HAS_MEMBER]->(f) "
+                        "MATCH (forum)-[:CONTAINER_OF]->(post:Post)-[:HAS_CREATOR]->(f) "
+                        "RETURN forum.id AS forumId, count(DISTINCT post) AS postCount "
+                        "ORDER BY postCount DESC, forumId ASC LIMIT 5")).get();
+        INFO("result: " << res);
+        REQUIRE(res.find("\"forumId\": 10, \"postCount\": 2") != std::string::npos);
+    }
+
+    graph.Stop().get();
+}

@@ -917,7 +917,7 @@ static seastar::future<> stream_match_chain(
                           mode = stmt.match_mode, pmode = stmt.path_mode,
                           pattern = &stmt.pattern](std::vector<GqlRow> rows) {
         auto rows_ptr = std::make_shared<std::vector<GqlRow>>(std::move(rows));
-        return seastar::do_for_each(*rows_ptr,
+        return seastar::max_concurrent_for_each(*rows_ptr, gql_stream_inner_concurrency,
             [&graph, query_ptr, pruner, idx, final_sink, mode, pmode, pattern](GqlRow& r) {
                 if (!satisfies_match_path_modes(r, mode, pmode, *pattern)) {
                     return seastar::make_ready_future<>();

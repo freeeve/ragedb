@@ -62,6 +62,12 @@ inline size_t gql_stream_chunk_size = 256;
 // while overlapping the latency of a large piped frontier (FoF expansion) instead of serialising it.
 inline size_t gql_stream_concurrency = 32;
 
+// Max rows driven concurrently at each INNER step of a multi-match chain (task 029): a chain step's
+// output (e.g. a friend's forums) fans into the next match (each forum's posts) concurrently. Kept
+// small so the nested product with gql_stream_concurrency stays bounded (independent semaphores per
+// level, so no cross-level deadlock).
+inline size_t gql_stream_inner_concurrency = 8;
+
 /**
  * @brief Consumer for streamed traversal output: when passed to traverse_path_pattern, matched
  *        rows are handed to consume() in bounded batches instead of being collected and returned

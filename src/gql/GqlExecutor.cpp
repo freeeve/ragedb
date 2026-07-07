@@ -835,7 +835,7 @@ static seastar::future<QueryResult> run_streaming_topk(
 
     auto rows_in = std::make_shared<std::vector<GqlRow>>(
         incoming.has_value() ? std::move(*incoming) : std::vector<GqlRow>{ GqlRow{} });
-    return seastar::do_for_each(rows_in->begin(), rows_in->end(),
+    return seastar::max_concurrent_for_each(rows_in->begin(), rows_in->end(), gql_stream_concurrency,
         [&graph, query_ptr, pruner, sink](GqlRow& in) {
             const auto& stmt = query_ptr->matches[0];
             return traverse_path_pattern(graph, stmt.pattern, in, 0, pruner, "", true, false,
@@ -978,7 +978,7 @@ static seastar::future<QueryResult> run_streaming_group_fold(
     auto pruner_ptr = std::make_shared<const ProjectionPruner>(pruner);
     auto rows_in = std::make_shared<std::vector<GqlRow>>(
         incoming.has_value() ? std::move(*incoming) : std::vector<GqlRow>{ GqlRow{} });
-    return seastar::do_for_each(rows_in->begin(), rows_in->end(),
+    return seastar::max_concurrent_for_each(rows_in->begin(), rows_in->end(), gql_stream_concurrency,
         [&graph, query_ptr, pruner_ptr, sink](GqlRow& in) {
             return stream_match_chain(graph, query_ptr, pruner_ptr, 0, in, sink);
         })

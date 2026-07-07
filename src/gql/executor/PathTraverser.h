@@ -57,6 +57,11 @@ inline size_t gql_scan_chunk_size = 65536;
  */
 inline size_t gql_stream_chunk_size = 256;
 
+// Max incoming rows driven concurrently through a streamed traversal (task 029): the per-row drives
+// await graph I/O independently, so bounding the in-flight count keeps memory O(concurrency x chunk)
+// while overlapping the latency of a large piped frontier (FoF expansion) instead of serialising it.
+inline size_t gql_stream_concurrency = 32;
+
 /**
  * @brief Consumer for streamed traversal output: when passed to traverse_path_pattern, matched
  *        rows are handed to consume() in bounded batches instead of being collected and returned

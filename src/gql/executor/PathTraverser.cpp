@@ -968,6 +968,24 @@ seastar::future<std::vector<GqlRow>> traverse_path_pattern(ragedb::Graph& graph,
         }
     }
 
+    // Task 035: anchor on a bound (e.g. piped) node when the written first node is unbound. If the
+    // pattern's first node has no binding in base_row but its last node does, reverse the pattern so
+    // the traversal starts from the bound node instead of scanning the first node's whole label (a
+    // piped `(forum:Forum)-[:CONTAINER_OF]->(post)-[:HAS_CREATOR]->(f)` otherwise scans every Forum
+    // per piped f). Reversal is semantically identical -- same paths, edge directions flipped.
+    // Restricted to the no-start-sort case so the start-node ordering optimisation is never dropped.
+    if (sort_property.empty() && !sort_by_id && prep_pattern.nodes.size() >= 2 &&
+        prep_pattern.edges.size() + 1 == prep_pattern.nodes.size() &&
+        base_row.bindings.find(prep_pattern.nodes.front().variable) == base_row.bindings.end() &&
+        base_row.bindings.find(prep_pattern.nodes.back().variable) != base_row.bindings.end()) {
+        std::reverse(prep_pattern.nodes.begin(), prep_pattern.nodes.end());
+        std::reverse(prep_pattern.edges.begin(), prep_pattern.edges.end());
+        for (auto& edge : prep_pattern.edges) {
+            if (edge.direction == EdgeDirection::RIGHT) edge.direction = EdgeDirection::LEFT;
+            else if (edge.direction == EdgeDirection::LEFT) edge.direction = EdgeDirection::RIGHT;
+        }
+    }
+
     bool has_node_seek = false;
     if (prep_pattern.nodes[0].label_expr && prep_pattern.nodes[0].label_expr->kind == LabelExprKind::LITERAL) {
         std::string label = prep_pattern.nodes[0].label_expr->name;

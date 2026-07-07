@@ -242,5 +242,15 @@ TEST_CASE("Typechecker is linear-query (NEXT) aware (task 022)", "[gql_typecheck
         REQUIRE_THROWS_WITH(GqlTypechecker::typecheck(graph, query), Catch::Contains("r"));
     }
 
+    SECTION("COUNT { } degree-rewrite virtual property passes typecheck (task 032)") {
+        // The optimizer rewrites the simple-pattern COUNT{} into a synthetic `_deg_p_..._OUT` degree
+        // property; the typechecker must accept it (it is populated at execution time, not declared in
+        // the schema). Without the fix this throws "Property '_deg_p_FRIEND_OF_OUT' does not exist".
+        auto query = GqlParser::parse(
+            "MATCH (p:Person) RETURN COUNT { (p)-[:FRIEND_OF]->(f:Person) } AS c");
+        GqlOptimizer::optimize(graph, query);
+        REQUIRE_NOTHROW(GqlTypechecker::typecheck(graph, query));
+    }
+
     graph.Stop().get();
 }

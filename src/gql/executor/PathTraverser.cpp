@@ -573,6 +573,38 @@ static seastar::future<std::vector<GqlRow>> traverse_step(ragedb::Graph& graph, 
                 rels.resize(max_limit);
             }
         }
+
+        // Bound-target semi-join (task 035): when the far node is already bound (a piped/earlier binding),
+        // we already hold that Node. A verification match like `(forum)-[hm:HAS_MEMBER]->(f)` then only
+        // needs to keep the relationship(s) whose other end IS the bound node -- so build the row from the
+        // matched rel directly instead of fetching every neighbour node (one NodeGetPeered per rel) and
+        // discarding all but the bound one. That per-rel node fetch was the FoF verification blow-up.
+        std::optional<uint64_t> bound_target_id;
+        std::optional<Node> bound_target_node;
+        {
+            auto bit = row.bindings.find(next_node.variable);
+            if (bit != row.bindings.end() && bit->second.type == GqlValue::NODE && bit->second.node.has_value()) {
+                bound_target_id = bit->second.node->getId();
+                bound_target_node = bit->second.node;
+            }
+        }
+        auto build_bound_row = [row, edge, next_node, node_idx, pruner, bound_target_node](const Relationship& rel) -> std::optional<GqlRow> {
+            Node target_node = *bound_target_node;
+            if (pruner.should_prune(next_node.variable)) {
+                target_node.pruneProperties(pruner.get_keys(next_node.variable));
+            }
+            if (next_node.label_expr && !matches_label_expr(target_node.getType(), next_node.label_expr)) return std::nullopt;
+            if (!matches_properties(target_node.getProperties(), next_node.properties) || !matches_filters(target_node.getProperties(), next_node.property_filters)) return std::nullopt;
+            GqlRow new_row = row;
+            new_row.bindings[edge.variable] = GqlValue(rel);
+            new_row.bindings["_e_" + std::to_string(node_idx)] = GqlValue(rel);
+            new_row.bindings[next_node.variable] = GqlValue(target_node);
+            new_row.bindings["_n_" + std::to_string(node_idx + 1)] = GqlValue(target_node);
+            if (edge.where_expr && !evaluate_expression(new_row, edge.where_expr.get()).is_truthy()) return std::nullopt;
+            if (next_node.where_expr && !evaluate_expression(new_row, next_node.where_expr.get()).is_truthy()) return std::nullopt;
+            return new_row;
+        };
+
         if (limit > 0) {
             struct LoopState {
                 size_t rel_idx = 0;
@@ -580,7 +612,7 @@ static seastar::future<std::vector<GqlRow>> traverse_step(ragedb::Graph& graph, 
             };
             auto state = std::make_shared<LoopState>();
             auto run_loop = std::make_shared<std::function<seastar::future<std::vector<GqlRow>>()>>();
-            *run_loop = [state, rels = std::move(rels), src_id, &graph, limit, edge, next_node, node_idx, row, pruner, run_loop]() -> seastar::future<std::vector<GqlRow>> {
+            *run_loop = [state, rels = std::move(rels), src_id, &graph, limit, edge, next_node, node_idx, row, pruner, run_loop, bound_target_id, build_bound_row]() -> seastar::future<std::vector<GqlRow>> {
                 if (state->results.size() >= limit || state->rel_idx >= rels.size()) {
                     if (state->results.size() > limit) {
                         state->results.resize(limit);
@@ -597,6 +629,12 @@ static seastar::future<std::vector<GqlRow>> traverse_step(ragedb::Graph& graph, 
                 }
 
                 uint64_t target_id = (rel.getStartingNodeId() == src_id) ? rel.getEndingNodeId() : rel.getStartingNodeId();
+                if (bound_target_id) {
+                    if (target_id == *bound_target_id) {
+                        if (auto r = build_bound_row(rel)) state->results.push_back(std::move(*r));
+                    }
+                    return (*run_loop)();
+                }
                 return graph.shard.local().NodeGetPeered(target_id)
                 .then([row, rel, edge, next_node, node_idx, pruner, state, run_loop](Node target_node) mutable {
                     if (pruner.should_prune(next_node.variable)) {
@@ -644,6 +682,13 @@ static seastar::future<std::vector<GqlRow>> traverse_step(ragedb::Graph& graph, 
                 }
 
                 uint64_t target_id = (rel.getStartingNodeId() == src_id) ? rel.getEndingNodeId() : rel.getStartingNodeId();
+
+                if (bound_target_id) {
+                    if (target_id == *bound_target_id) {
+                        futs.push_back(seastar::make_ready_future<std::optional<GqlRow>>(build_bound_row(rel)));
+                    }
+                    continue;
+                }
 
                 futs.push_back(
                     graph.shard.local().NodeGetPeered(target_id)

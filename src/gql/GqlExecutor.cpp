@@ -737,14 +737,7 @@ static seastar::future<std::vector<GqlRow>> execute_with_segments(
  *        and nothing that needs the materialised row set as a whole. The streamed shapes are the
  *        expansion-heavy ones that OOM when collected (tasks 018/020).
  */
-static bool stream_eligible(const GqlQuery& q) {
-    if (q.kind != QueryKind::SINGLE) return false;
-    if (q.explain || q.profile) return false;
-    if (!q.writes.empty()) return false;
-    if (q.has_unnested_subquery) return false;
-    if (q.matches.size() != 1) return false;
-    if (!q.let_bindings.empty()) return false; // LET adds computed columns; use the materialising path
-    const auto& m = q.matches[0];
+static bool match_streamable(const MatchStatement& m) {
     if (m.is_optional || m.is_search || m.is_khop) return false;
     if (m.shortest_path_kind != ShortestPathKind::NONE) return false;
     if (m.algebraic_path_count || m.khop_count_only) return false;
@@ -752,6 +745,36 @@ static bool stream_eligible(const GqlQuery& q) {
     if (!m.path_variable.empty()) return false;
     if (m.limit.has_value()) return false;
     if (m.pattern.edges.empty()) return false;
+    return true;
+}
+
+static bool stream_eligible(const GqlQuery& q) {
+    if (q.kind != QueryKind::SINGLE) return false;
+    if (q.explain || q.profile) return false;
+    if (!q.writes.empty()) return false;
+    if (q.has_unnested_subquery) return false;
+    if (q.matches.size() != 1) return false;
+    if (!q.let_bindings.empty()) return false; // LET adds computed columns; use the materialising path
+    return match_streamable(q.matches[0]);
+}
+
+/**
+ * @brief Whether a grouped/ungrouped aggregate can be streamed through a MULTI-match chain: every
+ *        match is individually streamable and the segment carries no shape that needs the whole
+ *        materialised row set. This bounds the FoF + expansion + count(DISTINCT) class (tasks 018/029)
+ *        that OOM-crashes when the full (frontier x expansion) join is collected before aggregating.
+ *        Cross-match DIFFERENT-EDGES uniqueness is enforced on the completed row in the fold sink.
+ */
+static bool stream_group_eligible(const GqlQuery& q) {
+    if (q.kind != QueryKind::SINGLE) return false;
+    if (q.explain || q.profile) return false;
+    if (!q.writes.empty()) return false;
+    if (q.has_unnested_subquery) return false;
+    if (!q.let_bindings.empty()) return false;
+    if (q.matches.empty()) return false;
+    for (const auto& m : q.matches) {
+        if (!match_streamable(m)) return false;
+    }
     return true;
 }
 
@@ -838,12 +861,82 @@ static seastar::future<QueryResult> run_streaming_topk(
 }
 
 /**
- * @brief Streamed grouped aggregation over an arbitrary single-match expansion (with or without
- *        piped input rows): every matched row folds into per-group incremental accumulators as it
- *        is produced, so peak memory is O(groups) instead of the whole expansion (the WITH
- *        DISTINCT -> expand -> aggregate crash class). Semantics mirror the batch fold: grouping
- *        keys are the non-aggregate RETURN items, the group representative is its first row, and
- *        the final project/sort/limit runs over the group set.
+ * @brief Collect the user-named edge variables that participate in a DIFFERENT EDGES match (GQL's
+ *        default). Auto-generated (`_`-prefixed) edge variables are excluded, matching the batch path.
+ */
+static std::set<std::string> collect_different_edge_vars(const GqlQuery& q) {
+    std::set<std::string> vars;
+    for (const auto& stmt : q.matches) {
+        if (stmt.match_mode == MatchMode::DIFFERENT_EDGES) {
+            for (const auto& edge : stmt.pattern.edges) {
+                if (!edge.variable.empty() && edge.variable[0] != '_') vars.insert(edge.variable);
+            }
+        }
+    }
+    return vars;
+}
+
+/** @brief Whether the relationships bound to the DIFFERENT-EDGES variables in a completed row are all
+ *         distinct (the cross-match GQL uniqueness the batch path enforces at PathTraverser.cpp). */
+static bool row_edges_all_distinct(const GqlRow& row, const std::set<std::string>& diff_edge_vars) {
+    if (diff_edge_vars.empty()) return true;
+    std::vector<uint64_t> rel_ids;
+    for (const auto& var : diff_edge_vars) {
+        auto it = row.bindings.find(var);
+        if (it == row.bindings.end()) continue;
+        const auto& val = it->second;
+        if (val.type == GqlValue::RELATIONSHIP) {
+            rel_ids.push_back(val.relationship->getId());
+        } else if (val.type == GqlValue::RELATIONSHIP_LIST) {
+            for (const auto& r : *val.relationship_list) rel_ids.push_back(r.getId());
+        } else if (val.type == GqlValue::PATH) {
+            for (const auto& r : val.path->GetRelationships()) rel_ids.push_back(r.getId());
+        }
+    }
+    std::set<uint64_t> uniq(rel_ids.begin(), rel_ids.end());
+    return uniq.size() == rel_ids.size();
+}
+
+/**
+ * @brief Stream one input row through matches[idx..], emitting each fully-joined row to final_sink.
+ *        Cross-match binding works because traverse_path_pattern uses already-bound variables in the
+ *        row as pattern anchors; each match's path/mode constraint is checked on its own output before
+ *        driving the next match. This keeps a multi-match expansion (FoF -> forum -> post) bounded to
+ *        one traversal chunk instead of the whole join (task 029).
+ */
+static seastar::future<> stream_match_chain(
+        ragedb::Graph& graph, std::shared_ptr<GqlQuery> query_ptr,
+        std::shared_ptr<const ProjectionPruner> pruner, size_t idx, GqlRow row,
+        std::shared_ptr<GqlRowSink> final_sink) {
+    if (idx >= query_ptr->matches.size()) {
+        return final_sink->consume(std::vector<GqlRow>{ std::move(row) });
+    }
+    const auto& stmt = query_ptr->matches[idx];
+    auto next_sink = std::make_shared<GqlRowSink>();
+    next_sink->consume = [&graph, query_ptr, pruner, idx, final_sink,
+                          mode = stmt.match_mode, pmode = stmt.path_mode,
+                          pattern = &stmt.pattern](std::vector<GqlRow> rows) {
+        auto rows_ptr = std::make_shared<std::vector<GqlRow>>(std::move(rows));
+        return seastar::do_for_each(*rows_ptr,
+            [&graph, query_ptr, pruner, idx, final_sink, mode, pmode, pattern](GqlRow& r) {
+                if (!satisfies_match_path_modes(r, mode, pmode, *pattern)) {
+                    return seastar::make_ready_future<>();
+                }
+                return stream_match_chain(graph, query_ptr, pruner, idx + 1, std::move(r), final_sink);
+            }).finally([rows_ptr] {});
+    };
+    return traverse_path_pattern(graph, stmt.pattern, row, 0, *pruner, "", true, false,
+                                 stmt.path_mode, next_sink.get())
+        .discard_result().finally([next_sink] {});
+}
+
+/**
+ * @brief Streamed grouped aggregation over one or more match statements (with or without piped input
+ *        rows): every fully-joined row folds into per-group incremental accumulators as it is
+ *        produced, so peak memory is O(groups) instead of the whole expansion (the FoF DISTINCT ->
+ *        expand -> aggregate crash class, tasks 018/029). Grouping keys are the non-aggregate RETURN
+ *        items, the group representative is its first row, and the final project/sort/limit runs over
+ *        the group set.
  */
 static seastar::future<QueryResult> run_streaming_group_fold(
         ragedb::Graph& graph, std::shared_ptr<GqlQuery> query_ptr,
@@ -860,11 +953,13 @@ static seastar::future<QueryResult> run_streaming_group_fold(
     auto keys_ptr = std::make_shared<std::vector<const Expression*>>(std::move(grouping_keys));
     auto aggs_ptr = std::make_shared<std::vector<const AggregateExpr*>>(std::move(aggs));
 
+    auto diff_edge_vars = std::make_shared<std::set<std::string>>(collect_different_edge_vars(*query_ptr));
     auto sink = std::make_shared<GqlRowSink>();
-    sink->consume = [st, query_ptr, keys_ptr, aggs_ptr](std::vector<GqlRow> rows) {
-        const auto& stmt = query_ptr->matches[0];
+    sink->consume = [st, query_ptr, keys_ptr, aggs_ptr, diff_edge_vars](std::vector<GqlRow> rows) {
         for (auto& r : rows) {
-            if (!satisfies_match_path_modes(r, stmt.match_mode, stmt.path_mode, stmt.pattern)) continue;
+            // Per-match path/mode constraints were checked in the chain; here the row is fully joined,
+            // so apply the cross-match DIFFERENT-EDGES uniqueness and the segment WHERE, then fold.
+            if (!row_edges_all_distinct(r, *diff_edge_vars)) continue;
             if (query_ptr->where_expr && !evaluate_expression(r, query_ptr->where_expr.get()).is_truthy()) continue;
             std::vector<GqlValue> key;
             key.reserve(keys_ptr->size());
@@ -880,13 +975,12 @@ static seastar::future<QueryResult> run_streaming_group_fold(
         return seastar::make_ready_future<>();
     };
 
+    auto pruner_ptr = std::make_shared<const ProjectionPruner>(pruner);
     auto rows_in = std::make_shared<std::vector<GqlRow>>(
         incoming.has_value() ? std::move(*incoming) : std::vector<GqlRow>{ GqlRow{} });
     return seastar::do_for_each(rows_in->begin(), rows_in->end(),
-        [&graph, query_ptr, pruner, sink](GqlRow& in) {
-            const auto& stmt = query_ptr->matches[0];
-            return traverse_path_pattern(graph, stmt.pattern, in, 0, pruner, "", true, false,
-                                         stmt.path_mode, sink.get()).discard_result();
+        [&graph, query_ptr, pruner_ptr, sink](GqlRow& in) {
+            return stream_match_chain(graph, query_ptr, pruner_ptr, 0, in, sink);
         })
     .then([st, query_ptr, keys_ptr, aggs_ptr, rows_in, sink] {
         const auto& query = *query_ptr;
@@ -1255,41 +1349,43 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
 
     // Streaming execution (tasks 018/020): expansion-heavy shapes fold matched rows as they are
     // produced instead of materialising the whole expansion, bounding peak memory.
-    if (stream_eligible(*query_ptr) && !query_ptr->distinct) {
-        if (!query_ptr->order_by.empty() && query_ptr->limit.has_value() && !query_contains_aggregates) {
-            return run_streaming_topk(graph, query_ptr, std::move(incoming), pruner);
+    // Streaming top-K: a single-match ORDER BY + LIMIT without aggregates folds into a bounded heap.
+    if (stream_eligible(*query_ptr) && !query_ptr->distinct &&
+        !query_ptr->order_by.empty() && query_ptr->limit.has_value() && !query_contains_aggregates) {
+        return run_streaming_topk(graph, query_ptr, std::move(incoming), pruner);
+    }
+    // Streaming grouped aggregate: one or more streamable matches (bounds the FoF -> expand ->
+    // count(DISTINCT) crash class, task 029) by folding each joined row into per-group accumulators.
+    if (stream_group_eligible(*query_ptr) && !query_ptr->distinct && query_contains_aggregates) {
+        // Mirrors the batch fold's key derivation: a bare returned variable groups by the whole
+        // entity, so property lookups on it are not separate keys.
+        std::set<std::string> group_variables;
+        for (const auto& item : query_ptr->returns) {
+            if (item.expr && !has_aggregates(item.expr.get()) && item.expr->kind == ExpressionKind::VARIABLE) {
+                group_variables.insert(static_cast<const VariableExpr*>(item.expr.get())->name);
+            }
         }
-        if (query_contains_aggregates) {
-            // Mirrors the batch fold's key derivation: a bare returned variable groups by the
-            // whole entity, so property lookups on it are not separate keys.
-            std::set<std::string> group_variables;
-            for (const auto& item : query_ptr->returns) {
-                if (item.expr && !has_aggregates(item.expr.get()) && item.expr->kind == ExpressionKind::VARIABLE) {
-                    group_variables.insert(static_cast<const VariableExpr*>(item.expr.get())->name);
-                }
+        std::vector<const Expression*> grouping_keys;
+        for (const auto& item : query_ptr->returns) {
+            if (has_aggregates(item.expr.get())) continue;
+            if (item.expr->kind == ExpressionKind::PROPERTY_LOOKUP &&
+                group_variables.count(static_cast<const PropertyLookupExpr*>(item.expr.get())->variable)) {
+                continue;
             }
-            std::vector<const Expression*> grouping_keys;
-            for (const auto& item : query_ptr->returns) {
-                if (has_aggregates(item.expr.get())) continue;
-                if (item.expr->kind == ExpressionKind::PROPERTY_LOOKUP &&
-                    group_variables.count(static_cast<const PropertyLookupExpr*>(item.expr.get())->variable)) {
-                    continue;
-                }
-                grouping_keys.push_back(item.expr.get());
-            }
-            std::vector<const AggregateExpr*> aggs;
-            for (const auto& item : query_ptr->returns) find_aggregates(item.expr.get(), aggs);
-            for (const auto& spec : query_ptr->order_by) find_aggregates(spec.expr.get(), aggs);
-            // collect_list gathers a list the streaming accumulator does not build; use the
-            // materialising group path for it.
-            bool has_collect = false;
-            for (const auto* a : aggs) {
-                if (a->fn_kind == AggregateKind::COLLECT) { has_collect = true; break; }
-            }
-            if (!aggs.empty() && !has_collect) {
-                return run_streaming_group_fold(graph, query_ptr, std::move(incoming), pruner,
-                                                std::move(grouping_keys), std::move(aggs));
-            }
+            grouping_keys.push_back(item.expr.get());
+        }
+        std::vector<const AggregateExpr*> aggs;
+        for (const auto& item : query_ptr->returns) find_aggregates(item.expr.get(), aggs);
+        for (const auto& spec : query_ptr->order_by) find_aggregates(spec.expr.get(), aggs);
+        // collect_list gathers a list the streaming accumulator does not build; use the materialising
+        // group path for it.
+        bool has_collect = false;
+        for (const auto* a : aggs) {
+            if (a->fn_kind == AggregateKind::COLLECT) { has_collect = true; break; }
+        }
+        if (!aggs.empty() && !has_collect) {
+            return run_streaming_group_fold(graph, query_ptr, std::move(incoming), pruner,
+                                            std::move(grouping_keys), std::move(aggs));
         }
     }
 

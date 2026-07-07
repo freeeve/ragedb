@@ -162,9 +162,11 @@ GqlType GqlTypechecker::get_property_type(const std::string& var_name, const std
         return GqlType::STRING;
     }
 
-    // Bypass typechecking for relationship count optimization temporary properties (e.g., _degree_p_opt).
-    // These properties are injected dynamically at query execution time and hold integer values.
-    if (prop_name.size() > 8 && prop_name.substr(0, 8) == "_degree_") {
+    // Bypass typechecking for synthetic degree properties injected by the optimizer at execution time.
+    // Both prefixes are used: `_degree_p_opt` from the count->degree-sum rewrite, and `_deg_v_REL_DIR`
+    // from the size()/COUNT{} degree rewrite (DegreeConstraintPruner). They hold integer degree values
+    // and are populated during the anchor scan, so the schema has no declaration for them.
+    if (prop_name.rfind("_deg", 0) == 0) {
         return GqlType::INTEGER;
     }
 

@@ -232,13 +232,21 @@ GqlValue evaluate_scalar_function(const GqlRow& row, const FunctionCallExpr* fc)
         return GqlValue();
     }
     // zoned_datetime / datetime / date (string): epoch MILLISECONDS as int64 (LDBC canonical unit).
-    // Date::convert yields epoch seconds (double), so scale by 1000.
+    // Date::convert yields epoch seconds (double), so scale by 1000. Date::fromString only accepts the
+    // 'YYYY-MM-DDThh:mm:ss' form (it returns null/0 for a date-only or space-separated string), so
+    // normalise: turn a ' ' separator into 'T' and pad a bare date to midnight.
     if (fc->name == "zoned_datetime" || fc->name == "datetime" || fc->name == "date" ||
         fc->name == "localdatetime") {
         if (fc->args.size() != 1) return GqlValue();
         GqlValue arg = evaluate_expression(row, fc->args[0].get());
         if (arg.type == GqlValue::PROPERTY && std::holds_alternative<std::string>(arg.property)) {
-            double seconds = Date::convert(std::get<std::string>(arg.property));
+            std::string s = std::get<std::string>(arg.property);
+            if (s.find('T') == std::string::npos) {
+                auto sp = s.find(' ');
+                if (sp != std::string::npos) s[sp] = 'T';
+                else s += "T00:00:00";
+            }
+            double seconds = Date::convert(s);
             return GqlValue(static_cast<int64_t>(std::llround(seconds * 1000.0)));
         }
         return GqlValue();

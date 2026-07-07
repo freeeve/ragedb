@@ -343,6 +343,59 @@ TEST_CASE("GQL expression forms execute (task 032: CASE/length/zoned_datetime/CO
     graph.Stop().get();
 }
 
+TEST_CASE("multi-match streamed group fold matches the batch result (task 029)", "[gql_executor_with][task029]") {
+    auto graph = Graph("gql_multimatch_stream_test");
+    graph.Start().get();
+    graph.Clear();
+    graph.shard.local().NodeTypeInsertPeered("Person").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "id", "integer").get();
+    graph.shard.local().NodeTypeInsertPeered("Forum").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Forum", "id", "integer").get();
+    graph.shard.local().NodeTypeInsertPeered("Post").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Post", "id", "integer").get();
+    graph.shard.local().RelationshipTypeInsertPeered("KNOWS").get();
+    graph.shard.local().RelationshipTypeInsertPeered("HAS_MEMBER").get();
+    graph.shard.local().RelationshipTypeInsertPeered("CONTAINER_OF").get();
+    graph.shard.local().RelationshipTypeInsertPeered("HAS_CREATOR").get();
+    uint64_t p1 = graph.shard.local().NodeAddPeered("Person", "1", "{\"id\": 1}").get();
+    uint64_t f1 = graph.shard.local().NodeAddPeered("Person", "2", "{\"id\": 2}").get();
+    graph.shard.local().RelationshipAddPeered("KNOWS", p1, f1, "{}").get();
+    // forum10: 3 distinct posts by f1; forum20: 1 post by f1. Both have f1 as member.
+    uint64_t forum10 = graph.shard.local().NodeAddPeered("Forum", "10", "{\"id\": 10}").get();
+    uint64_t forum20 = graph.shard.local().NodeAddPeered("Forum", "20", "{\"id\": 20}").get();
+    graph.shard.local().RelationshipAddPeered("HAS_MEMBER", forum10, f1, "{}").get();
+    graph.shard.local().RelationshipAddPeered("HAS_MEMBER", forum20, f1, "{}").get();
+    for (int i = 100; i < 103; ++i) {  // forum10 posts 100,101,102
+        uint64_t post = graph.shard.local().NodeAddPeered("Post", std::to_string(i), "{\"id\": " + std::to_string(i) + "}").get();
+        graph.shard.local().RelationshipAddPeered("CONTAINER_OF", forum10, post, "{}").get();
+        graph.shard.local().RelationshipAddPeered("HAS_CREATOR", post, f1, "{}").get();
+    }
+    uint64_t post200 = graph.shard.local().NodeAddPeered("Post", "200", "{\"id\": 200}").get();  // forum20 post
+    graph.shard.local().RelationshipAddPeered("CONTAINER_OF", forum20, post200, "{}").get();
+    graph.shard.local().RelationshipAddPeered("HAS_CREATOR", post200, f1, "{}").get();
+
+    const size_t saved = gql_stream_chunk_size;
+    gql_stream_chunk_size = 1;  // force multi-chunk streaming through the 2-match chain
+
+    // Piped frontier -> two-MATCH expansion -> grouped count(DISTINCT) with ORDER BY (IC5 shape).
+    std::string res = GqlExecutor::execute(graph,
+        std::string("MATCH (p:Person {id: 1})-[:KNOWS]-{1,2}(f:Person) WHERE f.id <> 1 "
+                    "RETURN DISTINCT f "
+                    "NEXT "
+                    "MATCH (forum:Forum)-[:HAS_MEMBER]->(f) "
+                    "MATCH (forum)-[:CONTAINER_OF]->(post:Post)-[:HAS_CREATOR]->(f) "
+                    "RETURN forum.id AS forumId, count(DISTINCT post) AS postCount "
+                    "ORDER BY postCount DESC, forumId ASC")).get();
+    INFO("result: " << res);
+    gql_stream_chunk_size = saved;
+
+    REQUIRE(res.find("\"forumId\": 10, \"postCount\": 3") != std::string::npos);
+    REQUIRE(res.find("\"forumId\": 20, \"postCount\": 1") != std::string::npos);
+    REQUIRE(res.find("10") < res.find("20"));  // ordered by postCount DESC
+
+    graph.Stop().get();
+}
+
 TEST_CASE("GQL IC5 shape executes without crashing (task 032 crash repro)", "[gql_executor_with][task032ic5]") {
     auto graph = Graph("gql_ic5_shape_test");
     graph.Start().get();

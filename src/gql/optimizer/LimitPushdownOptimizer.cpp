@@ -15,6 +15,7 @@
  */
 
 #include "LimitPushdownOptimizer.h"
+#include "OptimizerUtils.h"
 #include "../GqlVirtualCatalog.h"
 #include "../GqlParser.h"
 #include <vector>
@@ -78,8 +79,16 @@ std::vector<MandatoryRelation> find_mandatory_relations() {
 
 void LimitPushdownOptimizer::limit_pushdown_pass(GqlQuery& query) {
     if (query.kind != QueryKind::SINGLE || !query.limit.has_value() || !query.order_by.empty()) return;
+    // A piped-row part's LIMIT bounds its total output, not the per-input-row expansion a
+    // per-match scan limit would bound.
+    if (query.consumes_piped_rows) return;
 
     if (query.matches.empty()) return;
+
+    // Do not push the LIMIT into the scan when any predicate is evaluated (or rows are collapsed)
+    // AFTER the scan: scanning exactly `limit` rows would under-return. The residual conditions
+    // live in has_post_scan_residual_predicate, shared with the executor's limit_val gate.
+    if (has_post_scan_residual_predicate(query)) return;
 
     if (query.matches.size() == 1) {
         query.matches[0].limit = query.limit;

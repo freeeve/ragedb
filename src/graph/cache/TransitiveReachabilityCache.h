@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <map>
+#include <memory>
 #include <cstdint>
 
 namespace ragedb::gql {
@@ -30,9 +31,14 @@ namespace ragedb::gql {
  * Keyed by relationship type. Avoids repeated calculations of transitive closures.
  */
 class TransitiveReachabilityCache {
+public:
+    using DescendantsMap = std::map<uint64_t, std::unordered_set<uint64_t>>;
+
 private:
-    // Maps relationship type -> descendants map (node_id -> set of reachable descendant node_ids)
-    std::unordered_map<std::string, std::map<uint64_t, std::unordered_set<uint64_t>>> cache;
+    // Maps relationship type -> descendants map (node_id -> set of reachable descendant node_ids).
+    // Entries are immutable shared snapshots: readers hold a shared_ptr instead of copying the
+    // (potentially O(V^2)) map per query row, and invalidation just drops the cache's reference.
+    std::unordered_map<std::string, std::shared_ptr<const DescendantsMap>> cache;
 
 public:
     static TransitiveReachabilityCache& local() {
@@ -52,12 +58,16 @@ public:
         return cache.find(rel_type) != cache.end();
     }
 
-    const std::map<uint64_t, std::unordered_set<uint64_t>>& get(const std::string& rel_type) const {
-        return cache.at(rel_type);
+    // Returns the cached snapshot, or nullptr if absent.
+    std::shared_ptr<const DescendantsMap> get(const std::string& rel_type) const {
+        auto it = cache.find(rel_type);
+        return it != cache.end() ? it->second : nullptr;
     }
 
-    void set(const std::string& rel_type, std::map<uint64_t, std::unordered_set<uint64_t>>&& descendants) {
-        cache[rel_type] = std::move(descendants);
+    std::shared_ptr<const DescendantsMap> set(const std::string& rel_type, DescendantsMap&& descendants) {
+        auto snapshot = std::make_shared<const DescendantsMap>(std::move(descendants));
+        cache[rel_type] = snapshot;
+        return snapshot;
     }
 };
 

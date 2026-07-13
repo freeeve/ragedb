@@ -15,8 +15,10 @@
  */
 
 #include "GqlValue.h"
+#include "../graph/types/Date.h"
 #include <seastar/json/json_elements.hh>
 #include <algorithm>
+#include <cmath>
 #include <sstream>
 
 namespace ragedb::gql {
@@ -140,6 +142,17 @@ int compare_gql_values(const GqlValue& a, const GqlValue& b) {
         }
         return 0;
     }
+    // Compare two list values by length, then element by element.
+    if (a.type == GqlValue::LIST) {
+        const auto& al = *a.list;
+        const auto& bl = *b.list;
+        if (al.size() != bl.size()) return (al.size() < bl.size()) ? -1 : 1;
+        for (size_t i = 0; i < al.size(); ++i) {
+            int c = compare_gql_values(al[i], bl[i]);
+            if (c != 0) return c;
+        }
+        return 0;
+    }
     return 0;
 }
 
@@ -204,6 +217,43 @@ bool matches_filters(const std::map<std::string, property_type_t>& target, const
  * @param expr The AST expression node to evaluate.
  * @return GqlValue The result of the evaluation.
  */
+GqlValue evaluate_scalar_function(const GqlRow& row, const FunctionCallExpr* fc) {
+    if (!fc) return GqlValue();
+    // length(path | relationship-list): number of relationships.
+    if (fc->name == "length") {
+        if (fc->args.size() != 1) return GqlValue();
+        GqlValue arg = evaluate_expression(row, fc->args[0].get());
+        if (arg.type == GqlValue::PATH) {
+            return GqlValue(static_cast<int64_t>(arg.path->length()));
+        }
+        if (arg.type == GqlValue::RELATIONSHIP_LIST) {
+            return GqlValue(static_cast<int64_t>(arg.relationship_list->size()));
+        }
+        return GqlValue();
+    }
+    // zoned_datetime / datetime / date (string): epoch MILLISECONDS as int64 (LDBC canonical unit).
+    // Date::convert yields epoch seconds (double), so scale by 1000. Date::fromString only accepts the
+    // 'YYYY-MM-DDThh:mm:ss' form (it returns null/0 for a date-only or space-separated string), so
+    // normalise: turn a ' ' separator into 'T' and pad a bare date to midnight.
+    if (fc->name == "zoned_datetime" || fc->name == "datetime" || fc->name == "date" ||
+        fc->name == "localdatetime") {
+        if (fc->args.size() != 1) return GqlValue();
+        GqlValue arg = evaluate_expression(row, fc->args[0].get());
+        if (arg.type == GqlValue::PROPERTY && std::holds_alternative<std::string>(arg.property)) {
+            std::string s = std::get<std::string>(arg.property);
+            if (s.find('T') == std::string::npos) {
+                auto sp = s.find(' ');
+                if (sp != std::string::npos) s[sp] = 'T';
+                else s += "T00:00:00";
+            }
+            double seconds = Date::convert(s);
+            return GqlValue(static_cast<int64_t>(std::llround(seconds * 1000.0)));
+        }
+        return GqlValue();
+    }
+    return GqlValue(); // unknown function
+}
+
 GqlValue evaluate_expression(const GqlRow& row, const Expression* expr) {
     if (!expr) return GqlValue();
 
@@ -224,6 +274,35 @@ GqlValue evaluate_expression(const GqlRow& row, const Expression* expr) {
         }
         case ExpressionKind::AGGREGATION: {
             return GqlValue(); // Aggregations are not evaluated on single rows
+        }
+        case ExpressionKind::CASE_WHEN: {
+            auto* ce = static_cast<const CaseExpr*>(expr);
+            for (const auto& branch : ce->branches) {
+                if (evaluate_expression(row, branch.first.get()).is_truthy()) {
+                    return evaluate_expression(row, branch.second.get());
+                }
+            }
+            if (ce->else_expr) {
+                return evaluate_expression(row, ce->else_expr.get());
+            }
+            return GqlValue();
+        }
+        case ExpressionKind::FUNCTION_CALL: {
+            return evaluate_scalar_function(row, static_cast<const FunctionCallExpr*>(expr));
+        }
+        case ExpressionKind::IN_LIST: {
+            auto* in = static_cast<const InExpr*>(expr);
+            GqlValue needle = evaluate_expression(row, in->value.get());
+            GqlValue hay = evaluate_expression(row, in->list.get());
+            if (needle.type == GqlValue::NIL || hay.type != GqlValue::LIST) {
+                return GqlValue();
+            }
+            for (const auto& item : *hay.list) {
+                if (compare_gql_values(needle, item) == 0) {
+                    return GqlValue(true);
+                }
+            }
+            return GqlValue(false);
         }
         case ExpressionKind::EXISTS: {
             auto* exists = static_cast<const ExistsExpr*>(expr);
@@ -463,6 +542,18 @@ std::string serialize_gql_value(const GqlValue& val) {
         for (const auto& rel : *val.relationship_list) {
             if (!init) s += ",";
             s += serialize_gql_value(GqlValue(rel));
+            init = false;
+        }
+        s += "]";
+        return s;
+    }
+    // Serialize a heterogeneous list (collect_list result) to a JSON array.
+    if (val.type == GqlValue::LIST) {
+        std::string s = "[";
+        bool init = true;
+        for (const auto& item : *val.list) {
+            if (!init) s += ", ";
+            s += serialize_gql_value(item);
             init = false;
         }
         s += "]";

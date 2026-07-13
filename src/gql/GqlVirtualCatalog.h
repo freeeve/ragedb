@@ -23,6 +23,7 @@
 #include <optional>
 #include <algorithm>
 #include <cctype>
+#include "../graph/cache/AlgebraicTraits.h"
 
 namespace ragedb::gql {
 
@@ -112,9 +113,6 @@ private:
     std::unordered_map<std::string, std::unordered_set<std::string>> disjoint_labels;
     std::unordered_map<std::string, std::unordered_set<std::string>> disjoint_values;
 
-    // Maps relationship type string (uppercase) -> set of algebraic properties
-    std::unordered_map<std::string, std::unordered_set<std::string>> relationship_algebraic_properties;
-
 public:
     // Adds/registers a pair of disjoint node labels
     void add_disjoint_labels(const std::string& l1, const std::string& l2) {
@@ -138,40 +136,35 @@ public:
         return disjoint_values;
     }
 
+    // Lowercases a relationship type name into the canonical trait-registry key form.
     std::string normalize_name(std::string name) const {
-        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
-            return std::tolower(c);
-        });
-        return name;
+        return AlgebraicTraits::normalize(std::move(name));
     }
 
-    // Sets algebraic properties for a relationship type
+    // Sets algebraic properties for a relationship type. The trait store itself lives in the
+    // graph layer (AlgebraicTraits) so write paths can gate cache invalidation on it.
     void set_relationship_algebraic_properties(const std::string& rel_type, const std::unordered_set<std::string>& props) {
-        relationship_algebraic_properties[normalize_name(rel_type)] = props;
+        AlgebraicTraits::local().set(rel_type, props);
     }
 
     // Checks if a relationship has a specific algebraic property
     bool has_relationship_algebraic_property(const std::string& rel_type, const std::string& prop) const {
-        auto it = relationship_algebraic_properties.find(normalize_name(rel_type));
-        if (it != relationship_algebraic_properties.end()) {
-            return it->second.count(prop) > 0;
-        }
-        return false;
+        return AlgebraicTraits::local().has(rel_type, prop);
     }
 
     // Returns all relationship algebraic properties
     const std::unordered_map<std::string, std::unordered_set<std::string>>& get_relationship_algebraic_properties() const {
-        return relationship_algebraic_properties;
+        return AlgebraicTraits::local().all();
     }
 
-    // Clears all views, constraints, allowed relationships, and disjoint registries
+    // Clears all views, constraints, allowed relationships, disjoint registries, and traits
     void clear() {
         views.clear();
         constraints.clear();
         allowed_relationships.clear();
         disjoint_labels.clear();
         disjoint_values.clear();
-        relationship_algebraic_properties.clear();
+        AlgebraicTraits::local().clear();
     }
 };
 

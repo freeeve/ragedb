@@ -15,12 +15,17 @@
  */
 
 #include "EquivalenceClassOptimizer.h"
+#include "OptimizerUtils.h"
 #include "../GqlVirtualCatalog.h"
+#include <limits>
 
 namespace ragedb::gql {
 
 void EquivalenceClassOptimizer::equivalence_class_pass(GqlQuery& query) {
     if (query.skip_semantic || query.kind != QueryKind::SINGLE) return;
+    // Every rewrite here is keyed on registered algebraic traits; with none registered
+    // the pass cannot fire, so skip the per-match scanning entirely.
+    if (GqlVirtualCatalog::local().get_relationship_algebraic_properties().empty()) return;
 
     for (auto& match : query.matches) {
         if (match.is_optional || match.is_search || match.is_khop) continue;
@@ -35,7 +40,11 @@ void EquivalenceClassOptimizer::equivalence_class_pass(GqlQuery& query) {
                     GqlVirtualCatalog::local().has_relationship_algebraic_property(rel_type, "symmetric") &&
                     GqlVirtualCatalog::local().has_relationship_algebraic_property(rel_type, "transitive");
 
-                if (is_equivalence) {
+                // The equivalence-partition fast path (Case 0.5) only reproduces the original
+                // traversal for the one safe shape encoded in is_simple_unbounded_right_hop.
+                bool safe_to_rewrite = is_simple_unbounded_right_hop(match, edge);
+
+                if (is_equivalence && safe_to_rewrite) {
                     match.equivalence_partition_lookup = true;
                     edge.is_variable_length = false;
                     edge.min_hops = 1;

@@ -54,6 +54,28 @@ void collect_accessed_properties(const Expression* expr,
             collect_accessed_properties(is_null->expr.get(), accessed_props, whole_objects);
             break;
         }
+        case ExpressionKind::FUNCTION_CALL: {
+            auto* fc = static_cast<const FunctionCallExpr*>(expr);
+            for (const auto& a : fc->args) {
+                collect_accessed_properties(a.get(), accessed_props, whole_objects);
+            }
+            break;
+        }
+        case ExpressionKind::CASE_WHEN: {
+            auto* ce = static_cast<const CaseExpr*>(expr);
+            for (const auto& b : ce->branches) {
+                collect_accessed_properties(b.first.get(), accessed_props, whole_objects);
+                collect_accessed_properties(b.second.get(), accessed_props, whole_objects);
+            }
+            collect_accessed_properties(ce->else_expr.get(), accessed_props, whole_objects);
+            break;
+        }
+        case ExpressionKind::IN_LIST: {
+            auto* in = static_cast<const InExpr*>(expr);
+            collect_accessed_properties(in->value.get(), accessed_props, whole_objects);
+            collect_accessed_properties(in->list.get(), accessed_props, whole_objects);
+            break;
+        }
         case ExpressionKind::LITERAL:
         default:
             break;

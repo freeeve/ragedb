@@ -311,6 +311,14 @@ namespace ragedb {
                     auto p2 = make_shared(std::move(futures));
                     return seastar::when_all_succeed(p2->begin(), p2->end()).then([p2] (const std::vector<uint64_t>& results) {
                         return std::reduce(results.begin(), results.end()); // sum the counts of the results
+                    }).then([type_id, this] (uint64_t count) {
+                        // Bulk-loaded relationships bypass the peered add path, so invalidate the
+                        // semantic caches for this type before reporting the load complete.
+                        if (count == 0) {
+                            return seastar::make_ready_future<uint64_t>(count);
+                        }
+                        return InvalidateAlgebraicCachesPeered(relationship_types.getType(type_id))
+                            .then([count] { return count; });
                     });
 
                 });

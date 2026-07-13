@@ -84,6 +84,9 @@ bool are_equal_vars(const std::string& v1, const std::string& v2, const std::map
 
 void IrreflexiveContradictionPruner::irreflexive_contradiction_pass(GqlQuery& query) {
     if (query.skip_semantic || query.kind != QueryKind::SINGLE) return;
+    // Every rewrite here is keyed on registered algebraic traits; with none registered
+    // the pass cannot fire, so skip the per-match scanning entirely.
+    if (GqlVirtualCatalog::local().get_relationship_algebraic_properties().empty()) return;
 
     // Collect variable equality class map
     std::map<std::string, std::set<std::string>> node_eq;
@@ -91,6 +94,9 @@ void IrreflexiveContradictionPruner::irreflexive_contradiction_pass(GqlQuery& qu
         collect_equalities(query.where_expr.get(), node_eq);
     }
     for (const auto& match : query.matches) {
+        // An equality inside an OPTIONAL MATCH only filters that optional binding; it must not
+        // make the whole query a contradiction.
+        if (match.is_optional) continue;
         for (const auto& node : match.pattern.nodes) {
             if (node.where_expr) {
                 collect_equalities(node.where_expr.get(), node_eq);
@@ -109,13 +115,20 @@ void IrreflexiveContradictionPruner::irreflexive_contradiction_pass(GqlQuery& qu
         
         for (size_t i = 0; i < match.pattern.edges.size(); ++i) {
             const auto& edge = match.pattern.edges[i];
+            // Irreflexivity forbids only a DIRECT (1-hop) self-loop. A variable-length edge can
+            // reach the same node via a longer path (e.g. *2..2 = a->b->a), which is satisfiable.
+            if (edge.is_variable_length) continue;
             if (edge.label_expr && edge.label_expr->kind == LabelExprKind::LITERAL) {
                 std::string rel_type = edge.label_expr->name;
-                
+
                 if (GqlVirtualCatalog::local().has_relationship_algebraic_property(rel_type, "irreflexive")) {
                     std::string src = match.pattern.nodes[i].variable;
                     std::string tgt = match.pattern.nodes[i + 1].variable;
-                    
+
+                    // Anonymous endpoints are DISTINCT nodes, not a self-loop; only prune when the
+                    // two endpoints are the same named variable (or provably equal via WHERE).
+                    if (src.empty() || tgt.empty()) continue;
+
                     if (are_equal_vars(src, tgt, node_eq)) {
                         // Impossible self-loop on an irreflexive relationship!
                         query.no_op = true;

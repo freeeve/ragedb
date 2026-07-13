@@ -162,9 +162,11 @@ GqlType GqlTypechecker::get_property_type(const std::string& var_name, const std
         return GqlType::STRING;
     }
 
-    // Bypass typechecking for relationship count optimization temporary properties (e.g., _degree_p_opt).
-    // These properties are injected dynamically at query execution time and hold integer values.
-    if (prop_name.size() > 8 && prop_name.substr(0, 8) == "_degree_") {
+    // Bypass typechecking for synthetic degree properties injected by the optimizer at execution time.
+    // Both prefixes are used: `_degree_p_opt` from the count->degree-sum rewrite, and `_deg_v_REL_DIR`
+    // from the size()/COUNT{} degree rewrite (DegreeConstraintPruner). They hold integer degree values
+    // and are populated during the anchor scan, so the schema has no declaration for them.
+    if (prop_name.rfind("_deg", 0) == 0) {
         return GqlType::INTEGER;
     }
 
@@ -472,6 +474,34 @@ GqlType GqlTypechecker::check_expression(const Expression& expr) {
             this->env = std::move(parent_env);
             return GqlType::BOOLEAN;
         }
+        case ExpressionKind::FUNCTION_CALL: {
+            const auto& fc = static_cast<const FunctionCallExpr&>(expr);
+            for (const auto& a : fc.args) {
+                check_expression(*a);
+            }
+            if (fc.name == "length" || fc.name == "zoned_datetime" || fc.name == "datetime" ||
+                fc.name == "date" || fc.name == "localdatetime") {
+                return GqlType::INTEGER;
+            }
+            return GqlType::ANY;
+        }
+        case ExpressionKind::CASE_WHEN: {
+            const auto& ce = static_cast<const CaseExpr&>(expr);
+            for (const auto& branch : ce.branches) {
+                check_expression(*branch.first);
+                check_expression(*branch.second);
+            }
+            if (ce.else_expr) {
+                check_expression(*ce.else_expr);
+            }
+            return GqlType::ANY;
+        }
+        case ExpressionKind::IN_LIST: {
+            const auto& in = static_cast<const InExpr&>(expr);
+            check_expression(*in.value);
+            check_expression(*in.list);
+            return GqlType::BOOLEAN;
+        }
     }
     return GqlType::ANY;
 }
@@ -526,11 +556,59 @@ void GqlTypechecker::check_return_item(const ReturnItem& return_item) {
     }
 }
 
+/**
+ * @brief Derive the variable environment a completed WITH segment pipes into the next one: each
+ *        projected column becomes a binding under its output name (alias, or the variable's own
+ *        name). Called after the segment was checked, so its expressions are known to be valid.
+ */
+std::map<std::string, VariableSchema> GqlTypechecker::project_returns(const GqlQuery& segment) {
+    std::map<std::string, VariableSchema> projected;
+    for (const auto& item : segment.returns) {
+        if (!item.expr) continue;
+        std::string source_var;
+        if (item.expr->kind == ExpressionKind::VARIABLE) {
+            source_var = static_cast<const VariableExpr*>(item.expr.get())->name;
+        }
+        std::string name = item.alias ? *item.alias : source_var;
+        if (name.empty()) continue;  // non-variable items without alias are rejected at parse time
+
+        VariableSchema schema;
+        if (!source_var.empty()) {
+            auto it = env.find(source_var);
+            if (it != env.end()) schema = it->second;
+        } else {
+            schema.type = check_expression(*item.expr);
+        }
+        projected[name] = schema;
+    }
+    return projected;
+}
+
 void GqlTypechecker::check_query(const GqlQuery& query) {
     if (query.clear_cache) {
         return;
     }
 
+    // WITH-pipeline queries are checked segment by segment: each segment sees only the bindings
+    // the previous segment projected (plus whatever its own MATCH binds), mirroring execution.
+    if (!query.with_segments.empty()) {
+        std::map<std::string, VariableSchema> piped;
+        for (const auto& seg : query.with_segments) {
+            GqlTypechecker seg_tc(graph);
+            seg_tc.env = std::move(piped);
+            seg_tc.check_segment_body(*seg);
+            piped = seg_tc.project_returns(*seg);
+        }
+        GqlTypechecker final_tc(graph);
+        final_tc.env = std::move(piped);
+        final_tc.check_segment_body(query);
+        return;
+    }
+
+    check_segment_body(query);
+}
+
+void GqlTypechecker::check_segment_body(const GqlQuery& query) {
     if (query.kind != QueryKind::SINGLE) {
         if (query.left) {
             check_query(*query.left);
@@ -589,6 +667,14 @@ void GqlTypechecker::check_query(const GqlQuery& query) {
                 meet_variable(match.path_count_target_var, GqlType::INTEGER, {});
             }
             // cost_expr typechecking is now performed inside check_path_pattern per edge.
+        }
+    }
+
+    // Register ISO GQL LET bindings so the segment's WHERE/FILTER/RETURN can reference them.
+    for (const auto& let : query.let_bindings) {
+        GqlType t = check_expression(*let.expr);
+        if (let.alias) {
+            meet_variable(*let.alias, t, {});
         }
     }
 

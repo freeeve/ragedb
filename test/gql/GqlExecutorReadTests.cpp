@@ -20,7 +20,8 @@
 #include "../../src/gql/GqlOptimizer.h"
 #include "../../src/gql/GqlExecutor.h"
 #include "../../src/gql/GqlVirtualCatalog.h"
-#include "../../src/gql/executor/WccCache.h"
+#include "../../src/graph/cache/WccCache.h"
+#include "../../src/graph/cache/TransitiveReachabilityCache.h"
 
 using namespace ragedb;
 using namespace ragedb::gql;
@@ -377,4 +378,120 @@ TEST_CASE("GQL Execution Read Tests", "[gql_executor_read]") {
     }
 
     guard.stop();
+}
+
+// NOTE: the transitive/equivalence fast paths execute via seastar::async (task 002) and cannot be
+// driven from inside the Catch harness (which itself runs the session in a seastar::async), so 016 is
+// verified on the live server instead--the unlabeled transitive query no longer OOMs and bounded
+// queries still return the correct closure.
+
+TEST_CASE("GQL LIMIT with a residual WHERE returns the full LIMIT", "[gql_executor_read][task009]") {
+    auto graph = Graph("gql_limit_pushdown_test");
+    graph.Start().get();
+    graph.Clear();
+
+    graph.shard.local().NodeTypeInsertPeered("Person").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "name", "string").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "age", "integer").get();
+
+    // 15 non-matching (age 10) added first (lower ids -> scanned first), then 5 matching (age 50).
+    for (int i = 0; i < 15; ++i) {
+        graph.shard.local().NodeAddPeered("Person", "lo" + std::to_string(i),
+            "{\"name\": \"lo" + std::to_string(i) + "\", \"age\": 10}").get();
+    }
+    for (int i = 0; i < 5; ++i) {
+        graph.shard.local().NodeAddPeered("Person", "hi" + std::to_string(i),
+            "{\"name\": \"hi" + std::to_string(i) + "\", \"age\": 50}").get();
+    }
+
+    auto count_rows = [](const std::string& r) {
+        size_t c = 0, pos = 0;
+        while ((pos = r.find("\"name\":", pos)) != std::string::npos) { c++; pos += 7; }
+        return c;
+    };
+
+    // Sanity: without a LIMIT the residual predicate must match all 5 (isolates query/data issues).
+    std::string res_nolimit = GqlExecutor::execute(graph,
+        std::string("MATCH (n:Person) WHERE n.age > 25 OR n.name = 'zzz' RETURN n.name AS name")).get();
+    INFO("no-limit result: " << res_nolimit);
+    REQUIRE(count_rows(res_nolimit) == 5);
+
+    // The OR keeps the predicate residual (not pushed into the scan). With a pushed LIMIT the scan
+    // stops at the first 5 (non-matching) rows and under-returns; the fix scans all then truncates.
+    std::string res = GqlExecutor::execute(graph,
+        std::string("MATCH (n:Person) WHERE n.age > 25 OR n.name = 'zzz' RETURN n.name AS name LIMIT 5")).get();
+    INFO("limit-5 result: " << res);
+    REQUIRE(count_rows(res) == 5);
+
+    graph.Stop().get();
+}
+
+TEST_CASE("GQL NEXT query pipelining", "[gql_executor_read][task_with]") {
+    auto graph = Graph("gql_with_test");
+    graph.Start().get();
+    graph.Clear();
+    graph.shard.local().NodeTypeInsertPeered("Person").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "name", "string").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "age", "integer").get();
+    graph.shard.local().RelationshipTypeInsertPeered("KNOWS").get();
+    uint64_t a = graph.shard.local().NodeAddPeered("Person", "alice", "{\"name\": \"Alice\", \"age\": 30}").get();
+    uint64_t b = graph.shard.local().NodeAddPeered("Person", "bob", "{\"name\": \"Bob\", \"age\": 35}").get();
+    uint64_t c = graph.shard.local().NodeAddPeered("Person", "carol", "{\"name\": \"Carol\", \"age\": 40}").get();
+    graph.shard.local().RelationshipAddPeered("KNOWS", a, b, "{}").get();
+    graph.shard.local().RelationshipAddPeered("KNOWS", a, c, "{}").get();
+
+    SECTION("a trivial NEXT passes a node through to RETURN") {
+        std::string res = GqlExecutor::execute(graph,
+            std::string("MATCH (p:Person {name: 'Alice'}) RETURN p NEXT RETURN p.name AS n")).get();
+        REQUIRE(res.find("Alice") != std::string::npos);
+    }
+
+    SECTION("NEXT stages a node into a second MATCH") {
+        std::string res = GqlExecutor::execute(graph,
+            std::string("MATCH (a:Person {name: 'Alice'}) RETURN a NEXT MATCH (a)-[:KNOWS]->(f:Person) RETURN f.name AS fn")).get();
+        REQUIRE(res.find("Bob") != std::string::npos);
+        REQUIRE(res.find("Carol") != std::string::npos);
+    }
+
+    SECTION("NEXT mid-pipeline aggregation") {
+        std::string res = GqlExecutor::execute(graph,
+            std::string("MATCH (a:Person)-[:KNOWS]->(f:Person) RETURN a, count(f) AS cnt NEXT RETURN a.name AS n, cnt")).get();
+        REQUIRE(res.find("\"n\": \"Alice\", \"cnt\": 2") != std::string::npos);
+    }
+
+    SECTION("sort/page ORDER BY + LIMIT stages the top row into the next segment") {
+        std::string res = GqlExecutor::execute(graph,
+            std::string("MATCH (p:Person) RETURN p ORDER BY p.age DESC LIMIT 1 NEXT RETURN p.name AS n")).get();
+        REQUIRE(res.find("Carol") != std::string::npos);
+        REQUIRE(res.find("Alice") == std::string::npos);
+        REQUIRE(res.find("Bob") == std::string::npos);
+    }
+
+    graph.Stop().get();
+}
+
+TEST_CASE("GQL count(DISTINCT) dedupes repeated values", "[gql_executor_read][task_distinct]") {
+    auto graph = Graph("gql_distinct_test");
+    graph.Start().get();
+    graph.Clear();
+    graph.shard.local().NodeTypeInsertPeered("Person").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "name", "string").get();
+    graph.shard.local().RelationshipTypeInsertPeered("KNOWS").get();
+    uint64_t a = graph.shard.local().NodeAddPeered("Person", "alice", "{\"name\": \"Alice\"}").get();
+    uint64_t b = graph.shard.local().NodeAddPeered("Person", "bob", "{\"name\": \"Bob\"}").get();
+    uint64_t c = graph.shard.local().NodeAddPeered("Person", "carol", "{\"name\": \"Carol\"}").get();
+    // Alice->Bob, Alice->Carol, Bob->Carol. From Alice, 1..2 directed hops reach: Bob, Carol, and
+    // Carol again via Bob. So count(f)=3 but count(DISTINCT f)=2 ({Bob, Carol}).
+    graph.shard.local().RelationshipAddPeered("KNOWS", a, b, "{}").get();
+    graph.shard.local().RelationshipAddPeered("KNOWS", a, c, "{}").get();
+    graph.shard.local().RelationshipAddPeered("KNOWS", b, c, "{}").get();
+
+    std::string res = GqlExecutor::execute(graph,
+        std::string("MATCH (a:Person {name: 'Alice'})-[:KNOWS*1..2]->(f:Person) "
+                    "RETURN count(DISTINCT f) AS distinct_f, count(f) AS total_f")).get();
+    INFO("result: " << res);
+    REQUIRE(res.find("\"distinct_f\": 2") != std::string::npos);
+    REQUIRE(res.find("\"total_f\": 3") != std::string::npos);
+
+    graph.Stop().get();
 }

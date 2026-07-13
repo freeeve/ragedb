@@ -35,12 +35,16 @@ private:
     bool check(TokenType type) const;
     bool match(TokenType type);
     void consume(TokenType type, const std::string& error_message);
+    std::string consume_identifier(const std::string& error_message);
 
     // Parsing routines
     GqlQuery parse_query();
     GqlQuery parse_union();
     GqlQuery parse_intersect();
     GqlQuery parse_single_query();
+    void parse_return_items(GqlQuery& query, bool require_alias_for_expressions);
+    void parse_order_by(GqlQuery& query);
+    void parse_limit(GqlQuery& query);
     MatchStatement parse_match();
     PathPattern parse_path_pattern();
     PatternNode parse_node_pattern();
@@ -60,6 +64,9 @@ private:
     std::unique_ptr<Expression> parse_mul_div();
     std::unique_ptr<Expression> parse_unary();
     std::unique_ptr<Expression> parse_primary();
+    /// Parse a braced subquery body `{ [MATCH ...]* [<bare pattern>] [WHERE <pred>] }` shared by
+    /// EXISTS { ... } and COUNT { ... }. Assumes the next token is '{'; consumes through the '}'.
+    void parse_braced_subquery(std::vector<MatchStatement>& matches, std::unique_ptr<Expression>& sub_where);
 
 public:
     explicit GqlParser(std::vector<Token> tokens) : tokens(std::move(tokens)) {}

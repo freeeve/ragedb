@@ -213,6 +213,13 @@ namespace ragedb {
                         });
                     }
                     return seastar::make_ready_future<bool>(false);
+                }).then([this] (bool removed) {
+                    // The cascade deleted relationships of unknown types, so every semantic cache
+                    // entry may now be stale; drop them all before acknowledging the delete.
+                    if (removed) {
+                        return InvalidateAllAlgebraicCachesPeered().then([] { return true; });
+                    }
+                    return seastar::make_ready_future<bool>(false);
                 });
             }
             return seastar::make_ready_future<bool>(false);

@@ -65,6 +65,8 @@ private:
     void check_path_pattern(const PathPattern& path_pattern);
     void check_write_op(const WriteOp& write_op);
     void check_return_item(const ReturnItem& return_item);
+    void check_segment_body(const GqlQuery& query);
+    std::map<std::string, VariableSchema> project_returns(const GqlQuery& segment);
     
     GqlType check_expression(const Expression& expr);
     GqlType get_property_type(const std::string& var_name, const std::string& prop_name);

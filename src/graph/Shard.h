@@ -580,6 +580,13 @@ namespace ragedb {
         seastar::future<bool> NodeDeletePropertiesPeered(uint64_t id);
 
         // Relationship
+        // Drops WCC/reachability cache entries for a relationship type on every shard. Awaited by
+        // every topology mutation so a client that writes then immediately reads sees fresh
+        // results; skipped entirely when the type carries no algebraic traits.
+        seastar::future<> InvalidateAlgebraicCachesPeered(const std::string& rel_type);
+        // Drops ALL WCC/reachability cache entries on every shard: for mutations that can touch
+        // relationships of unknown types (node-delete cascades, bulk loads).
+        seastar::future<> InvalidateAllAlgebraicCachesPeered();
         seastar::future<uint64_t> RelationshipAddEmptyPeered(const std::string& rel_type, const std::string& type1, const std::string& key1,
                                                              const std::string& type2, const std::string& key2);
         seastar::future<uint64_t> RelationshipAddEmptyPeered(const std::string& rel_type, uint64_t id1, uint64_t id2);

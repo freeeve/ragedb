@@ -441,7 +441,11 @@ struct MatchStatement {
     bool is_optional = false; ///< True if this is an OPTIONAL MATCH clause.
     int optional_group_id = -1; ///< Groups patterns belonging to the same OPTIONAL MATCH statement.
     MatchMode match_mode = MatchMode::DIFFERENT_EDGES; ///< GQL Match Mode (default is DIFFERENT EDGES).
-    PathMode path_mode = PathMode::TRAIL;            ///< GQL Path Mode (default is TRAIL).
+    /// GQL path mode. The standard's default is WALK -- the absence of any filtering -- so an unqualified
+    /// quantified pattern may repeat both nodes and edges. Defaulting to TRAIL instead silently dropped
+    /// every path that reuses an edge, which is Cypher's relationship-uniqueness rule, not GQL's. A query
+    /// that wants trail semantics must now say so: MATCH TRAIL (a)-[:R]-{1,3}(b).
+    PathMode path_mode = PathMode::WALK;
     PathPattern pattern;      ///< Path pattern to match.
     std::optional<uint64_t> limit; ///< Optional limit pushed down to this match statement.
 

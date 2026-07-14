@@ -115,7 +115,7 @@ seastar::future<std::vector<GqlRow>> traverse_path_pattern(
     std::string sort_property = "",
     bool sort_ascending = true,
     bool sort_by_id = false,
-    PathMode path_mode = PathMode::TRAIL,
+    PathMode path_mode = PathMode::WALK,   // GQL's default: no path filtering
     GqlRowSink* sink = nullptr
 );
 

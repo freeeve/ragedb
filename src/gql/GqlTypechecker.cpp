@@ -15,6 +15,7 @@
  */
 
 #include "GqlTypechecker.h"
+#include <limits>
 #include <stdexcept>
 #include <algorithm>
 

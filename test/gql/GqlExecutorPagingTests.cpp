@@ -55,6 +55,50 @@ static void populate_paging_graph(Graph& graph) {
     }
 }
 
+/*
+ * ISO GQL's default path mode is WALK -- "the absence of any filtering" -- so an unqualified quantified
+ * pattern may repeat both nodes AND edges. ragedb previously defaulted to TRAIL (no repeated edges), which
+ * is Cypher's relationship-uniqueness rule, not GQL's: it silently dropped every path that reuses an edge.
+ * A query that wants trail semantics must now say TRAIL (task 047).
+ *
+ * Two people joined by a single undirected edge make the difference unmissable: under WALK, A-B-A is a
+ * legal 2-hop walk (it re-crosses the one edge); under TRAIL it is not.
+ */
+TEST_CASE("the default path mode is WALK, not TRAIL (task 047)", "[gql_executor_paging][task047_walk]") {
+    auto graph = Graph("gql_path_mode_default");
+    graph.Start().get();
+    graph.Clear();
+    graph.shard.local().NodeTypeInsertPeered("Person").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "name", "string").get();
+    graph.shard.local().RelationshipTypeInsertPeered("KNOWS").get();
+
+    uint64_t a = graph.shard.local().NodeAddPeered("Person", "a", "{\"name\": \"A\"}").get();
+    uint64_t b = graph.shard.local().NodeAddPeered("Person", "b", "{\"name\": \"B\"}").get();
+    graph.shard.local().RelationshipAddPeered("KNOWS", a, b, "{}").get();
+
+    auto run = [&graph](const std::string& q) {
+        auto query = GqlParser::parse(q);
+        GqlOptimizer::optimize(query);
+        return GqlExecutor::execute(graph, std::move(query)).get();
+    };
+
+    SECTION("an unqualified quantified pattern walks, so it may re-cross the same edge") {
+        // Paths of length 1..2 from A: A-B (1 hop) and A-B-A (2 hops, re-crossing the single edge).
+        std::string res = run("MATCH (p:Person)-[:KNOWS]-{1,2}(q:Person) FILTER p.name = 'A' RETURN count(*) AS n");
+        INFO("result: " << res);
+        REQUIRE(res.find("\"n\": 2") != std::string::npos);
+    }
+
+    SECTION("TRAIL still forbids reusing an edge, when the query asks for it") {
+        // Only A-B survives: A-B-A would have to re-cross the same edge.
+        std::string res = run("MATCH TRAIL (p:Person)-[:KNOWS]-{1,2}(q:Person) FILTER p.name = 'A' RETURN count(*) AS n");
+        INFO("result: " << res);
+        REQUIRE(res.find("\"n\": 1") != std::string::npos);
+    }
+
+    graph.Stop().get();
+}
+
 TEST_CASE("ISO GQL OFFSET pages the ordered result (task 032)", "[gql_executor_paging][task032_offset]") {
     auto graph = Graph("gql_paging_test");
     graph.Start().get();

@@ -17,6 +17,7 @@
 #include <catch2/catch.hpp>
 #include <Graph.h>
 #include "../../src/gql/GqlParser.h"
+#include "../../src/gql/GqlOptimizer.h"
 #include "../../src/gql/GqlExecutor.h"
 #include "../../src/gql/executor/PathTraverser.h"
 
@@ -153,5 +154,92 @@ TEST_CASE("chunked start-node scan matches one-shot scan results", "[gql_executo
         REQUIRE(count_rows(res) == 4);
     }
 
+    graph.Stop().get();
+}
+
+/*
+ * A pattern with NO edges -- a plain label scan -- was excluded from both the paged scan and the streamed
+ * folds, so any aggregate or top-K over a bare label held the whole label (every node WITH its properties)
+ * in one vector before folding. At SF1 a date-filtered count of Posts died on std::bad_alloc that way. The
+ * scan now pages and the fold consumes each page, so these must be correct AND independent of the page
+ * size (task 020).
+ */
+TEST_CASE("aggregates and top-K over a bare label scan page instead of materialising", "[gql_executor_limit][task020_scan]") {
+    auto graph = Graph("gql_bare_scan_task020");
+    graph.Start().get();
+    graph.Clear();
+    graph.shard.local().NodeTypeInsertPeered("Post").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Post", "score", "integer").get();
+
+    // Scores 0..19, so an aggregate and a top-K both have predictable answers.
+    for (int i = 0; i < 20; ++i) {
+        graph.shard.local().NodeAddPeered("Post", "post" + std::to_string(i),
+            "{\"score\": " + std::to_string(i) + "}").get();
+    }
+
+    const size_t saved_chunk = gql_scan_chunk_size;
+
+    auto run = [&graph](const std::string& q) {
+        auto query = GqlParser::parse(q);
+        GqlOptimizer::optimize(query);
+        return GqlExecutor::execute(graph, std::move(query)).get();
+    };
+
+    SECTION("a residual-filtered count over a bare label is right at any page size") {
+        // The filter has a non-literal right side, so it is NOT pushed into the scan and stays a residual
+        // predicate -- exactly the SF1 shape (m.creationDate >= zoned_datetime(...)) that OOMed. Scores
+        // 15..19 qualify.
+        const std::string q = "MATCH (m:Post) FILTER m.score >= 10 + 5 RETURN count(m) AS n";
+
+        gql_scan_chunk_size = 3;
+        std::string paged = run(q);
+        gql_scan_chunk_size = saved_chunk;
+        std::string one_shot = run(q);
+
+        INFO("paged: " << paged << "  one_shot: " << one_shot);
+        REQUIRE(paged == one_shot);
+        REQUIRE(paged.find("\"n\": 5") != std::string::npos);
+    }
+
+    SECTION("an ungrouped aggregate over a bare label folds every scanned node") {
+        const std::string q = "MATCH (m:Post) RETURN max(m.score) AS hi, min(m.score) AS lo, count(m) AS n";
+        gql_scan_chunk_size = 4;
+        std::string res = run(q);
+        gql_scan_chunk_size = saved_chunk;
+        INFO("result: " << res);
+        REQUIRE(res.find("\"hi\": 19") != std::string::npos);
+        REQUIRE(res.find("\"lo\": 0") != std::string::npos);
+        REQUIRE(res.find("\"n\": 20") != std::string::npos);
+    }
+
+    SECTION("ORDER BY + LIMIT over a bare label keeps the true top-K across page boundaries") {
+        const std::string q = "MATCH (m:Post) RETURN m.score AS s ORDER BY m.score DESC LIMIT 3";
+        gql_scan_chunk_size = 3;
+        std::string paged = run(q);
+        gql_scan_chunk_size = saved_chunk;
+        std::string one_shot = run(q);
+
+        INFO("paged: " << paged << "  one_shot: " << one_shot);
+        REQUIRE(paged == one_shot);
+        // The winners are the last page's rows, so a heap that only saw one page would get this wrong.
+        REQUIRE(paged.find("\"s\": 19") != std::string::npos);
+        REQUIRE(paged.find("\"s\": 18") != std::string::npos);
+        REQUIRE(paged.find("\"s\": 17") != std::string::npos);
+        REQUIRE(paged.find("\"s\": 16") == std::string::npos);
+    }
+
+    SECTION("a grouped aggregate over a bare label is right at any page size") {
+        const std::string q = "MATCH (m:Post) FILTER m.score < 4 RETURN m.score AS s, count(m) AS n ORDER BY m.score ASC";
+        gql_scan_chunk_size = 2;
+        std::string paged = run(q);
+        gql_scan_chunk_size = saved_chunk;
+        std::string one_shot = run(q);
+        INFO("paged: " << paged << "  one_shot: " << one_shot);
+        REQUIRE(paged == one_shot);
+        REQUIRE(paged.find("\"s\": 0, \"n\": 1") != std::string::npos);
+        REQUIRE(paged.find("\"s\": 3, \"n\": 1") != std::string::npos);
+    }
+
+    gql_scan_chunk_size = saved_chunk;
     graph.Stop().get();
 }

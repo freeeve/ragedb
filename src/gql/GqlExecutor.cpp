@@ -796,7 +796,10 @@ static bool match_streamable(const MatchStatement& m) {
     if (m.equivalence_partition_lookup || m.transitive_reachability_lookup) return false;
     if (!m.path_variable.empty()) return false;
     if (m.limit.has_value()) return false;
-    if (m.pattern.edges.empty()) return false;
+    // A plain node scan with no edges streams too: its rows are the scanned nodes themselves, which the
+    // traversal pages and hands to the sink. Excluding it sent every aggregate or top-K over a bare label
+    // (a date-filtered count of Posts, say) down the materialising path, which holds the whole label --
+    // every node WITH its properties -- in one vector before the fold ever runs.
     return true;
 }
 

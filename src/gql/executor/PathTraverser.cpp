@@ -1195,11 +1195,13 @@ seastar::future<std::vector<GqlRow>> traverse_path_pattern(ragedb::Graph& graph,
         return traverse_from_relationship_index(graph, prep_pattern, base_row, limit, pruner, path_mode, sink);
     }
 
-    // Edge patterns cannot bound the anchor scan by the LIMIT (a start node may yield no match),
-    // so an unbound anchor used to trigger a full-label materialisation. Drive those scans page by
-    // page instead: expand each page, accumulate matches, and stop as soon as the LIMIT is
-    // satisfied or the scan is exhausted, keeping peak memory at one page plus the results.
-    if (bound_it == base_row.bindings.end() && !prep_pattern.edges.empty() &&
+    // An unbound anchor used to trigger a full-label materialisation: edge patterns cannot bound the
+    // anchor scan by the LIMIT (a start node may yield no match), and a bare node scan was not paged at
+    // all. Drive both page by page instead: expand each page, accumulate matches (or hand them to the
+    // sink), and stop as soon as the LIMIT is satisfied or the scan is exhausted, keeping peak memory at
+    // one page rather than the whole label. With no edges the page's rows ARE the result, so they go
+    // straight to the sink -- which is what makes a streamed aggregate over a plain label bounded.
+    if (bound_it == base_row.bindings.end() &&
         start_scan_is_pageable(prep_pattern.nodes[0], sort_property, sort_by_id)) {
         struct ChunkScanState {
             std::vector<GqlRow> rows;

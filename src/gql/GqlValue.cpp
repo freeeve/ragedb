@@ -18,7 +18,9 @@
 #include "../graph/types/Date.h"
 #include <seastar/json/json_elements.hh>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <optional>
 #include <sstream>
 
 namespace ragedb::gql {
@@ -222,13 +224,60 @@ namespace {
 /// listed here but not dispatched would evaluate to NULL, which is the very failure this guards against.
 const std::vector<std::string>& scalar_function_names() {
     static const std::vector<std::string> names = {
+        // paths
         "length",
+        "nodes",
+        "relationships",
+        // temporal (epoch milliseconds -- see the note on evaluate_scalar_function)
         "zoned_datetime",
         "datetime",
         "date",
         "localdatetime",
+        // strings
+        "substring",
+        "char_length",
+        "character_length",
+        "octet_length",
+        "upper",
+        "lower",
+        "trim",
+        "ltrim",
+        "rtrim",
+        // lists
+        "cardinality",
+        // numeric
+        "abs",
+        "ceil",
+        "ceiling",
+        "floor",
+        "sqrt",
+        "power",
+        "mod",
+        // null handling
+        "coalesce",
+        "nullif",
     };
     return names;
+}
+
+/// Numeric view of a value: GQL's numeric functions accept either an integer or a float.
+std::optional<double> numeric_arg(const GqlValue& v) {
+    if (v.type != GqlValue::PROPERTY) return std::nullopt;
+    if (std::holds_alternative<int64_t>(v.property)) return static_cast<double>(std::get<int64_t>(v.property));
+    if (std::holds_alternative<double>(v.property)) return std::get<double>(v.property);
+    return std::nullopt;
+}
+
+/// True when the value is an integer, so an integer-in/integer-out function can stay integral.
+bool is_integer_arg(const GqlValue& v) {
+    return v.type == GqlValue::PROPERTY && std::holds_alternative<int64_t>(v.property);
+}
+
+std::optional<std::string> string_arg(const GqlValue& v) {
+    if (v.type == GqlValue::PROPERTY && std::holds_alternative<std::string>(v.property)) {
+        return std::get<std::string>(v.property);
+    }
+    return std::nullopt;
 }
 }  // namespace
 
@@ -280,7 +329,154 @@ GqlValue evaluate_scalar_function(const GqlRow& row, const FunctionCallExpr* fc)
         }
         return GqlValue();
     }
-    return GqlValue(); // unknown function
+
+    // ---- paths -------------------------------------------------------------------------------------
+    // nodes(path) / relationships(path): the path's elements, as a LIST.
+    if (fc->name == "nodes" || fc->name == "relationships") {
+        if (fc->args.size() != 1) return GqlValue();
+        GqlValue arg = evaluate_expression(row, fc->args[0].get());
+        if (arg.type != GqlValue::PATH) return GqlValue();
+
+        auto items = std::make_shared<std::vector<GqlValue>>();
+        if (fc->name == "nodes") {
+            for (const auto& n : arg.path->GetNodes()) items->push_back(GqlValue(n));
+        } else {
+            for (const auto& r : arg.path->GetRelationships()) items->push_back(GqlValue(r));
+        }
+        GqlValue out;
+        out.type = GqlValue::LIST;
+        out.list = std::move(items);
+        return out;
+    }
+
+    // ---- strings -----------------------------------------------------------------------------------
+    // substring(s, start [, length]): start is 0-based, matching the benchmark's usage. A start past the
+    // end yields the empty string rather than an error.
+    if (fc->name == "substring") {
+        if (fc->args.size() < 2 || fc->args.size() > 3) return GqlValue();
+        auto s = string_arg(evaluate_expression(row, fc->args[0].get()));
+        auto start = numeric_arg(evaluate_expression(row, fc->args[1].get()));
+        if (!s || !start || *start < 0) return GqlValue();
+
+        const size_t from = static_cast<size_t>(*start);
+        if (from >= s->size()) return GqlValue(std::string());
+
+        size_t count = s->size() - from;
+        if (fc->args.size() == 3) {
+            auto len = numeric_arg(evaluate_expression(row, fc->args[2].get()));
+            if (!len || *len < 0) return GqlValue();
+            count = std::min(count, static_cast<size_t>(*len));
+        }
+        return GqlValue(s->substr(from, count));
+    }
+    if (fc->name == "char_length" || fc->name == "character_length" || fc->name == "octet_length") {
+        if (fc->args.size() != 1) return GqlValue();
+        auto s = string_arg(evaluate_expression(row, fc->args[0].get()));
+        if (!s) return GqlValue();
+        return GqlValue(static_cast<int64_t>(s->size()));
+    }
+    if (fc->name == "upper" || fc->name == "lower") {
+        if (fc->args.size() != 1) return GqlValue();
+        auto s = string_arg(evaluate_expression(row, fc->args[0].get()));
+        if (!s) return GqlValue();
+        std::string out = *s;
+        const bool up = (fc->name == "upper");
+        std::transform(out.begin(), out.end(), out.begin(), [up](unsigned char c) {
+            return static_cast<char>(up ? std::toupper(c) : std::tolower(c));
+        });
+        return GqlValue(out);
+    }
+    if (fc->name == "trim" || fc->name == "ltrim" || fc->name == "rtrim") {
+        if (fc->args.size() != 1) return GqlValue();
+        auto s = string_arg(evaluate_expression(row, fc->args[0].get()));
+        if (!s) return GqlValue();
+        std::string out = *s;
+        const auto is_space = [](unsigned char c) { return std::isspace(c) != 0; };
+        if (fc->name != "rtrim") {
+            out.erase(out.begin(), std::find_if_not(out.begin(), out.end(), is_space));
+        }
+        if (fc->name != "ltrim") {
+            out.erase(std::find_if_not(out.rbegin(), out.rend(), is_space).base(), out.end());
+        }
+        return GqlValue(out);
+    }
+
+    // ---- lists -------------------------------------------------------------------------------------
+    // cardinality(list): element count. Also accepts the list-shaped values that are not the LIST type
+    // (a relationship list, a stored list property), the same view FOR expands.
+    if (fc->name == "cardinality") {
+        if (fc->args.size() != 1) return GqlValue();
+        const auto elements = as_list_elements(evaluate_expression(row, fc->args[0].get()));
+        if (!elements) return GqlValue();
+        return GqlValue(static_cast<int64_t>(elements->size()));
+    }
+
+    // ---- numeric -----------------------------------------------------------------------------------
+    if (fc->name == "abs") {
+        if (fc->args.size() != 1) return GqlValue();
+        GqlValue arg = evaluate_expression(row, fc->args[0].get());
+        if (is_integer_arg(arg)) {
+            const int64_t i = std::get<int64_t>(arg.property);
+            return GqlValue(i < 0 ? -i : i);
+        }
+        auto d = numeric_arg(arg);
+        if (!d) return GqlValue();
+        return GqlValue(std::fabs(*d));
+    }
+    if (fc->name == "ceil" || fc->name == "ceiling" || fc->name == "floor" || fc->name == "sqrt") {
+        if (fc->args.size() != 1) return GqlValue();
+        auto d = numeric_arg(evaluate_expression(row, fc->args[0].get()));
+        if (!d) return GqlValue();
+        if (fc->name == "sqrt") {
+            if (*d < 0.0) return GqlValue();   // no real root; NULL rather than NaN
+            return GqlValue(std::sqrt(*d));
+        }
+        return GqlValue((fc->name == "floor") ? std::floor(*d) : std::ceil(*d));
+    }
+    if (fc->name == "power") {
+        if (fc->args.size() != 2) return GqlValue();
+        auto base = numeric_arg(evaluate_expression(row, fc->args[0].get()));
+        auto exp = numeric_arg(evaluate_expression(row, fc->args[1].get()));
+        if (!base || !exp) return GqlValue();
+        return GqlValue(std::pow(*base, *exp));
+    }
+    if (fc->name == "mod") {
+        if (fc->args.size() != 2) return GqlValue();
+        GqlValue lhs = evaluate_expression(row, fc->args[0].get());
+        GqlValue rhs = evaluate_expression(row, fc->args[1].get());
+        // Integer operands stay integral; a zero divisor is NULL rather than a trap.
+        if (is_integer_arg(lhs) && is_integer_arg(rhs)) {
+            const int64_t divisor = std::get<int64_t>(rhs.property);
+            if (divisor == 0) return GqlValue();
+            return GqlValue(std::get<int64_t>(lhs.property) % divisor);
+        }
+        auto a = numeric_arg(lhs);
+        auto b = numeric_arg(rhs);
+        if (!a || !b || *b == 0.0) return GqlValue();
+        return GqlValue(std::fmod(*a, *b));
+    }
+
+    // ---- null handling -----------------------------------------------------------------------------
+    // coalesce(a, b, ...): the first argument that is not null.
+    if (fc->name == "coalesce") {
+        for (const auto& arg : fc->args) {
+            GqlValue v = evaluate_expression(row, arg.get());
+            const bool is_null = v.type == GqlValue::NIL ||
+                                 (v.type == GqlValue::PROPERTY && std::holds_alternative<std::monostate>(v.property));
+            if (!is_null) return v;
+        }
+        return GqlValue();
+    }
+    // nullif(a, b): null when the two are equal, otherwise a.
+    if (fc->name == "nullif") {
+        if (fc->args.size() != 2) return GqlValue();
+        GqlValue a = evaluate_expression(row, fc->args[0].get());
+        GqlValue b = evaluate_expression(row, fc->args[1].get());
+        if (compare_gql_values(a, b) == 0) return GqlValue();
+        return a;
+    }
+
+    return GqlValue(); // unreachable: the parser rejects names not in scalar_function_names()
 }
 
 bool matches_label_expr(const std::string& actual_type, const std::shared_ptr<LabelExpression>& expr) {

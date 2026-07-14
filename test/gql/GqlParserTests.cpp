@@ -718,10 +718,12 @@ TEST_CASE("GQL ISO linear-query NEXT/FILTER lowering (task 032)", "[gql_parser][
             Catch::Contains("WITH is not GQL"));
     }
     SECTION("an unimplemented function is a hard error, not a silent NULL (task 045)") {
-        // These all used to parse, typecheck as ANY, and evaluate to NULL -- so a query calling them
-        // returned plausible-looking wrong answers instead of failing.
-        for (const auto& call : { "abs(p.age)", "toInteger(p.age)", "toString(p.age)", "labels(p)",
-                                  "coalesce(p.name, 'x')", "upper(p.name)", "shortestPath(p)" }) {
+        // These are still not implemented -- openCypher spellings (toInteger/toString/labels/type) and
+        // the Cypher-only shortestPath() function -- and used to parse, typecheck as ANY and evaluate to
+        // NULL, so a query calling them returned plausible-looking wrong answers instead of failing.
+        // (abs/upper/coalesce and friends ARE implemented as of task 046, so they are no longer here.)
+        for (const auto& call : { "toInteger(p.age)", "toString(p.age)", "labels(p)",
+                                  "keys(p)", "head(p.name)", "shortestPath(p)" }) {
             INFO("call: " << call);
             REQUIRE_THROWS_WITH(
                 GqlParser::parse(std::string("MATCH (p:Person) RETURN ") + call + " AS v"),

@@ -217,6 +217,35 @@ bool matches_filters(const std::map<std::string, property_type_t>& target, const
  * @param expr The AST expression node to evaluate.
  * @return GqlValue The result of the evaluation.
  */
+namespace {
+/// The scalar functions evaluate_scalar_function below actually implements. Keep the two in step: a name
+/// listed here but not dispatched would evaluate to NULL, which is the very failure this guards against.
+const std::vector<std::string>& scalar_function_names() {
+    static const std::vector<std::string> names = {
+        "length",
+        "zoned_datetime",
+        "datetime",
+        "date",
+        "localdatetime",
+    };
+    return names;
+}
+}  // namespace
+
+bool is_supported_scalar_function(const std::string& lower_name) {
+    const auto& names = scalar_function_names();
+    return std::find(names.begin(), names.end(), lower_name) != names.end();
+}
+
+std::string supported_scalar_function_list() {
+    std::string out;
+    for (const auto& name : scalar_function_names()) {
+        if (!out.empty()) out += ", ";
+        out += name;
+    }
+    return out;
+}
+
 GqlValue evaluate_scalar_function(const GqlRow& row, const FunctionCallExpr* fc) {
     if (!fc) return GqlValue();
     // length(path | relationship-list): number of relationships.

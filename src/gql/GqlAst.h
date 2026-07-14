@@ -83,7 +83,8 @@ enum class AggregateKind {
     AVG,
     MIN,
     MAX,
-    COLLECT   ///< collect / collect_list: gather values into a LIST (DISTINCT dedups).
+    COLLECT   ///< collect_list: gather values into a LIST (DISTINCT dedups). GQL's general set function;
+              ///< the openCypher collect() spelling is rejected.
 };
 
 /**

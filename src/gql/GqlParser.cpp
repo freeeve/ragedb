@@ -15,6 +15,7 @@
  */
 
 #include "GqlParser.h"
+#include "GqlValue.h"
 #include <stdexcept>
 #include <algorithm>
 #include <cctype>
@@ -1760,8 +1761,15 @@ std::unique_ptr<Expression> GqlParser::parse_primary() {
         if (peek(1).type == TokenType::LPAREN) {
             std::string upper_name = var;
             std::transform(upper_name.begin(), upper_name.end(), upper_name.begin(), [](unsigned char c){ return std::toupper(c); });
+            // `collect(x)` is the openCypher spelling; ISO GQL's general set function is `collect_list(x)`.
+            // The dialect is pure GQL (WITH was removed for the same reason), so reject it rather than
+            // quietly accepting a Cypher-ism.
+            if (upper_name == "COLLECT") {
+                throw std::runtime_error(
+                    "collect is not GQL: use collect_list(...)");
+            }
             if (upper_name == "COUNT" || upper_name == "SUM" || upper_name == "AVG" || upper_name == "MIN" || upper_name == "MAX" ||
-                upper_name == "COLLECT" || upper_name == "COLLECT_LIST") {
+                upper_name == "COLLECT_LIST") {
                 advance(); // consume function name
                 consume(TokenType::LPAREN, "Expected '(' after aggregate function");
                 
@@ -1784,7 +1792,7 @@ std::unique_ptr<Expression> GqlParser::parse_primary() {
                 else if (upper_name == "SUM") fn = AggregateKind::SUM;
                 else if (upper_name == "AVG") fn = AggregateKind::AVG;
                 else if (upper_name == "MIN") fn = AggregateKind::MIN;
-                else if (upper_name == "COLLECT" || upper_name == "COLLECT_LIST") fn = AggregateKind::COLLECT;
+                else if (upper_name == "COLLECT_LIST") fn = AggregateKind::COLLECT;
                 else fn = AggregateKind::MAX;
 
                 return std::make_unique<AggregateExpr>(fn, std::move(arg), distinct);
@@ -1820,6 +1828,16 @@ std::unique_ptr<Expression> GqlParser::parse_primary() {
                 std::string lname = var;
                 std::transform(lname.begin(), lname.end(), lname.begin(),
                                [](unsigned char c) { return std::tolower(c); });
+
+                // Only names the evaluator actually implements may parse. Anything else used to build a
+                // FunctionCallExpr that typechecked as ANY and evaluated to NULL, so a query calling an
+                // unimplemented function -- abs(), toInteger(), labels(), coalesce(), shortestPath() --
+                // silently produced NULLs and plausible-looking wrong answers instead of failing. Reject
+                // it here, where the name is known and the error can name it.
+                if (!is_supported_scalar_function(lname)) {
+                    throw std::runtime_error("Unknown function: " + var + "(). Supported scalar functions: " +
+                                             supported_scalar_function_list());
+                }
                 return std::make_unique<FunctionCallExpr>(std::move(lname), std::move(args));
             }
         }

@@ -717,6 +717,35 @@ TEST_CASE("GQL ISO linear-query NEXT/FILTER lowering (task 032)", "[gql_parser][
             GqlParser::parse("MATCH (a:Person) WITH a AS x RETURN x.name"),
             Catch::Contains("WITH is not GQL"));
     }
+    SECTION("an unimplemented function is a hard error, not a silent NULL (task 045)") {
+        // These all used to parse, typecheck as ANY, and evaluate to NULL -- so a query calling them
+        // returned plausible-looking wrong answers instead of failing.
+        for (const auto& call : { "abs(p.age)", "toInteger(p.age)", "toString(p.age)", "labels(p)",
+                                  "coalesce(p.name, 'x')", "upper(p.name)", "shortestPath(p)" }) {
+            INFO("call: " << call);
+            REQUIRE_THROWS_WITH(
+                GqlParser::parse(std::string("MATCH (p:Person) RETURN ") + call + " AS v"),
+                Catch::Contains("Unknown function"));
+        }
+    }
+    SECTION("the implemented scalar functions still parse (task 045)") {
+        REQUIRE_NOTHROW(GqlParser::parse(
+            "MATCH p = ANY SHORTEST (a:Person)-[:KNOWS]-{1,3}(b:Person) RETURN length(p) AS d"));
+        REQUIRE_NOTHROW(GqlParser::parse(
+            "MATCH (m:Post) FILTER m.creationDate >= zoned_datetime('2011-07-01') RETURN count(m) AS n"));
+    }
+    SECTION("openCypher collect() is rejected in favour of collect_list() (task 045)") {
+        REQUIRE_THROWS_WITH(
+            GqlParser::parse("MATCH (a:Person) RETURN collect(a.name) AS names"),
+            Catch::Contains("collect is not GQL"));
+        // The ISO GQL general set function still parses, DISTINCT and all.
+        auto q = GqlParser::parse("MATCH (a:Person) RETURN collect_list(DISTINCT a.name) AS names");
+        REQUIRE(q.returns.size() == 1);
+        REQUIRE(q.returns[0].expr->kind == ExpressionKind::AGGREGATION);
+        const auto* agg = static_cast<const AggregateExpr*>(q.returns[0].expr.get());
+        REQUIRE(agg->fn_kind == AggregateKind::COLLECT);
+        REQUIRE(agg->distinct);
+    }
     SECTION("standalone ORDER BY/LIMIT sort-page then RETURN pushes top-K to producer (IC2/IS2, task 034)") {
         auto q = GqlParser::parse(
             "MATCH (p:Person {id: 1})<-[:HAS_CREATOR]-(m:Message) "

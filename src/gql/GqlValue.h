@@ -108,9 +108,19 @@ GqlValue evaluate_expression(const GqlRow& row, const Expression* expr);
 
 /**
  * @brief Evaluates a scalar function call (e.g. length(path), zoned_datetime('2010-01-01')) against a
- *        row. Unknown functions return NIL. Shared by the row and group expression evaluators.
+ *        row. Shared by the row and group expression evaluators. The parser rejects any name this does not
+ *        implement, so an unimplemented function cannot reach here and silently evaluate to NULL.
  */
 GqlValue evaluate_scalar_function(const GqlRow& row, const FunctionCallExpr* fc);
+
+/**
+ * @brief Whether a (lower-cased) scalar function name is one the evaluator implements. Lives beside
+ *        evaluate_scalar_function so the allowlist cannot drift from the dispatch it guards.
+ */
+bool is_supported_scalar_function(const std::string& lower_name);
+
+/// The supported scalar function names, comma-separated, for error messages.
+std::string supported_scalar_function_list();
 
 /**
  * @brief Whether a node or relationship type satisfies a label expression (LITERAL / AND / OR / NOT /

@@ -34,23 +34,6 @@
  */
 namespace ragedb::gql {
 
-bool matches_label_expr(const std::string& actual_type, const std::shared_ptr<LabelExpression>& expr) {
-    if (!expr) return true;
-    switch (expr->kind) {
-        case LabelExprKind::LITERAL:
-            return actual_type == expr->name;
-        case LabelExprKind::NOT:
-            return !matches_label_expr(actual_type, expr->expr);
-        case LabelExprKind::AND:
-            return matches_label_expr(actual_type, expr->left) && matches_label_expr(actual_type, expr->right);
-        case LabelExprKind::OR:
-            return matches_label_expr(actual_type, expr->left) || matches_label_expr(actual_type, expr->right);
-        case LabelExprKind::WILDCARD:
-            return !actual_type.empty() && actual_type != "_default" && actual_type != "_";
-    }
-    return false;
-}
-
 seastar::future<std::vector<Node>> get_start_nodes(ragedb::Graph& graph, const PatternNode& node, size_t limit, const ProjectionPruner& pruner, std::string sort_property, bool sort_ascending, bool sort_by_id) {
     std::string single_label = "";
     if (node.label_expr && node.label_expr->kind == LabelExprKind::LITERAL) {

@@ -538,6 +538,12 @@ bool is_variable_referenced_outside_count(const Expression* expr, const std::str
             return is_variable_referenced_outside_count(in->value.get(), var_name) ||
                    is_variable_referenced_outside_count(in->list.get(), var_name);
         }
+        case ExpressionKind::CAST: {
+            return is_variable_referenced_outside_count(static_cast<const CastExpr*>(expr)->value.get(), var_name);
+        }
+        case ExpressionKind::IS_LABELED: {
+            return is_variable_referenced_outside_count(static_cast<const IsLabeledExpr*>(expr)->value.get(), var_name);
+        }
         default:
             return false;
     }

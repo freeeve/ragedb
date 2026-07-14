@@ -502,6 +502,22 @@ GqlType GqlTypechecker::check_expression(const Expression& expr) {
             check_expression(*in.list);
             return GqlType::BOOLEAN;
         }
+        case ExpressionKind::CAST: {
+            const auto& c = static_cast<const CastExpr&>(expr);
+            check_expression(*c.value);
+            switch (c.target) {
+                case CastType::STRING:  return GqlType::STRING;
+                case CastType::INTEGER: return GqlType::INTEGER;
+                case CastType::FLOAT:   return GqlType::DOUBLE;
+                case CastType::BOOLEAN: return GqlType::BOOLEAN;
+            }
+            return GqlType::ANY;
+        }
+        case ExpressionKind::IS_LABELED: {
+            const auto& l = static_cast<const IsLabeledExpr&>(expr);
+            check_expression(*l.value);
+            return GqlType::BOOLEAN;
+        }
     }
     return GqlType::ANY;
 }

@@ -54,10 +54,14 @@ private:
     std::map<std::string, property_type_t> parse_properties(
         std::map<std::string, std::shared_ptr<Expression>>* property_exprs = nullptr);
     void parse_edge_details(PatternEdge& edge);
-    std::shared_ptr<LabelExpression> parse_label_expression();
-    std::shared_ptr<LabelExpression> parse_label_or();
-    std::shared_ptr<LabelExpression> parse_label_and();
-    std::shared_ptr<LabelExpression> parse_label_factor();
+    /// Parses a label expression. `allow_keyword_ops` enables the `AND`/`OR`/`NOT` spellings alongside the
+    /// symbolic `&`/`|`/`!`: they are unambiguous inside a pattern, where a delimiter ends the label, but
+    /// not in an expression -- `n IS LABELED Person OR n.rank > 5` must read the OR as the boolean
+    /// operator it is, so IS LABELED passes false and accepts only the symbolic forms.
+    std::shared_ptr<LabelExpression> parse_label_expression(bool allow_keyword_ops = true);
+    std::shared_ptr<LabelExpression> parse_label_or(bool allow_keyword_ops);
+    std::shared_ptr<LabelExpression> parse_label_and(bool allow_keyword_ops);
+    std::shared_ptr<LabelExpression> parse_label_factor(bool allow_keyword_ops);
 
     // Expression parsing (Precedence climbing)
     std::unique_ptr<Expression> parse_expression();

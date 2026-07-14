@@ -309,6 +309,8 @@ std::vector<Token> GqlLexer::tokenize(const std::string& input) {
             else if (upper_name == "NOT") type = TokenType::NOT;
             else if (upper_name == "AS") type = TokenType::AS;
             else if (upper_name == "IS") type = TokenType::IS;
+            else if (upper_name == "CAST") type = TokenType::CAST;
+            else if (upper_name == "LABELED") type = TokenType::LABELED;
             // ISO GQL linear-query keywords
             else if (upper_name == "NEXT") type = TokenType::NEXT_KW;
             else if (upper_name == "LET") type = TokenType::LET_KW;

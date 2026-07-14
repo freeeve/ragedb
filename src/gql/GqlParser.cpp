@@ -20,6 +20,7 @@
 #include <cctype>
 #include <limits>
 #include <memory>
+#include <optional>
 
 namespace ragedb::gql {
 
@@ -178,6 +179,16 @@ static std::unique_ptr<Expression> substitute_return_aliases(
             auto* in = static_cast<InExpr*>(expr.get());
             in->value = substitute_return_aliases(std::move(in->value), aliases);
             in->list = substitute_return_aliases(std::move(in->list), aliases);
+            return expr;
+        }
+        case ExpressionKind::CAST: {
+            auto* c = static_cast<CastExpr*>(expr.get());
+            c->value = substitute_return_aliases(std::move(c->value), aliases);
+            return expr;
+        }
+        case ExpressionKind::IS_LABELED: {
+            auto* l = static_cast<IsLabeledExpr*>(expr.get());
+            l->value = substitute_return_aliases(std::move(l->value), aliases);
             return expr;
         }
         default:
@@ -1366,7 +1377,15 @@ std::unique_ptr<Expression> GqlParser::parse_comparison() {
             if (match(TokenType::NOT)) {
                 is_not = true;
             }
-            consume(TokenType::NULL_KW, "Expected 'NULL' after 'IS [NOT]'");
+            // `x IS [NOT] LABELED <labelExpression>` -- the label side is the same grammar as a pattern's,
+            // so AND/OR/NOT compose there exactly as they do inside a pattern.
+            if (match(TokenType::LABELED)) {
+                // Symbolic label operators only: a trailing `OR`/`AND` here belongs to the enclosing
+                // boolean expression, not to the label.
+                expr = std::make_unique<IsLabeledExpr>(std::move(expr), parse_label_expression(false), is_not);
+                continue;
+            }
+            consume(TokenType::NULL_KW, "Expected 'NULL' or 'LABELED' after 'IS [NOT]'");
             expr = std::make_unique<IsNullExpr>(std::move(expr), is_not);
             continue;
         }
@@ -1604,6 +1623,43 @@ std::unique_ptr<Expression> GqlParser::parse_primary() {
         parse_braced_subquery(matches, sub_where);
         return std::make_unique<ExistsExpr>(std::move(matches), std::move(sub_where));
     }
+    // CAST(<expr> AS <type>). The primitive type names are lexed as their own keywords (they are also
+    // schema-DDL types), so accept those tokens as well as the spellings that arrive as plain names.
+    if (match(TokenType::CAST)) {
+        consume(TokenType::LPAREN, "Expected '(' after CAST");
+        auto value = parse_expression();
+        consume(TokenType::AS, "Expected 'AS' in CAST");
+
+        std::optional<CastType> target;
+        if (match(TokenType::STRING_KW)) {
+            target = CastType::STRING;
+        } else if (match(TokenType::INTEGER_KW)) {
+            target = CastType::INTEGER;
+        } else if (match(TokenType::DOUBLE_KW)) {
+            target = CastType::FLOAT;
+        } else if (match(TokenType::BOOLEAN_KW)) {
+            target = CastType::BOOLEAN;
+        } else if (check(TokenType::NAME)) {
+            std::string type_name = peek().text;
+            advance();
+            std::transform(type_name.begin(), type_name.end(), type_name.begin(),
+                           [](unsigned char c) { return std::toupper(c); });
+            if (type_name == "VARCHAR" || type_name == "TEXT") {
+                target = CastType::STRING;
+            } else if (type_name == "BIGINT") {
+                target = CastType::INTEGER;
+            } else if (type_name == "FLOAT" || type_name == "REAL") {
+                target = CastType::FLOAT;
+            } else {
+                throw std::runtime_error("Unsupported CAST target type: " + type_name);
+            }
+        } else {
+            throw std::runtime_error("Expected a type name after 'AS' in CAST");
+        }
+
+        consume(TokenType::RPAREN, "Expected ')' to close CAST");
+        return std::make_unique<CastExpr>(std::move(value), *target);
+    }
     // ISO GQL COUNT { <pattern subquery> } counts subquery matches (distinct from the count(x)
     // aggregate). It shares the braced-subquery body with EXISTS and reuses SizeExpr (a match count).
     if (check(TokenType::NAME) && peek(1).type == TokenType::LBRACE) {
@@ -1787,15 +1843,15 @@ GqlQuery GqlParser::parse(const std::string& query) {
     return parser.parse_query();
 }
 
-std::shared_ptr<LabelExpression> GqlParser::parse_label_expression() {
-    return parse_label_or();
+std::shared_ptr<LabelExpression> GqlParser::parse_label_expression(bool allow_keyword_ops) {
+    return parse_label_or(allow_keyword_ops);
 }
 
-std::shared_ptr<LabelExpression> GqlParser::parse_label_or() {
-    auto left = parse_label_and();
-    while (check(TokenType::PIPE) || check(TokenType::OR)) {
+std::shared_ptr<LabelExpression> GqlParser::parse_label_or(bool allow_keyword_ops) {
+    auto left = parse_label_and(allow_keyword_ops);
+    while (check(TokenType::PIPE) || (allow_keyword_ops && check(TokenType::OR))) {
         advance(); // consume '|' or 'OR'
-        auto right = parse_label_and();
+        auto right = parse_label_and(allow_keyword_ops);
         auto node = std::make_shared<LabelExpression>();
         node->kind = LabelExprKind::OR;
         node->left = std::move(left);
@@ -1805,11 +1861,11 @@ std::shared_ptr<LabelExpression> GqlParser::parse_label_or() {
     return left;
 }
 
-std::shared_ptr<LabelExpression> GqlParser::parse_label_and() {
-    auto left = parse_label_factor();
-    while (check(TokenType::AMP) || check(TokenType::AND)) {
+std::shared_ptr<LabelExpression> GqlParser::parse_label_and(bool allow_keyword_ops) {
+    auto left = parse_label_factor(allow_keyword_ops);
+    while (check(TokenType::AMP) || (allow_keyword_ops && check(TokenType::AND))) {
         advance(); // consume '&' or 'AND'
-        auto right = parse_label_factor();
+        auto right = parse_label_factor(allow_keyword_ops);
         auto node = std::make_shared<LabelExpression>();
         node->kind = LabelExprKind::AND;
         node->left = std::move(left);
@@ -1819,16 +1875,17 @@ std::shared_ptr<LabelExpression> GqlParser::parse_label_and() {
     return left;
 }
 
-std::shared_ptr<LabelExpression> GqlParser::parse_label_factor() {
-    if (match(TokenType::BANG) || match(TokenType::NOT)) {
-        auto expr = parse_label_factor();
+std::shared_ptr<LabelExpression> GqlParser::parse_label_factor(bool allow_keyword_ops) {
+    if (match(TokenType::BANG) || (allow_keyword_ops && match(TokenType::NOT))) {
+        auto expr = parse_label_factor(allow_keyword_ops);
         auto node = std::make_shared<LabelExpression>();
         node->kind = LabelExprKind::NOT;
         node->expr = std::move(expr);
         return node;
     }
     if (match(TokenType::LPAREN)) {
-        auto expr = parse_label_expression();
+        // Parenthesised: a ')' delimits it, so the keyword spellings are unambiguous again inside.
+        auto expr = parse_label_expression(true);
         consume(TokenType::RPAREN, "Expected ')' to close label expression");
         return expr;
     }

@@ -58,7 +58,19 @@ enum class ExpressionKind {
     SIZE_OP,          ///< Size function expression (e.g. size((x)-[:REL]->()))
     FUNCTION_CALL,    ///< Scalar function call (e.g. length(p), zoned_datetime('2010-01-01'))
     CASE_WHEN,        ///< CASE WHEN cond THEN val [WHEN ...] [ELSE val] END conditional expression
-    IN_LIST           ///< Membership test against a list value: x IN <listExpr>
+    IN_LIST,          ///< Membership test against a list value: x IN <listExpr>
+    CAST,             ///< Type conversion: CAST(x AS STRING | INTEGER | FLOAT | BOOLEAN)
+    IS_LABELED        ///< Label predicate: x IS [NOT] LABELED <labelExpression>
+};
+
+/**
+ * @brief Target types for CAST(x AS T).
+ */
+enum class CastType {
+    STRING,
+    INTEGER,
+    FLOAT,
+    BOOLEAN
 };
 
 /**
@@ -93,6 +105,9 @@ enum class BinaryOpKind {
     CONTAINS,
     IS, AS                   ///< Keywords used in label specification and projections
 };
+
+/// Defined below with the pattern types; IS LABELED tests against one, so it is named here first.
+struct LabelExpression;
 
 /**
  * @brief Base struct for all GQL expression nodes.
@@ -255,6 +270,43 @@ struct InExpr : public Expression {
     }
     std::unique_ptr<Expression> clone() const override {
         return std::make_unique<InExpr>(value ? value->clone() : nullptr, list ? list->clone() : nullptr);
+    }
+};
+
+/**
+ * @brief Represents CAST(<expr> AS <type>): converts a value to the named type, yielding NULL when the
+ *        value cannot be represented in it (e.g. CAST('abc' AS INTEGER)).
+ */
+struct CastExpr : public Expression {
+    std::unique_ptr<Expression> value;   ///< The value being converted.
+    CastType target;                     ///< The type to convert to.
+    CastExpr(std::unique_ptr<Expression> v, CastType t) {
+        kind = ExpressionKind::CAST;
+        value = std::move(v);
+        target = t;
+    }
+    std::unique_ptr<Expression> clone() const override {
+        return std::make_unique<CastExpr>(value ? value->clone() : nullptr, target);
+    }
+};
+
+/**
+ * @brief Represents `<expr> IS [NOT] LABELED <labelExpression>`: whether a node or relationship carries
+ *        the given label. The label side reuses the pattern label expression, so AND/OR/NOT/`%` compose
+ *        exactly as they do inside a pattern.
+ */
+struct IsLabeledExpr : public Expression {
+    std::unique_ptr<Expression> value;               ///< The node or relationship being tested.
+    std::shared_ptr<LabelExpression> label_expr;     ///< The label expression to test against.
+    bool negated = false;                            ///< True for IS NOT LABELED.
+    IsLabeledExpr(std::unique_ptr<Expression> v, std::shared_ptr<LabelExpression> l, bool n) {
+        kind = ExpressionKind::IS_LABELED;
+        value = std::move(v);
+        label_expr = std::move(l);
+        negated = n;
+    }
+    std::unique_ptr<Expression> clone() const override {
+        return std::make_unique<IsLabeledExpr>(value ? value->clone() : nullptr, label_expr, negated);
     }
 };
 

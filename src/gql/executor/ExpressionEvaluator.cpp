@@ -68,6 +68,12 @@ bool has_aggregates(const Expression* expr) {
         auto* in = static_cast<const InExpr*>(expr);
         return has_aggregates(in->value.get()) || has_aggregates(in->list.get());
     }
+    if (expr->kind == ExpressionKind::CAST) {
+        return has_aggregates(static_cast<const CastExpr*>(expr)->value.get());
+    }
+    if (expr->kind == ExpressionKind::IS_LABELED) {
+        return has_aggregates(static_cast<const IsLabeledExpr*>(expr)->value.get());
+    }
     return false;
 }
 
@@ -107,6 +113,10 @@ void find_aggregates(const Expression* expr, std::vector<const AggregateExpr*>& 
         auto* in = static_cast<const InExpr*>(expr);
         find_aggregates(in->value.get(), aggregates);
         find_aggregates(in->list.get(), aggregates);
+    } else if (expr->kind == ExpressionKind::CAST) {
+        find_aggregates(static_cast<const CastExpr*>(expr)->value.get(), aggregates);
+    } else if (expr->kind == ExpressionKind::IS_LABELED) {
+        find_aggregates(static_cast<const IsLabeledExpr*>(expr)->value.get(), aggregates);
     }
 }
 
@@ -155,6 +165,15 @@ GqlValue evaluate_group_expression(const GqlRow& representative, const std::map<
         case ExpressionKind::FUNCTION_CALL: {
             // Scalar functions evaluate over the representative row's bindings (grouping keys).
             return evaluate_scalar_function(representative, static_cast<const FunctionCallExpr*>(expr));
+        }
+        case ExpressionKind::CAST: {
+            auto* c = static_cast<const CastExpr*>(expr);
+            return apply_cast(evaluate_group_expression(representative, aggregate_results, c->value.get()), c->target);
+        }
+        case ExpressionKind::IS_LABELED: {
+            auto* l = static_cast<const IsLabeledExpr*>(expr);
+            return apply_is_labeled(evaluate_group_expression(representative, aggregate_results, l->value.get()),
+                                    l->label_expr, l->negated);
         }
         case ExpressionKind::IN_LIST: {
             auto* in = static_cast<const InExpr*>(expr);

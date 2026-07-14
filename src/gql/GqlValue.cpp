@@ -254,6 +254,114 @@ GqlValue evaluate_scalar_function(const GqlRow& row, const FunctionCallExpr* fc)
     return GqlValue(); // unknown function
 }
 
+bool matches_label_expr(const std::string& actual_type, const std::shared_ptr<LabelExpression>& expr) {
+    if (!expr) return true;
+    switch (expr->kind) {
+        case LabelExprKind::LITERAL:
+            return actual_type == expr->name;
+        case LabelExprKind::NOT:
+            return !matches_label_expr(actual_type, expr->expr);
+        case LabelExprKind::AND:
+            return matches_label_expr(actual_type, expr->left) && matches_label_expr(actual_type, expr->right);
+        case LabelExprKind::OR:
+            return matches_label_expr(actual_type, expr->left) || matches_label_expr(actual_type, expr->right);
+        case LabelExprKind::WILDCARD:
+            return !actual_type.empty() && actual_type != "_default" && actual_type != "_";
+    }
+    return false;
+}
+
+GqlValue apply_cast(const GqlValue& value, CastType target) {
+    // Only primitive values convert; a node, relationship, path or list has no scalar representation.
+    if (value.type != GqlValue::PROPERTY || std::holds_alternative<std::monostate>(value.property)) {
+        return GqlValue();
+    }
+    const property_type_t& p = value.property;
+
+    switch (target) {
+        case CastType::STRING: {
+            if (std::holds_alternative<std::string>(p)) return value;
+            if (std::holds_alternative<int64_t>(p)) return GqlValue(std::to_string(std::get<int64_t>(p)));
+            if (std::holds_alternative<double>(p)) {
+                std::ostringstream oss;
+                oss << std::get<double>(p);
+                return GqlValue(oss.str());
+            }
+            if (std::holds_alternative<bool>(p)) return GqlValue(std::string(std::get<bool>(p) ? "true" : "false"));
+            return GqlValue();
+        }
+        case CastType::INTEGER: {
+            if (std::holds_alternative<int64_t>(p)) return value;
+            if (std::holds_alternative<bool>(p)) return GqlValue(static_cast<int64_t>(std::get<bool>(p) ? 1 : 0));
+            if (std::holds_alternative<double>(p)) {
+                const double d = std::get<double>(p);
+                if (!std::isfinite(d)) return GqlValue();
+                return GqlValue(static_cast<int64_t>(std::llround(d)));
+            }
+            if (std::holds_alternative<std::string>(p)) {
+                // A string that is not wholly an integer has no integer value, so it casts to NULL rather
+                // than to the prefix it happens to start with.
+                const std::string& s = std::get<std::string>(p);
+                try {
+                    size_t consumed = 0;
+                    const long long parsed = std::stoll(s, &consumed);
+                    if (consumed != s.size()) return GqlValue();
+                    return GqlValue(static_cast<int64_t>(parsed));
+                } catch (...) {
+                    return GqlValue();
+                }
+            }
+            return GqlValue();
+        }
+        case CastType::FLOAT: {
+            if (std::holds_alternative<double>(p)) return value;
+            if (std::holds_alternative<int64_t>(p)) return GqlValue(static_cast<double>(std::get<int64_t>(p)));
+            if (std::holds_alternative<bool>(p)) return GqlValue(std::get<bool>(p) ? 1.0 : 0.0);
+            if (std::holds_alternative<std::string>(p)) {
+                const std::string& s = std::get<std::string>(p);
+                try {
+                    size_t consumed = 0;
+                    const double parsed = std::stod(s, &consumed);
+                    if (consumed != s.size()) return GqlValue();
+                    return GqlValue(parsed);
+                } catch (...) {
+                    return GqlValue();
+                }
+            }
+            return GqlValue();
+        }
+        case CastType::BOOLEAN: {
+            if (std::holds_alternative<bool>(p)) return value;
+            if (std::holds_alternative<int64_t>(p)) return GqlValue(std::get<int64_t>(p) != 0);
+            if (std::holds_alternative<double>(p)) return GqlValue(std::get<double>(p) != 0.0);
+            if (std::holds_alternative<std::string>(p)) {
+                std::string s = std::get<std::string>(p);
+                std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
+                if (s == "true") return GqlValue(true);
+                if (s == "false") return GqlValue(false);
+                return GqlValue();
+            }
+            return GqlValue();
+        }
+    }
+    return GqlValue();
+}
+
+GqlValue apply_is_labeled(const GqlValue& value, const std::shared_ptr<LabelExpression>& label_expr, bool negated) {
+    std::string type;
+    if (value.type == GqlValue::NODE) {
+        type = value.node->getType();
+    } else if (value.type == GqlValue::RELATIONSHIP) {
+        type = value.relationship->getType();
+    } else {
+        // Not an entity (or unbound): unknown, which propagates rather than reading as a false match.
+        return GqlValue();
+    }
+
+    const bool labeled = matches_label_expr(type, label_expr);
+    return GqlValue(negated ? !labeled : labeled);
+}
+
 GqlValue evaluate_expression(const GqlRow& row, const Expression* expr) {
     if (!expr) return GqlValue();
 
@@ -289,6 +397,14 @@ GqlValue evaluate_expression(const GqlRow& row, const Expression* expr) {
         }
         case ExpressionKind::FUNCTION_CALL: {
             return evaluate_scalar_function(row, static_cast<const FunctionCallExpr*>(expr));
+        }
+        case ExpressionKind::CAST: {
+            auto* c = static_cast<const CastExpr*>(expr);
+            return apply_cast(evaluate_expression(row, c->value.get()), c->target);
+        }
+        case ExpressionKind::IS_LABELED: {
+            auto* l = static_cast<const IsLabeledExpr*>(expr);
+            return apply_is_labeled(evaluate_expression(row, l->value.get()), l->label_expr, l->negated);
         }
         case ExpressionKind::IN_LIST: {
             auto* in = static_cast<const InExpr*>(expr);

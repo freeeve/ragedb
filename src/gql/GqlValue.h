@@ -113,6 +113,25 @@ GqlValue evaluate_expression(const GqlRow& row, const Expression* expr);
 GqlValue evaluate_scalar_function(const GqlRow& row, const FunctionCallExpr* fc);
 
 /**
+ * @brief Whether a node or relationship type satisfies a label expression (LITERAL / AND / OR / NOT /
+ *        wildcard). Used both by pattern matching and by the `IS LABELED` predicate.
+ */
+bool matches_label_expr(const std::string& actual_type, const std::shared_ptr<LabelExpression>& expr);
+
+/**
+ * @brief Converts a value to a CAST target type, yielding NULL when it has no representation there (e.g.
+ *        CAST('abc' AS INTEGER)). Shared by the row and group expression evaluators.
+ */
+GqlValue apply_cast(const GqlValue& value, CastType target);
+
+/**
+ * @brief Evaluates `IS [NOT] LABELED` for an already-evaluated operand: true when the bound node or
+ *        relationship carries the label. A non-entity operand (or an unbound one) is NULL, not false, so
+ *        it propagates like any other unknown.
+ */
+GqlValue apply_is_labeled(const GqlValue& value, const std::shared_ptr<LabelExpression>& label_expr, bool negated);
+
+/**
  * @brief Serializes a GqlValue to its JSON string representation.
  */
 std::string serialize_gql_value(const GqlValue& val);

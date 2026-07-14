@@ -19,6 +19,7 @@
 #include "../../src/gql/GqlParser.h"
 #include "../../src/gql/GqlOptimizer.h"
 #include "../../src/gql/GqlExecutor.h"
+#include "../../src/gql/executor/PathTraverser.h"
 
 using namespace ragedb;
 using namespace ragedb::gql;
@@ -110,6 +111,42 @@ TEST_CASE("GQL Execution Shortest Path Tests", "[gql_executor_shortest_path]") {
         GqlOptimizer::optimize(query);
         std::string results = GqlExecutor::execute(graph, std::move(query)).get();
         REQUIRE(results.find("Arcadia") != std::string::npos);
+    }
+
+    // One bound start against an unbound endpoint runs a separate search per candidate pair -- the
+    // shape that made a person-to-every-Person-of-a-first-name query exhaust the heap. The searches
+    // now run with a bounded number in flight, and neither the rows nor their order may depend on
+    // that bound (task 028).
+    SECTION("many-endpoint search is invariant under the concurrency bound (task 028)") {
+        std::string query_str = "MATCH p = ANY SHORTEST (a)-[:Links]-{1,10}(b) WHERE a.name = 'Arcadia' RETURN b.name AS name, length(p) AS d";
+
+        const size_t saved_concurrency = gql_shortest_path_concurrency;
+        std::string serial;
+        std::string bounded;
+        try {
+            gql_shortest_path_concurrency = 1;
+            auto serial_query = GqlParser::parse(query_str);
+            GqlOptimizer::optimize(serial_query);
+            serial = GqlExecutor::execute(graph, std::move(serial_query)).get();
+
+            gql_shortest_path_concurrency = 4;
+            auto bounded_query = GqlParser::parse(query_str);
+            GqlOptimizer::optimize(bounded_query);
+            bounded = GqlExecutor::execute(graph, std::move(bounded_query)).get();
+        } catch (...) {
+            gql_shortest_path_concurrency = saved_concurrency;
+            throw;
+        }
+        gql_shortest_path_concurrency = saved_concurrency;
+
+        REQUIRE(serial == bounded);
+
+        // Arcadia reaches every city except the isolated Nexis, so each reachable endpoint yields a
+        // row and the unreachable one yields none.
+        REQUIRE(serial.find("Eldoria") != std::string::npos);
+        REQUIRE(serial.find("Nebula") != std::string::npos);
+        REQUIRE(serial.find("Lunaria") != std::string::npos);
+        REQUIRE(serial.find("Nexis") == std::string::npos);
     }
 
     guard.stop();

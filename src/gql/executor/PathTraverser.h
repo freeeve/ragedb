@@ -68,6 +68,13 @@ inline size_t gql_stream_concurrency = 32;
 // level, so no cross-level deadlock).
 inline size_t gql_stream_inner_concurrency = 8;
 
+// Max (start, end) pairs searched concurrently by a shortest-path selector (ANY/ALL SHORTEST and the
+// CHEAPEST forms). Each pair runs its own BFS and holds its own frontier plus result paths, so an
+// unbounded fan-out over the candidate cartesian product makes peak memory O(pairs) -- a pattern with
+// many candidate endpoints (one person to every Person of a given first name) exhausts the heap.
+// Bounding the in-flight searches keeps it O(concurrency).
+inline size_t gql_shortest_path_concurrency = 8;
+
 /**
  * @brief Consumer for streamed traversal output: when passed to traverse_path_pattern, matched
  *        rows are handed to consume() in bounded batches instead of being collected and returned

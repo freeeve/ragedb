@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <unordered_set>
 #include <iterator>
+#include <numeric>
 
 /**
  * @file PathTraverser.cpp
@@ -1921,30 +1922,41 @@ seastar::future<std::vector<GqlRow>> traverse_match_statement(ragedb::Graph& gra
             uint64_t min_hops = edge.is_variable_length ? edge.min_hops : 1;
             uint64_t max_hops = edge.is_variable_length ? edge.max_hops : 15;
 
-            // Compute shortest paths within each (start node, end node) partition pair.
-            std::vector<seastar::future<std::vector<Path>>> traversal_futs;
+            // Enumerate the (start node, end node) partition pairs to search.
             struct PartitionInfo {
                 Node start_node;
                 Node end_node;
             };
             auto partitions = std::make_shared<std::vector<PartitionInfo>>();
+            partitions->reserve(valid_starts.size() * valid_ends.size());
+            for (const auto& s : valid_starts) {
+                for (const auto& e : valid_ends) {
+                    partitions->push_back({s, e});
+                }
+            }
 
+            if (partitions->empty()) {
+                return seastar::make_ready_future<std::vector<GqlRow>>(std::vector<GqlRow>{});
+            }
+
+            // Resolve the edge cost function once for the weighted selectors, rather than rebuilding
+            // it for every pair.
+            std::function<double(const Relationship&)> cost_fn;
             if (stmt.shortest_path_kind == ShortestPathKind::CHEAPEST ||
                 stmt.shortest_path_kind == ShortestPathKind::ALL_CHEAPEST ||
                 stmt.shortest_path_kind == ShortestPathKind::CHEAPEST_K) {
                 std::shared_ptr<Expression> cost_expr = nullptr;
-                std::string edge_var = "";
+                std::string cost_edge_var = "";
                 if (!stmt.pattern.edges.empty()) {
                     cost_expr = stmt.pattern.edges[0].cost_expr;
-                    edge_var = stmt.pattern.edges[0].variable;
+                    cost_edge_var = stmt.pattern.edges[0].variable;
                 }
-                
-                std::function<double(const Relationship&)> cost_fn;
+
                 if (cost_expr) {
-                    cost_fn = [cost_expr, edge_var](const Relationship& rel) -> double {
+                    cost_fn = [cost_expr, cost_edge_var](const Relationship& rel) -> double {
                         GqlRow temp_row;
-                        if (!edge_var.empty()) {
-                            temp_row.bindings[edge_var] = GqlValue(rel);
+                        if (!cost_edge_var.empty()) {
+                            temp_row.bindings[cost_edge_var] = GqlValue(rel);
                         }
                         GqlValue val = evaluate_expression(temp_row, cost_expr.get());
                         if (std::holds_alternative<double>(val.property)) {
@@ -1965,92 +1977,69 @@ seastar::future<std::vector<GqlRow>> traverse_match_statement(ragedb::Graph& gra
                         return 1.0;
                     };
                 }
-
-                for (const auto& s : valid_starts) {
-                    for (const auto& e : valid_ends) {
-                        partitions->push_back({s, e});
-                        seastar::future<std::vector<Path>> fut = [&graph, s, e, dir, &rel_types, &cost_fn, &stmt]() {
-                            if (stmt.shortest_path_kind == ShortestPathKind::CHEAPEST) {
-                                return graph.shard.local().ShortestWeightedPathPeered(
-                                    s.getId(),
-                                    e.getId(),
-                                    dir,
-                                    rel_types,
-                                    cost_fn
-                                ).then([](std::optional<WeightedPath> opt_wpath) {
-                                    std::vector<Path> paths;
-                                    if (opt_wpath) {
-                                        paths.push_back(Path(opt_wpath->GetNodes(), opt_wpath->GetRelationships()));
-                                    }
-                                    return paths;
-                                });
-                            } else if (stmt.shortest_path_kind == ShortestPathKind::ALL_CHEAPEST) {
-                                return graph.shard.local().AllCheapestWeightedPathsPeered(
-                                    s.getId(),
-                                    e.getId(),
-                                    dir,
-                                    rel_types,
-                                    cost_fn
-                                ).then([](std::vector<WeightedPath> wpaths) {
-                                    std::vector<Path> paths;
-                                    for (const auto& wp : wpaths) {
-                                        paths.push_back(Path(wp.GetNodes(), wp.GetRelationships()));
-                                    }
-                                    return paths;
-                                });
-                            } else { // CHEAPEST_K
-                                return graph.shard.local().KCheapestWeightedPathsPeered(
-                                    s.getId(),
-                                    e.getId(),
-                                    dir,
-                                    rel_types,
-                                    cost_fn,
-                                    stmt.shortest_path_k
-                                ).then([](std::vector<WeightedPath> wpaths) {
-                                    std::vector<Path> paths;
-                                    for (const auto& wp : wpaths) {
-                                        paths.push_back(Path(wp.GetNodes(), wp.GetRelationships()));
-                                    }
-                                    return paths;
-                                });
-                            }
-                        }();
-                        traversal_futs.push_back(std::move(fut));
-                    }
-                }
-            } else {
-                for (const auto& s : valid_starts) {
-                    for (const auto& e : valid_ends) {
-                        partitions->push_back({s, e});
-                        traversal_futs.push_back(
-                            graph.shard.local().ShortestPathsPeered(
-                                s.getId(),
-                                e.getId(),
-                                dir,
-                                rel_types,
-                                min_hops,
-                                max_hops,
-                                stmt.shortest_path_kind,
-                                stmt.shortest_path_k
-                            )
-                        );
-                    }
-                }
             }
 
-            if (traversal_futs.empty()) {
-                return seastar::make_ready_future<std::vector<GqlRow>>(std::vector<GqlRow>{});
-            }
+            // Search the pairs with a bounded number in flight. Every pair runs an independent BFS
+            // holding its own frontier and result paths, so launching the whole cartesian product at
+            // once -- and holding every pair's paths until the last one resolves -- makes peak memory
+            // O(pairs). A pattern with many candidate endpoints (one person to every Person of a given
+            // first name) exhausts the heap that way. Each pair folds its rows into its own slot, so
+            // the output stays in partition order regardless of the order the searches complete in.
+            auto row_groups = std::make_shared<std::vector<std::vector<GqlRow>>>(partitions->size());
+            auto indices = std::make_shared<std::vector<size_t>>(partitions->size());
+            std::iota(indices->begin(), indices->end(), 0);
 
-            // Once all partition-level shortest path searches finish, bind results to GqlValue.
-            return seastar::when_all_succeed(traversal_futs.begin(), traversal_futs.end())
-            .then([row, stmt, start_node_var, end_node_var, partitions, edge_var = edge.variable](std::vector<std::vector<Path>> path_results) {
-                std::vector<GqlRow> out_rows;
-                for (size_t i = 0; i < path_results.size(); ++i) {
-                    const auto& partition = (*partitions)[i];
-                    const auto& paths = path_results[i];
+            const size_t concurrency = gql_shortest_path_concurrency > 0 ? gql_shortest_path_concurrency : 1;
 
-                    // Bind variables for the start/end nodes, traversed edge relationships list, and path object.
+            return seastar::max_concurrent_for_each(indices->begin(), indices->end(), concurrency,
+            [&graph, stmt, row, start_node_var, end_node_var, edge_var = edge.variable, rel_types, dir,
+             min_hops, max_hops, cost_fn, partitions, row_groups](size_t index) {
+                const auto& partition = (*partitions)[index];
+                seastar::future<std::vector<Path>> search = seastar::make_ready_future<std::vector<Path>>();
+
+                if (stmt.shortest_path_kind == ShortestPathKind::CHEAPEST) {
+                    search = graph.shard.local().ShortestWeightedPathPeered(
+                        partition.start_node.getId(), partition.end_node.getId(), dir, rel_types, cost_fn
+                    ).then([](std::optional<WeightedPath> opt_wpath) {
+                        std::vector<Path> paths;
+                        if (opt_wpath) {
+                            paths.push_back(Path(opt_wpath->GetNodes(), opt_wpath->GetRelationships()));
+                        }
+                        return paths;
+                    });
+                } else if (stmt.shortest_path_kind == ShortestPathKind::ALL_CHEAPEST) {
+                    search = graph.shard.local().AllCheapestWeightedPathsPeered(
+                        partition.start_node.getId(), partition.end_node.getId(), dir, rel_types, cost_fn
+                    ).then([](std::vector<WeightedPath> wpaths) {
+                        std::vector<Path> paths;
+                        for (const auto& wp : wpaths) {
+                            paths.push_back(Path(wp.GetNodes(), wp.GetRelationships()));
+                        }
+                        return paths;
+                    });
+                } else if (stmt.shortest_path_kind == ShortestPathKind::CHEAPEST_K) {
+                    search = graph.shard.local().KCheapestWeightedPathsPeered(
+                        partition.start_node.getId(), partition.end_node.getId(), dir, rel_types, cost_fn,
+                        stmt.shortest_path_k
+                    ).then([](std::vector<WeightedPath> wpaths) {
+                        std::vector<Path> paths;
+                        for (const auto& wp : wpaths) {
+                            paths.push_back(Path(wp.GetNodes(), wp.GetRelationships()));
+                        }
+                        return paths;
+                    });
+                } else {
+                    search = graph.shard.local().ShortestPathsPeered(
+                        partition.start_node.getId(), partition.end_node.getId(), dir, rel_types,
+                        min_hops, max_hops, stmt.shortest_path_kind, stmt.shortest_path_k
+                    );
+                }
+
+                // Bind variables for the start/end nodes, traversed edge relationships list, and path object.
+                return search.then([row, stmt, start_node_var, end_node_var, edge_var, index, partitions, row_groups]
+                                   (std::vector<Path> paths) {
+                    const auto& partition = (*partitions)[index];
+                    auto& slot = (*row_groups)[index];
                     for (const auto& path : paths) {
                         GqlRow new_row = row;
                         new_row.bindings[start_node_var] = GqlValue(partition.start_node);
@@ -2064,8 +2053,14 @@ seastar::future<std::vector<GqlRow>> traverse_match_statement(ragedb::Graph& gra
                         new_row.bindings["_e_0"] = GqlValue(path.GetRelationships());
 
                         new_row.bindings[stmt.path_variable] = GqlValue(path);
-                        out_rows.push_back(new_row);
+                        slot.push_back(new_row);
                     }
+                });
+            }).then([partitions, indices, row_groups] {
+                std::vector<GqlRow> out_rows;
+                for (auto& group : *row_groups) {
+                    out_rows.insert(out_rows.end(), std::make_move_iterator(group.begin()),
+                                    std::make_move_iterator(group.end()));
                 }
                 return out_rows;
             });

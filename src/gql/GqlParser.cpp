@@ -223,13 +223,23 @@ void GqlParser::parse_order_by(GqlQuery& query) {
 }
 
 /**
- * @brief Parse an optional LIMIT clause into query.limit.
+ * @brief Parse the optional OFFSET and LIMIT page clauses into query.offset / query.limit. Either order is
+ *        accepted, so both `OFFSET 10 LIMIT 5` and `LIMIT 5 OFFSET 10` parse.
  */
 void GqlParser::parse_limit(GqlQuery& query) {
-    if (!match(TokenType::LIMIT)) return;
-    std::string num_str = peek().text;
-    consume(TokenType::NUMBER, "Expected integer limit value");
-    query.limit = std::stoull(num_str);
+    for (;;) {
+        if (match(TokenType::LIMIT)) {
+            std::string num_str = peek().text;
+            consume(TokenType::NUMBER, "Expected integer limit value");
+            query.limit = std::stoull(num_str);
+        } else if (match(TokenType::OFFSET)) {
+            std::string num_str = peek().text;
+            consume(TokenType::NUMBER, "Expected integer offset value");
+            query.offset = std::stoull(num_str);
+        } else {
+            return;
+        }
+    }
 }
 
 static void validate_insert_label_expr(const std::shared_ptr<LabelExpression>& expr) {
@@ -569,7 +579,7 @@ GqlQuery GqlParser::parse_single_query() {
 
     // ISO GQL standalone ordering/paging statement: a segment may begin with ORDER BY [LIMIT] operating
     // on the working table piped in from the previous segment (no MATCH/RETURN of its own yet).
-    if ((check(TokenType::ORDER_BY) || check(TokenType::LIMIT)) &&
+    if ((check(TokenType::ORDER_BY) || check(TokenType::LIMIT) || check(TokenType::OFFSET)) &&
         query.matches.empty() && query.returns.empty() && query.let_bindings.empty() &&
         !with_segments.empty()) {
         parse_order_by(query);

@@ -22,6 +22,7 @@
 #include <unordered_map>
 #include <set>
 #include <algorithm>
+#include <limits>
 
 namespace ragedb::gql {
 
@@ -90,8 +91,14 @@ void LimitPushdownOptimizer::limit_pushdown_pass(GqlQuery& query) {
     // live in has_post_scan_residual_predicate, shared with the executor's limit_val gate.
     if (has_post_scan_residual_predicate(query)) return;
 
+    // Push the whole page window (offset + limit), not the bare limit: an OFFSET skips past the first rows
+    // of the result, so a scan bounded at `limit` would stop before reaching the rows the page returns.
+    const uint64_t skip = query.offset.value_or(0);
+    if (skip > std::numeric_limits<uint64_t>::max() - *query.limit) return;
+    const std::optional<uint64_t> window = skip + *query.limit;
+
     if (query.matches.size() == 1) {
-        query.matches[0].limit = query.limit;
+        query.matches[0].limit = window;
         return;
     }
 
@@ -155,7 +162,7 @@ void LimitPushdownOptimizer::limit_pushdown_pass(GqlQuery& query) {
     }
 
     if (all_mandatory) {
-        query.matches[0].limit = query.limit;
+        query.matches[0].limit = window;
     }
 }
 

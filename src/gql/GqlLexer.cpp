@@ -298,6 +298,7 @@ std::vector<Token> GqlLexer::tokenize(const std::string& input) {
             else if (upper_name == "WITH") type = TokenType::WITH;
             else if (upper_name == "DISTINCT") type = TokenType::DISTINCT;
             else if (upper_name == "LIMIT") type = TokenType::LIMIT;
+            else if (upper_name == "OFFSET" || upper_name == "SKIP") type = TokenType::OFFSET;
             else if (upper_name == "ASC" || upper_name == "ASCENDING") type = TokenType::ASC;
             else if (upper_name == "DESC" || upper_name == "DESCENDING") type = TokenType::DESC;
             else if (upper_name == "TRUE") type = TokenType::TRUE_KW;

@@ -44,6 +44,7 @@
 #include <set>
 #include <map>
 #include <algorithm>
+#include <limits>
 #include <cstdlib>
 #include <chrono>
 #include <seastar/core/when_all.hh>
@@ -88,17 +89,54 @@ struct QueryResult {
     std::vector<std::string> column_names;
     std::vector<std::vector<GqlValue>> rows;
     bool is_sorted = false;
+    /// OFFSET/LIMIT already applied by the path that produced these rows, so the terminal must not page
+    /// again -- a second LIMIT would be harmless, but a second OFFSET would skip a further offset rows.
+    /// Set operations leave this false: they combine un-paged branch results and page the combination.
+    bool is_paged = false;
 };
+
+/**
+ * @brief Rows that an INTERMEDIATE truncation has to retain for a later OFFSET/LIMIT page to still have
+ *        its window: the page keeps [offset, offset + limit), so cutting down to limit alone would throw
+ *        away exactly the rows the offset skips past. Returns nullopt when nothing bounds the row count.
+ */
+static std::optional<uint64_t> page_window(const GqlQuery& q) {
+    if (!q.limit) return std::nullopt;
+    const uint64_t skip = q.offset.value_or(0);
+    if (skip > std::numeric_limits<uint64_t>::max() - *q.limit) return std::nullopt;
+    return skip + *q.limit;
+}
+
+/**
+ * @brief Applies the OFFSET/LIMIT page to a FINAL row set: drops the first offset rows, then caps the rest
+ *        at limit. Ordering and DISTINCT must already have been applied, since the page is defined over the
+ *        ordered, deduplicated result.
+ */
+template <typename Row>
+static void apply_page(std::vector<Row>& rows, const GqlQuery& q) {
+    const size_t skip = static_cast<size_t>(q.offset.value_or(0));
+    if (skip > 0) {
+        if (skip >= rows.size()) {
+            rows.clear();
+        } else {
+            rows.erase(rows.begin(), rows.begin() + static_cast<std::ptrdiff_t>(skip));
+        }
+    }
+    if (q.limit && rows.size() > static_cast<size_t>(*q.limit)) {
+        rows.resize(static_cast<size_t>(*q.limit));
+    }
+}
 
 /**
  * @brief Sorts the combined query results according to GQL ORDER BY specification.
  * @param res The QueryResult containing column names and rows.
  * @param order_by The sorting specifications.
- * @param limit Optional limit constraint to restrict result size.
+ * @param limit Optional limit constraint to restrict result size. Pass the page window (offset + limit),
+ *        not the bare limit, when an OFFSET follows -- the sort prunes, and the skipped rows are needed.
  */
 static void sort_combined_result(QueryResult& res, const std::vector<SortSpec>& order_by, std::optional<size_t> limit = std::nullopt) {
     if (order_by.empty()) return;
-    
+
     auto comp = [&res, &order_by](const std::vector<GqlValue>& a, const std::vector<GqlValue>& b) {
         for (const auto& spec : order_by) {
             size_t col_idx = res.column_names.size();
@@ -227,6 +265,7 @@ static bool try_plan_simple_node_count(const GqlQuery& q, SimpleNodeCountPlan& o
     if (q.has_unnested_subquery) return false;
     if (q.distinct) return false;
     if (q.limit.has_value()) return false;
+    if (q.offset.has_value()) return false;   // this plan emits the count row directly; nothing pages it
     if (!q.order_by.empty()) return false;
     if (q.matches.size() != 1) return false;
     if (q.returns.size() != 1) return false;
@@ -677,6 +716,7 @@ static seastar::future<QueryResult> run_streaming_edge_aggregate(
             rows.push_back(std::move(gr));
         }
 
+        const auto window = page_window(query);
         if (!query.order_by.empty()) {
             auto comp = [&query](const GroupRow& a, const GroupRow& b) {
                 for (size_t i = 0; i < query.order_by.size(); ++i) {
@@ -685,15 +725,17 @@ static seastar::future<QueryResult> run_streaming_edge_aggregate(
                 }
                 return false;
             };
-            if (query.limit && *query.limit < rows.size()) {
-                std::partial_sort(rows.begin(), rows.begin() + *query.limit, rows.end(), comp);
-                rows.resize(*query.limit);
+            if (window && *window < rows.size()) {
+                std::partial_sort(rows.begin(), rows.begin() + static_cast<std::ptrdiff_t>(*window), rows.end(), comp);
+                rows.resize(static_cast<size_t>(*window));
             } else {
                 std::stable_sort(rows.begin(), rows.end(), comp);
             }
-        } else if (query.limit && *query.limit < rows.size()) {
-            rows.resize(*query.limit);
+        } else if (window && *window < rows.size()) {
+            rows.resize(static_cast<size_t>(*window));
         }
+        apply_page(rows, query);
+        result.is_paged = true;
 
         for (auto& gr : rows) result.rows.push_back(std::move(gr.projected));
         return result;
@@ -806,7 +848,9 @@ static seastar::future<QueryResult> run_streaming_topk(
         size_t k = 0;
     };
     auto st = std::make_shared<TopKState>();
-    st->k = *query_ptr->limit;
+    // The heap must retain the whole page window (offset + limit): an OFFSET skips past the first rows of
+    // the ordered result, so keeping only `limit` of them would discard exactly what the page returns.
+    st->k = static_cast<size_t>(page_window(*query_ptr).value_or(*query_ptr->limit));
 
     // Orders entries by the ORDER BY specs; the heap is a max-heap under this comparator, so its
     // front is the current worst kept entry.
@@ -853,8 +897,10 @@ static seastar::future<QueryResult> run_streaming_topk(
         })
     .then([st, query_ptr, entry_less, rows_in, sink] {
         std::sort(st->heap.begin(), st->heap.end(), entry_less);
+        apply_page(st->heap, *query_ptr);
         QueryResult res;
         res.is_sorted = true;
+        res.is_paged = true;
         for (size_t i = 0; i < query_ptr->returns.size(); ++i) {
             res.column_names.push_back(return_item_column_name(query_ptr->returns[i], i));
         }
@@ -1030,6 +1076,7 @@ static seastar::future<QueryResult> run_streaming_group_fold(
             rows.push_back(std::move(gr));
         }
 
+        const auto window = page_window(query);
         if (!query.order_by.empty()) {
             auto comp = [&query](const GroupRow& a, const GroupRow& b) {
                 for (size_t i = 0; i < query.order_by.size(); ++i) {
@@ -1038,15 +1085,17 @@ static seastar::future<QueryResult> run_streaming_group_fold(
                 }
                 return false;
             };
-            if (query.limit && *query.limit < rows.size()) {
-                std::partial_sort(rows.begin(), rows.begin() + static_cast<std::ptrdiff_t>(*query.limit), rows.end(), comp);
-                rows.resize(*query.limit);
+            if (window && *window < rows.size()) {
+                std::partial_sort(rows.begin(), rows.begin() + static_cast<std::ptrdiff_t>(*window), rows.end(), comp);
+                rows.resize(static_cast<size_t>(*window));
             } else {
                 std::stable_sort(rows.begin(), rows.end(), comp);
             }
-        } else if (query.limit && *query.limit < rows.size()) {
-            rows.resize(*query.limit);
+        } else if (window && *window < rows.size()) {
+            rows.resize(static_cast<size_t>(*window));
         }
+        apply_page(rows, query);
+        result.is_paged = true;
 
         for (auto& gr : rows) result.rows.push_back(std::move(gr.projected));
         return result;
@@ -1244,7 +1293,12 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
     size_t limit_val = 0;
     if (query_ptr->limit.has_value() && query_ptr->order_by.empty() &&
         !query_contains_aggregates && !has_post_scan_residual_predicate(*query_ptr)) {
-        limit_val = *query_ptr->limit;
+        // Scan the whole page window: with an OFFSET, scanning only `limit` rows would stop short of the
+        // rows the page actually returns.
+        const auto window = page_window(*query_ptr);
+        if (window) {
+            limit_val = static_cast<size_t>(*window);
+        }
     }
 
     // 3. Build ProjectionPruner to avoid reading properties that are never accessed
@@ -1942,9 +1996,10 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
                     return false;
                 };
                 
-                if (query.limit && *query.limit < sorted_groups.size()) {
-                    std::partial_sort(sorted_groups.begin(), sorted_groups.begin() + *query.limit, sorted_groups.end(), comp);
-                    sorted_groups.resize(*query.limit);
+                const auto window = page_window(query);
+                if (window && *window < sorted_groups.size()) {
+                    std::partial_sort(sorted_groups.begin(), sorted_groups.begin() + static_cast<std::ptrdiff_t>(*window), sorted_groups.end(), comp);
+                    sorted_groups.resize(static_cast<size_t>(*window));
                 } else {
                     std::stable_sort(sorted_groups.begin(), sorted_groups.end(), comp);
                 }
@@ -1995,9 +2050,10 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
                     return false;
                 };
 
-                if (query.limit && *query.limit < sorted_keys.size()) {
-                    std::partial_sort(sorted_keys.begin(), sorted_keys.begin() + *query.limit, sorted_keys.end(), comp);
-                    sorted_keys.resize(*query.limit);
+                const auto window = page_window(query);
+                if (window && *window < sorted_keys.size()) {
+                    std::partial_sort(sorted_keys.begin(), sorted_keys.begin() + static_cast<std::ptrdiff_t>(*window), sorted_keys.end(), comp);
+                    sorted_keys.resize(static_cast<size_t>(*window));
                 } else {
                     std::stable_sort(sorted_keys.begin(), sorted_keys.end(), comp);
                 }
@@ -2015,11 +2071,12 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
                         node->time_ms = std::chrono::duration<double, std::milli>(sort_end - sort_start).count();
                     }
                 }
-            } else if (query.limit && !query.distinct && *query.limit < filtered_rows.size()) {
+            } else if (page_window(query) && !query.distinct && *page_window(query) < filtered_rows.size()) {
                 // DISTINCT collapses rows during projection, so the raw matched rows cannot be
-                // truncated to the LIMIT here; the post-dedup resize below enforces it instead.
+                // truncated to the LIMIT here; the post-dedup resize below enforces it instead. The cut is
+                // to offset+limit, not limit: an OFFSET skips past rows that are still needed.
                 auto limit_start = std::chrono::steady_clock::now();
-                filtered_rows.resize(*query.limit);
+                filtered_rows.resize(static_cast<size_t>(*page_window(query)));
                 if (query_ptr->profile) {
                     auto limit_end = std::chrono::steady_clock::now();
                     auto node = query_ptr->plan_nodes["limit"];
@@ -2068,9 +2125,8 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
             }
         }
 
-        if (query.limit && query_res.rows.size() > *query.limit) {
-            query_res.rows.resize(*query.limit);
-        }
+        apply_page(query_res.rows, query);
+        query_res.is_paged = true;
 
         return seastar::make_ready_future<QueryResult>(std::move(query_res));
     });
@@ -2209,12 +2265,17 @@ seastar::future<std::string> GqlExecutor::execute(ragedb::Graph& graph, GqlQuery
 
         const auto& query = *query_ptr;
 
-        if (!query.order_by.empty() && !result.is_sorted) {
-            sort_combined_result(result, query.order_by, query.limit);
-        }
-
-        if (query.limit && result.rows.size() > *query.limit) {
-            result.rows.resize(*query.limit);
+        // Set operations combine un-paged branch results, so the page applies to the combination here.
+        // Every other path already paged its own rows and must not be paged a second time.
+        if (!result.is_paged) {
+            if (!query.order_by.empty() && !result.is_sorted) {
+                // Sort down to the page window, not the bare limit: the OFFSET skips past rows the sort
+                // would otherwise have pruned away.
+                const auto window = page_window(query);
+                sort_combined_result(result, query.order_by,
+                                     window ? std::optional<size_t>(static_cast<size_t>(*window)) : std::nullopt);
+            }
+            apply_page(result.rows, query);
         }
 
         std::string json_res = "[";

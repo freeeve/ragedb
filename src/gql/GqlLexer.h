@@ -54,6 +54,7 @@ enum class TokenType {
     DISTINCT,
     ORDER_BY,
     LIMIT,
+    OFFSET,
     ASC,
     DESC,
     INSERT,

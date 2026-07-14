@@ -572,6 +572,7 @@ struct GqlQuery {
     bool distinct = false;                   ///< True if distinct results are required.
     std::vector<SortSpec> order_by;          ///< Sequence of sort specifications.
     std::optional<uint64_t> limit;           ///< Optional maximum number of rows to return.
+    std::optional<uint64_t> offset;          ///< Optional rows to skip before the limit (ISO GQL OFFSET).
 
     /// WITH-pipeline prefix segments. Each entry is a sub-query (matches + WHERE + WITH projection +
     /// ORDER BY/LIMIT/DISTINCT) whose projected rows feed forward as input bindings to the next
@@ -633,6 +634,7 @@ struct GqlQuery {
         }
         
         copy.limit = limit;
+        copy.offset = offset;
         copy.with_segments.reserve(with_segments.size());
         for (const auto& seg : with_segments) {
             copy.with_segments.push_back(std::make_shared<GqlQuery>(seg->clone()));

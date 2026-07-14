@@ -247,6 +247,9 @@ static bool try_plan_simple_node_count(const GqlQuery& q, SimpleNodeCountPlan& o
 
     const auto& node = m.pattern.nodes[0];
     if (node.where_expr) return false;
+    // A property map value that is an expression is only known once it is resolved against the incoming
+    // row, which this plan bypasses; counting through it would silently ignore the constraint.
+    if (!node.property_exprs.empty()) return false;
 
     // The count target must be count(*) or count(<the pattern node's variable>). For a single
     // non-optional node every matched row binds a distinct node, so count(n) == row count.
@@ -341,6 +344,13 @@ static bool plan_streaming_edge_aggregate(const GqlQuery& q, EdgeAggPlan& out) {
     if (!edge.properties.empty() || !edge.property_filters.empty()) return false;
     if (!edge.label_expr || edge.label_expr->kind != LabelExprKind::LITERAL) return false;
     out.rel_type = edge.label_expr->name;
+
+    // Property map values that are expressions are only known once resolved against the incoming row,
+    // which this plan bypasses; planning through them would silently drop the constraint.
+    for (const auto& n : m.pattern.nodes) {
+        if (!n.property_exprs.empty()) return false;
+    }
+    if (!edge.property_exprs.empty()) return false;
 
     for (const auto& item : q.returns) find_aggregates(item.expr.get(), out.aggs);
     for (const auto& spec : q.order_by) find_aggregates(spec.expr.get(), out.aggs);
@@ -1296,6 +1306,10 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
                 for (const auto& [prop, val] : n.properties) {
                     pruner.accessed_props[n.variable].insert(prop);
                 }
+                for (const auto& [prop, expr] : n.property_exprs) {
+                    pruner.accessed_props[n.variable].insert(prop);
+                    collect_accessed_properties(expr.get(), pruner.accessed_props, pruner.whole_objects);
+                }
                 for (const auto& filter : n.property_filters) {
                     pruner.accessed_props[n.variable].insert(filter.property);
                 }
@@ -1305,6 +1319,10 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
             if (!e.variable.empty()) {
                 for (const auto& [prop, val] : e.properties) {
                     pruner.accessed_props[e.variable].insert(prop);
+                }
+                for (const auto& [prop, expr] : e.property_exprs) {
+                    pruner.accessed_props[e.variable].insert(prop);
+                    collect_accessed_properties(expr.get(), pruner.accessed_props, pruner.whole_objects);
                 }
                 for (const auto& filter : e.property_filters) {
                     pruner.accessed_props[e.variable].insert(filter.property);

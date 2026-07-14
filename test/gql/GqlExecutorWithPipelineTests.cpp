@@ -538,3 +538,56 @@ TEST_CASE("cost-based reorder runs the cheap match first (task 035)", "[gql_exec
 
     graph.Stop().get();
 }
+
+/*
+ * A property map value is a general value expression in ISO GQL, not only a literal, so a binding
+ * carried in from an earlier segment is legal there. It used to be rejected outright ("Expected literal
+ * value for property map"), which forced the FILTER spelling of the same predicate (task 040).
+ */
+TEST_CASE("property map accepts a value expression, not only a literal (task 040)", "[gql_executor_with][task040]") {
+    auto graph = Graph("gql_property_map_expr_test");
+    graph.Start().get();
+    populate_with_pipeline_graph(graph);
+
+    auto run = [&graph](const std::string& query_str) {
+        auto query = GqlParser::parse(query_str);
+        GqlOptimizer::optimize(query);
+        return GqlExecutor::execute(graph, std::move(query)).get();
+    };
+
+    SECTION("a NEXT-piped binding resolves inside the property map") {
+        std::string res = run(
+            "MATCH (p:Person) FILTER p.name = 'Alice' RETURN p.name AS n "
+            "NEXT MATCH (q:Person {name: n}) RETURN q.name AS qn");
+        INFO("result: " << res);
+        REQUIRE(res.find("\"qn\": \"Alice\"") != std::string::npos);
+        REQUIRE(res.find("Bob") == std::string::npos);
+    }
+
+    SECTION("the property map and FILTER spellings of the same predicate agree") {
+        std::string mapped = run(
+            "MATCH (p:Person) FILTER p.name = 'Alice' RETURN p.name AS n "
+            "NEXT MATCH (q:Person {name: n}) RETURN q.name AS qn");
+        std::string filtered = run(
+            "MATCH (p:Person) FILTER p.name = 'Alice' RETURN p.name AS n "
+            "NEXT MATCH (q:Person) FILTER q.name = n RETURN q.name AS qn");
+        REQUIRE(mapped == filtered);
+    }
+
+    SECTION("a piped binding constrains an expansion, not just a bare node") {
+        // Alice's KNOWS triangle: Bob and Carol, and none of the disjoint Dave/Erin/Frank triangle.
+        std::string res = run(
+            "MATCH (p:Person) FILTER p.name = 'Alice' RETURN p.name AS n "
+            "NEXT MATCH (a:Person {name: n})-[:KNOWS]-(f:Person) RETURN count(f) AS friends");
+        INFO("result: " << res);
+        REQUIRE(res.find("\"friends\": 2") != std::string::npos);
+    }
+
+    SECTION("a literal property map still resolves") {
+        std::string res = run("MATCH (p:Person {name: 'Bob'}) RETURN p.name AS n");
+        REQUIRE(res.find("\"n\": \"Bob\"") != std::string::npos);
+        REQUIRE(res.find("Alice") == std::string::npos);
+    }
+
+    graph.Stop().get();
+}

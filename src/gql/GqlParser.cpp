@@ -1014,7 +1014,7 @@ void GqlParser::parse_edge_details(PatternEdge& edge) {
         }
     }
     if (check(TokenType::LBRACE)) {
-        edge.properties = parse_properties();
+        edge.properties = parse_properties(&edge.property_exprs);
     }
     if (match(TokenType::WHERE)) {
         edge.where_expr = parse_expression();
@@ -1241,7 +1241,7 @@ PatternNode GqlParser::parse_node_pattern() {
         node.label_expr = parse_label_expression();
     }
     if (check(TokenType::LBRACE)) {
-        node.properties = parse_properties();
+        node.properties = parse_properties(&node.property_exprs);
     }
     if (match(TokenType::WHERE)) {
         node.where_expr = parse_expression();
@@ -1256,7 +1256,8 @@ PatternNode GqlParser::parse_node_pattern() {
  * 
  * @return std::map<std::string, property_type_t> The map of parsed keys to typed literal values.
  */
-std::map<std::string, property_type_t> GqlParser::parse_properties() {
+std::map<std::string, property_type_t> GqlParser::parse_properties(
+        std::map<std::string, std::shared_ptr<Expression>>* property_exprs) {
     std::map<std::string, property_type_t> props;
     consume(TokenType::LBRACE, "Expected '{' to start property map");
     if (!check(TokenType::RBRACE)) {
@@ -1273,22 +1274,27 @@ std::map<std::string, property_type_t> GqlParser::parse_properties() {
             } else if (check(TokenType::FLOAT_LIT)) {
                 value = is_negative ? -peek().float_value : peek().float_value;
                 advance();
-            } else {
+            } else if (!is_negative && match(TokenType::TRUE_KW)) {
+                value = true;
+            } else if (!is_negative && match(TokenType::FALSE_KW)) {
+                value = false;
+            } else if (!is_negative && match(TokenType::NULL_KW)) {
+                value = std::monostate{};
+            } else if (!is_negative && check(TokenType::STRING_LIT)) {
+                value = peek().text;
+                advance();
+            } else if (property_exprs) {
+                // A property map value is a general value expression, not only a literal: a variable
+                // bound by an earlier segment, a LET binding or any computed expression is legal here
+                // and is resolved against the current row before the node is looked up. Step back over
+                // a consumed '-' so the expression parser sees the whole term.
                 if (is_negative) {
-                    throw std::runtime_error("Expected numeric literal after '-' in property map");
+                    --pos;
                 }
-                if (match(TokenType::TRUE_KW)) {
-                    value = true;
-                } else if (match(TokenType::FALSE_KW)) {
-                    value = false;
-                } else if (match(TokenType::NULL_KW)) {
-                    value = std::monostate{};
-                } else if (check(TokenType::STRING_LIT)) {
-                    value = peek().text;
-                    advance();
-                } else {
-                    throw std::runtime_error("Expected literal value for property map");
-                }
+                (*property_exprs)[key] = parse_expression();
+                continue;
+            } else {
+                throw std::runtime_error("Expected literal value for property map");
             }
 
             props[key] = value;

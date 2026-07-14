@@ -337,10 +337,33 @@ seastar::future<IntermediateResult> execute_match_chain_factorized(
             break;
         }
     }
-    for (const auto& edge : stmt.pattern.edges) {
-        if (!edge.variable.empty() && incoming_vars.count(edge.variable)) {
-            has_shared = true;
-            break;
+    if (!has_shared) {
+        for (const auto& edge : stmt.pattern.edges) {
+            if (!edge.variable.empty() && incoming_vars.count(edge.variable)) {
+                has_shared = true;
+                break;
+            }
+        }
+    }
+
+    // A property map value that is an expression is resolved against the incoming row, so a statement
+    // carrying one is never independent of those rows even when it shares no pattern variable with them:
+    // running it standalone would evaluate the expression against an empty row and match nothing. Drive
+    // it per row instead.
+    if (!has_shared) {
+        for (const auto& node : stmt.pattern.nodes) {
+            if (!node.property_exprs.empty()) {
+                has_shared = true;
+                break;
+            }
+        }
+    }
+    if (!has_shared) {
+        for (const auto& edge : stmt.pattern.edges) {
+            if (!edge.property_exprs.empty()) {
+                has_shared = true;
+                break;
+            }
         }
     }
 

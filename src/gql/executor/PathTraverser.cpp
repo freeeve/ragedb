@@ -1108,8 +1108,33 @@ static seastar::future<std::vector<GqlRow>> traverse_from_relationship_index(
      });
 }
 
+/**
+ * @brief Resolves a pattern's non-literal property map values -- a variable bound by an earlier segment,
+ *        a LET binding, any computed expression -- against the given row, yielding a pattern whose
+ *        property maps are ordinary literals. Everything downstream (the indexed start-node lookup, the
+ *        property matchers, the fast-path guards) then needs no special case for them.
+ */
+static PathPattern bind_property_exprs(const PathPattern& pattern, const GqlRow& row) {
+    if (pattern.nodes.empty() && pattern.edges.empty()) {
+        return pattern;
+    }
+    PathPattern bound = pattern;
+    for (auto& node : bound.nodes) {
+        for (const auto& [prop, expr] : node.property_exprs) {
+            node.properties[prop] = evaluate_expression(row, expr.get()).property;
+        }
+    }
+    for (auto& edge : bound.edges) {
+        for (const auto& [prop, expr] : edge.property_exprs) {
+            edge.properties[prop] = evaluate_expression(row, expr.get()).property;
+        }
+    }
+    return bound;
+}
+
 seastar::future<std::vector<GqlRow>> traverse_path_pattern(ragedb::Graph& graph, const PathPattern& pattern, const GqlRow& base_row, size_t limit, const ProjectionPruner& pruner, std::string sort_property, bool sort_ascending, bool sort_by_id, PathMode path_mode, GqlRowSink* sink) {
-    PathPattern prep_pattern = pattern;
+    PathPattern prep_pattern = bind_property_exprs(pattern, base_row);
+
     for (size_t j = 0; j < prep_pattern.nodes.size(); ++j) {
         if (prep_pattern.nodes[j].variable.empty()) {
             prep_pattern.nodes[j].variable = "_n_" + std::to_string(j) + "_user_empty";
@@ -1315,7 +1340,14 @@ static seastar::future<int64_t> propagate_path_counts(
     });
 }
 
-seastar::future<std::vector<GqlRow>> traverse_match_statement(ragedb::Graph& graph, const MatchStatement& stmt, const GqlRow& row, size_t limit, const ProjectionPruner& pruner, std::string sort_property, bool sort_ascending, bool sort_by_id) {
+seastar::future<std::vector<GqlRow>> traverse_match_statement(ragedb::Graph& graph, const MatchStatement& stmt_in, const GqlRow& row, size_t limit, const ProjectionPruner& pruner, std::string sort_property, bool sort_ascending, bool sort_by_id) {
+    // Resolve any non-literal property map values against the incoming row up front, so every path
+    // below -- the k-hop and shortest-path searches as well as the general traversal -- sees ordinary
+    // literal property maps and needs no special case for them.
+    MatchStatement bound_stmt = stmt_in;
+    bound_stmt.pattern = bind_property_exprs(stmt_in.pattern, row);
+    const MatchStatement& stmt = bound_stmt;
+
     // Case 0.25: Algebraic Path Count Traversal.
     if (stmt.algebraic_path_count) {
         // Resolve start nodes candidate set.

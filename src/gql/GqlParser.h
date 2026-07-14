@@ -48,7 +48,11 @@ private:
     MatchStatement parse_match();
     PathPattern parse_path_pattern();
     PatternNode parse_node_pattern();
-    std::map<std::string, property_type_t> parse_properties();
+    /// Parses a property map. Literal values are returned directly; when property_exprs is provided,
+    /// a non-literal value (a bound variable, a LET binding, any computed expression) is parsed into it
+    /// instead of being rejected.
+    std::map<std::string, property_type_t> parse_properties(
+        std::map<std::string, std::shared_ptr<Expression>>* property_exprs = nullptr);
     void parse_edge_details(PatternEdge& edge);
     std::shared_ptr<LabelExpression> parse_label_expression();
     std::shared_ptr<LabelExpression> parse_label_or();

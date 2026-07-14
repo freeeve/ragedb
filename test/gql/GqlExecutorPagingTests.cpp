@@ -19,6 +19,7 @@
 #include "../../src/gql/GqlParser.h"
 #include "../../src/gql/GqlOptimizer.h"
 #include "../../src/gql/GqlExecutor.h"
+#include "../../src/gql/executor/PathTraverser.h"
 
 using namespace ragedb;
 using namespace ragedb::gql;
@@ -96,6 +97,80 @@ TEST_CASE("the default path mode is WALK, not TRAIL (task 047)", "[gql_executor_
         REQUIRE(res.find("\"n\": 1") != std::string::npos);
     }
 
+    graph.Stop().get();
+}
+
+/*
+ * An unbounded quantifier ({n,} or *) under WALK has no finite result on cyclic data -- a walk may
+ * re-cross an edge -- so the traversal must fail loudly rather than exhaust the heap. Two guards, each
+ * applying ONLY to that case: a depth cap for a low-branching cycle, and a path-count budget for an
+ * exponential blow-up. A bounded quantifier and a restrictor are already finite and must be unaffected.
+ */
+TEST_CASE("an unbounded WALK on cyclic data fails loudly instead of diverging", "[gql_executor_paging][gql_walk_unbounded]") {
+    auto graph = Graph("gql_walk_unbounded");
+    graph.Start().get();
+    graph.Clear();
+    graph.shard.local().NodeTypeInsertPeered("Person").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "name", "string").get();
+    graph.shard.local().RelationshipTypeInsertPeered("KNOWS").get();
+
+    // A ring: every node knows the next, and the last closes back to the first -- so every node is on a
+    // cycle and an unbounded walk never terminates.
+    std::vector<uint64_t> ids;
+    for (int i = 0; i < 5; ++i) {
+        ids.push_back(graph.shard.local().NodeAddPeered("Person", "p" + std::to_string(i),
+            "{\"name\": \"P" + std::to_string(i) + "\"}").get());
+    }
+    for (int i = 0; i < 5; ++i) {
+        graph.shard.local().RelationshipAddPeered("KNOWS", ids[i], ids[(i + 1) % 5], "{}").get();
+    }
+
+    auto run = [&graph](const std::string& q) {
+        auto query = GqlParser::parse(q);
+        GqlOptimizer::optimize(query);
+        return GqlExecutor::execute(graph, std::move(query)).get();
+    };
+
+    const uint64_t saved_depth = gql_var_len_walk_depth_cap;
+    const uint64_t saved_budget = gql_var_len_walk_path_budget;
+
+    SECTION("the depth cap stops a low-branching cycle") {
+        gql_var_len_walk_depth_cap = 8;
+        gql_var_len_walk_path_budget = saved_budget;
+        try {
+            REQUIRE_THROWS_WITH(
+                run("MATCH (a:Person)-[:KNOWS]->{1,}(b:Person) FILTER a.name = 'P0' RETURN count(*) AS n"),
+                Catch::Contains("unbounded quantifier"));
+        } catch (...) { gql_var_len_walk_depth_cap = saved_depth; gql_var_len_walk_path_budget = saved_budget; throw; }
+        gql_var_len_walk_depth_cap = saved_depth;
+    }
+
+    SECTION("the path budget stops an exponential blow-up before the depth cap") {
+        gql_var_len_walk_depth_cap = saved_depth;   // high, so the budget is what trips
+        gql_var_len_walk_path_budget = 50;
+        try {
+            REQUIRE_THROWS_WITH(
+                run("MATCH (a:Person)-[:KNOWS]-{1,}(b:Person) FILTER a.name = 'P0' RETURN count(*) AS n"),
+                Catch::Contains("unbounded quantifier"));
+        } catch (...) { gql_var_len_walk_depth_cap = saved_depth; gql_var_len_walk_path_budget = saved_budget; throw; }
+        gql_var_len_walk_path_budget = saved_budget;
+    }
+
+    SECTION("a bounded quantifier and a restrictor are unaffected by the guards") {
+        // Both guards shrunk to tiny values: a bounded {1,3} and an unbounded TRAIL must still complete,
+        // because neither is the divergent case the guards target.
+        gql_var_len_walk_depth_cap = 3;
+        gql_var_len_walk_path_budget = 5;
+        try {
+            REQUIRE_NOTHROW(run("MATCH (a:Person)-[:KNOWS]->{1,3}(b:Person) FILTER a.name = 'P0' RETURN count(*) AS n"));
+            REQUIRE_NOTHROW(run("MATCH TRAIL (a:Person)-[:KNOWS]->{1,}(b:Person) FILTER a.name = 'P0' RETURN count(*) AS n"));
+        } catch (...) { gql_var_len_walk_depth_cap = saved_depth; gql_var_len_walk_path_budget = saved_budget; throw; }
+        gql_var_len_walk_depth_cap = saved_depth;
+        gql_var_len_walk_path_budget = saved_budget;
+    }
+
+    gql_var_len_walk_depth_cap = saved_depth;
+    gql_var_len_walk_path_budget = saved_budget;
     graph.Stop().get();
 }
 

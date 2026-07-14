@@ -85,6 +85,19 @@ inline size_t gql_var_len_branch_concurrency = 16;
 // are held before the consumer folds them away.
 inline size_t gql_var_len_hop_batch = 1024;
 
+// Two guards for an UNBOUNDED var-length pattern ({n,} or *) under the WALK path mode, which has no finite
+// result on cyclic data (a walk may re-cross an edge). Both apply ONLY to that case -- a bounded quantifier
+// is stopped by its own upper bound, and a restrictor (TRAIL / ACYCLIC / SIMPLE) makes the path set finite,
+// so neither guard touches them. Tests shrink these to force the limits.
+//
+//  - depth cap: catches a low-branching cycle (e.g. a 2-node ring walking A-B-A-B...), which recurses
+//    forever at ~one path per depth without exploding in count.
+inline uint64_t gql_var_len_walk_depth_cap = 100;
+//  - path budget: catches an exponential blow-up (a dense/clique-like cycle), where the path COUNT
+//    explodes at shallow depths and would exhaust the heap long before the depth cap. Bounds the total
+//    paths recorded across the whole expansion.
+inline uint64_t gql_var_len_walk_path_budget = 5'000'000;
+
 /**
  * @brief Consumer for streamed traversal output: when passed to traverse_path_pattern, matched
  *        rows are handed to consume() in bounded batches instead of being collected and returned

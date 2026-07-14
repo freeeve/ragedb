@@ -27,6 +27,7 @@
 #include <unordered_set>
 #include <iterator>
 #include <numeric>
+#include <limits>
 
 /**
  * @file PathTraverser.cpp
@@ -346,11 +347,23 @@ static seastar::future<std::vector<PathHop>> traverse_var_len_async(
     size_t limit,
     const ProjectionPruner& pruner,
     PathMode path_mode,
-    PathHopSink* hop_sink = nullptr
+    PathHopSink* hop_sink = nullptr,
+    std::shared_ptr<uint64_t> walk_path_count = nullptr
 ) {
     // Base Case 1: Exceeded maximum hops allowed
     if (current_depth > edge.max_hops) {
         return seastar::make_ready_future<std::vector<PathHop>>();
+    }
+
+    // walk_path_count is non-null only for an unbounded quantifier under WALK -- the case with no finite
+    // result on cyclic data. Fail loudly at the depth cap (catches a low-branching cycle) rather than
+    // diverge. The path-count budget below catches the exponential case.
+    if (walk_path_count && current_depth > gql_var_len_walk_depth_cap) {
+        return seastar::make_exception_future<std::vector<PathHop>>(std::runtime_error(
+            "An unbounded quantifier under the WALK path mode did not terminate within " +
+            std::to_string(gql_var_len_walk_depth_cap) +
+            " hops -- a walk may re-cross an edge on cyclic data, so the result is unbounded. Give the "
+            "quantifier an upper bound, or restrict the paths (TRAIL / ACYCLIC / SIMPLE)."));
     }
 
     // Base Case 2: Within allowed hop range, record the current path. With a sink the finished path is
@@ -358,6 +371,17 @@ static seastar::future<std::vector<PathHop>> traverse_var_len_async(
     std::vector<PathHop> local_results;
     seastar::future<> recorded = seastar::make_ready_future<>();
     if (current_depth >= edge.min_hops) {
+        // An unbounded WALK on a dense/clique-like cycle explodes exponentially at shallow depths, well
+        // before the depth cap; bound the total paths recorded so it fails loudly instead of exhausting
+        // the heap. Counted here because this is the one place a path is finalised, on both the
+        // materialising and the streaming route.
+        if (walk_path_count && ++(*walk_path_count) > gql_var_len_walk_path_budget) {
+            return seastar::make_exception_future<std::vector<PathHop>>(std::runtime_error(
+                "An unbounded quantifier under the WALK path mode produced more than " +
+                std::to_string(gql_var_len_walk_path_budget) +
+                " paths -- a walk may re-cross an edge on cyclic data, so the result is unbounded. Give "
+                "the quantifier an upper bound, or restrict the paths (TRAIL / ACYCLIC / SIMPLE)."));
+        }
         if (hop_sink) {
             recorded = hop_sink->add(PathHop{current_path_rels, current_path_nodes});
         } else {
@@ -385,7 +409,7 @@ static seastar::future<std::vector<PathHop>> traverse_var_len_async(
     // Callback to process retrieved relationships on the current node
     auto handle_rels = [&graph, edge, next_node, current_node_id, current_depth, visited_rel_ids = std::move(visited_rel_ids),
            current_path_rels = std::move(current_path_rels), current_path_nodes = std::move(current_path_nodes),
-           local_results = std::move(local_results), limit, pruner, path_mode, hop_sink](std::vector<Relationship> rels) mutable {
+           local_results = std::move(local_results), limit, pruner, path_mode, hop_sink, walk_path_count](std::vector<Relationship> rels) mutable {
 
         if (pruner.should_prune(edge.variable)) {
             auto keys = pruner.get_keys(edge.variable);
@@ -466,13 +490,13 @@ static seastar::future<std::vector<PathHop>> traverse_var_len_async(
 
         return seastar::max_concurrent_for_each(indices->begin(), indices->end(), branch_concurrency,
         [&graph, branches, branch_results, edge, next_node, current_node_id, current_depth, visited_rel_ids,
-         current_path_rels, current_path_nodes, limit, pruner, path_mode, hop_sink](size_t branch_idx) {
+         current_path_rels, current_path_nodes, limit, pruner, path_mode, hop_sink, walk_path_count](size_t branch_idx) {
             const Relationship& rel = (*branches)[branch_idx];
             uint64_t target_id = (rel.getStartingNodeId() == current_node_id) ? rel.getEndingNodeId() : rel.getStartingNodeId();
 
             return graph.shard.local().NodeGetPeered(target_id)
             .then([&graph, branch_idx, branch_results, rel, edge, next_node, current_depth, visited_rel_ids,
-                   current_path_rels, current_path_nodes, target_id, limit, pruner, path_mode, hop_sink](Node target_node) mutable {
+                   current_path_rels, current_path_nodes, target_id, limit, pruner, path_mode, hop_sink, walk_path_count](Node target_node) mutable {
                 if (pruner.should_prune(next_node.variable)) {
                     target_node.pruneProperties(pruner.get_keys(next_node.variable));
                 }
@@ -485,7 +509,7 @@ static seastar::future<std::vector<PathHop>> traverse_var_len_async(
                                 visited_rel_ids = std::move(visited_rel_ids),
                                 current_path_rels = std::move(current_path_rels),
                                 current_path_nodes = std::move(current_path_nodes),
-                                limit, pruner, path_mode, hop_sink]() mutable {
+                                limit, pruner, path_mode, hop_sink, walk_path_count]() mutable {
                     return traverse_var_len_async(
                         graph,
                         target_id,
@@ -498,7 +522,8 @@ static seastar::future<std::vector<PathHop>> traverse_var_len_async(
                         limit,
                         pruner,
                         path_mode,
-                        hop_sink
+                        hop_sink,
+                        walk_path_count
                     );
                 };
 
@@ -591,7 +616,13 @@ static seastar::future<std::vector<GqlRow>> traverse_step(ragedb::Graph& graph, 
     uint64_t src_id = it->second.node->getId();
 
     if (edge.is_variable_length) {
-        return traverse_var_len_async(graph, src_id, edge, next_node, 0, {}, {}, {}, limit, pruner, path_mode)
+        // A counter guards only the divergent case -- unbounded quantifier under WALK; null disables the
+        // guard for bounded quantifiers and restrictors, which are already finite.
+        auto walk_path_count = (path_mode == PathMode::WALK &&
+                                edge.max_hops == std::numeric_limits<uint64_t>::max())
+            ? std::make_shared<uint64_t>(0) : nullptr;
+        return traverse_var_len_async(graph, src_id, edge, next_node, 0, {}, {}, {}, limit, pruner, path_mode,
+                                      nullptr, walk_path_count)
         .then([row, edge, next_node, node_idx](std::vector<PathHop> hops) {
             return var_len_hops_to_rows(row, edge, next_node, node_idx, hops);
         });
@@ -819,7 +850,11 @@ static seastar::future<> traverse_var_len_step_to_sink(ragedb::Graph& graph, con
         return sink->consume(std::move(rows));
     };
 
-    return traverse_var_len_async(graph, src_id, edge, next_node, 0, {}, {}, {}, 0, pruner, path_mode, hop_sink.get())
+    auto walk_path_count = (path_mode == PathMode::WALK &&
+                            edge.max_hops == std::numeric_limits<uint64_t>::max())
+        ? std::make_shared<uint64_t>(0) : nullptr;
+    return traverse_var_len_async(graph, src_id, edge, next_node, 0, {}, {}, {}, 0, pruner, path_mode,
+                                  hop_sink.get(), walk_path_count)
     .then([hop_sink](std::vector<PathHop>) {
         return hop_sink->flush();
     });

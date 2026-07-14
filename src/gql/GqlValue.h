@@ -22,6 +22,7 @@
 #include <string>
 #include <variant>
 #include <vector>
+#include <functional>
 #include "../graph/Graph.h"
 #include "../graph/paths/Path.h"
 #include "GqlAst.h"
@@ -112,6 +113,14 @@ GqlValue evaluate_expression(const GqlRow& row, const Expression* expr);
  *        implement, so an unimplemented function cannot reach here and silently evaluate to NULL.
  */
 GqlValue evaluate_scalar_function(const GqlRow& row, const FunctionCallExpr* fc);
+
+/**
+ * @brief Applies a scalar function, evaluating each argument through eval_arg. The group evaluator passes
+ *        an eval_arg that resolves nested aggregates from its results map, so a scalar function wrapping an
+ *        aggregate -- cardinality(collect_list(x)) -- sees the aggregated value rather than a per-row NULL.
+ */
+GqlValue evaluate_scalar_function_with(const FunctionCallExpr* fc,
+                                       const std::function<GqlValue(const Expression*)>& eval_arg);
 
 /**
  * @brief Whether a (lower-cased) scalar function name is one the evaluator implements. Lives beside

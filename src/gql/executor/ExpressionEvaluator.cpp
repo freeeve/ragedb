@@ -173,8 +173,14 @@ GqlValue evaluate_group_expression(const GqlRow& representative, const std::map<
             return GqlValue();
         }
         case ExpressionKind::FUNCTION_CALL: {
-            // Scalar functions evaluate over the representative row's bindings (grouping keys).
-            return evaluate_scalar_function(representative, static_cast<const FunctionCallExpr*>(expr));
+            // Scalar functions evaluate over the representative row's grouping keys, but a nested aggregate
+            // argument must resolve from the results map rather than re-evaluate per row -- so
+            // cardinality(collect_list(x)) sees the whole list, not a per-row NULL.
+            return evaluate_scalar_function_with(
+                static_cast<const FunctionCallExpr*>(expr),
+                [&representative, &aggregate_results](const Expression* e) {
+                    return evaluate_group_expression(representative, aggregate_results, e);
+                });
         }
         case ExpressionKind::LIST_LITERAL: {
             auto* le = static_cast<const ListExpr*>(expr);

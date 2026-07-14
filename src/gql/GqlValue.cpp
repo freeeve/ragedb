@@ -296,11 +296,18 @@ std::string supported_scalar_function_list() {
 }
 
 GqlValue evaluate_scalar_function(const GqlRow& row, const FunctionCallExpr* fc) {
+    return evaluate_scalar_function_with(fc, [&row](const Expression* e) {
+        return evaluate_expression(row, e);
+    });
+}
+
+GqlValue evaluate_scalar_function_with(const FunctionCallExpr* fc,
+                                       const std::function<GqlValue(const Expression*)>& eval_arg) {
     if (!fc) return GqlValue();
     // length(path | relationship-list): number of relationships.
     if (fc->name == "length") {
         if (fc->args.size() != 1) return GqlValue();
-        GqlValue arg = evaluate_expression(row, fc->args[0].get());
+        GqlValue arg = eval_arg(fc->args[0].get());
         if (arg.type == GqlValue::PATH) {
             return GqlValue(static_cast<int64_t>(arg.path->length()));
         }
@@ -316,7 +323,7 @@ GqlValue evaluate_scalar_function(const GqlRow& row, const FunctionCallExpr* fc)
     if (fc->name == "zoned_datetime" || fc->name == "datetime" || fc->name == "date" ||
         fc->name == "localdatetime") {
         if (fc->args.size() != 1) return GqlValue();
-        GqlValue arg = evaluate_expression(row, fc->args[0].get());
+        GqlValue arg = eval_arg(fc->args[0].get());
         if (arg.type == GqlValue::PROPERTY && std::holds_alternative<std::string>(arg.property)) {
             std::string s = std::get<std::string>(arg.property);
             if (s.find('T') == std::string::npos) {
@@ -334,7 +341,7 @@ GqlValue evaluate_scalar_function(const GqlRow& row, const FunctionCallExpr* fc)
     // nodes(path) / relationships(path): the path's elements, as a LIST.
     if (fc->name == "nodes" || fc->name == "relationships") {
         if (fc->args.size() != 1) return GqlValue();
-        GqlValue arg = evaluate_expression(row, fc->args[0].get());
+        GqlValue arg = eval_arg(fc->args[0].get());
         if (arg.type != GqlValue::PATH) return GqlValue();
 
         auto items = std::make_shared<std::vector<GqlValue>>();
@@ -354,8 +361,8 @@ GqlValue evaluate_scalar_function(const GqlRow& row, const FunctionCallExpr* fc)
     // end yields the empty string rather than an error.
     if (fc->name == "substring") {
         if (fc->args.size() < 2 || fc->args.size() > 3) return GqlValue();
-        auto s = string_arg(evaluate_expression(row, fc->args[0].get()));
-        auto start = numeric_arg(evaluate_expression(row, fc->args[1].get()));
+        auto s = string_arg(eval_arg(fc->args[0].get()));
+        auto start = numeric_arg(eval_arg(fc->args[1].get()));
         if (!s || !start || *start < 0) return GqlValue();
 
         const size_t from = static_cast<size_t>(*start);
@@ -363,7 +370,7 @@ GqlValue evaluate_scalar_function(const GqlRow& row, const FunctionCallExpr* fc)
 
         size_t count = s->size() - from;
         if (fc->args.size() == 3) {
-            auto len = numeric_arg(evaluate_expression(row, fc->args[2].get()));
+            auto len = numeric_arg(eval_arg(fc->args[2].get()));
             if (!len || *len < 0) return GqlValue();
             count = std::min(count, static_cast<size_t>(*len));
         }
@@ -371,13 +378,13 @@ GqlValue evaluate_scalar_function(const GqlRow& row, const FunctionCallExpr* fc)
     }
     if (fc->name == "char_length" || fc->name == "character_length" || fc->name == "octet_length") {
         if (fc->args.size() != 1) return GqlValue();
-        auto s = string_arg(evaluate_expression(row, fc->args[0].get()));
+        auto s = string_arg(eval_arg(fc->args[0].get()));
         if (!s) return GqlValue();
         return GqlValue(static_cast<int64_t>(s->size()));
     }
     if (fc->name == "upper" || fc->name == "lower") {
         if (fc->args.size() != 1) return GqlValue();
-        auto s = string_arg(evaluate_expression(row, fc->args[0].get()));
+        auto s = string_arg(eval_arg(fc->args[0].get()));
         if (!s) return GqlValue();
         std::string out = *s;
         const bool up = (fc->name == "upper");
@@ -388,7 +395,7 @@ GqlValue evaluate_scalar_function(const GqlRow& row, const FunctionCallExpr* fc)
     }
     if (fc->name == "trim" || fc->name == "ltrim" || fc->name == "rtrim") {
         if (fc->args.size() != 1) return GqlValue();
-        auto s = string_arg(evaluate_expression(row, fc->args[0].get()));
+        auto s = string_arg(eval_arg(fc->args[0].get()));
         if (!s) return GqlValue();
         std::string out = *s;
         const auto is_space = [](unsigned char c) { return std::isspace(c) != 0; };
@@ -406,7 +413,7 @@ GqlValue evaluate_scalar_function(const GqlRow& row, const FunctionCallExpr* fc)
     // (a relationship list, a stored list property), the same view FOR expands.
     if (fc->name == "cardinality") {
         if (fc->args.size() != 1) return GqlValue();
-        const auto elements = as_list_elements(evaluate_expression(row, fc->args[0].get()));
+        const auto elements = as_list_elements(eval_arg(fc->args[0].get()));
         if (!elements) return GqlValue();
         return GqlValue(static_cast<int64_t>(elements->size()));
     }
@@ -414,7 +421,7 @@ GqlValue evaluate_scalar_function(const GqlRow& row, const FunctionCallExpr* fc)
     // ---- numeric -----------------------------------------------------------------------------------
     if (fc->name == "abs") {
         if (fc->args.size() != 1) return GqlValue();
-        GqlValue arg = evaluate_expression(row, fc->args[0].get());
+        GqlValue arg = eval_arg(fc->args[0].get());
         if (is_integer_arg(arg)) {
             const int64_t i = std::get<int64_t>(arg.property);
             return GqlValue(i < 0 ? -i : i);
@@ -425,7 +432,7 @@ GqlValue evaluate_scalar_function(const GqlRow& row, const FunctionCallExpr* fc)
     }
     if (fc->name == "ceil" || fc->name == "ceiling" || fc->name == "floor" || fc->name == "sqrt") {
         if (fc->args.size() != 1) return GqlValue();
-        auto d = numeric_arg(evaluate_expression(row, fc->args[0].get()));
+        auto d = numeric_arg(eval_arg(fc->args[0].get()));
         if (!d) return GqlValue();
         if (fc->name == "sqrt") {
             if (*d < 0.0) return GqlValue();   // no real root; NULL rather than NaN
@@ -435,15 +442,15 @@ GqlValue evaluate_scalar_function(const GqlRow& row, const FunctionCallExpr* fc)
     }
     if (fc->name == "power") {
         if (fc->args.size() != 2) return GqlValue();
-        auto base = numeric_arg(evaluate_expression(row, fc->args[0].get()));
-        auto exp = numeric_arg(evaluate_expression(row, fc->args[1].get()));
+        auto base = numeric_arg(eval_arg(fc->args[0].get()));
+        auto exp = numeric_arg(eval_arg(fc->args[1].get()));
         if (!base || !exp) return GqlValue();
         return GqlValue(std::pow(*base, *exp));
     }
     if (fc->name == "mod") {
         if (fc->args.size() != 2) return GqlValue();
-        GqlValue lhs = evaluate_expression(row, fc->args[0].get());
-        GqlValue rhs = evaluate_expression(row, fc->args[1].get());
+        GqlValue lhs = eval_arg(fc->args[0].get());
+        GqlValue rhs = eval_arg(fc->args[1].get());
         // Integer operands stay integral; a zero divisor is NULL rather than a trap.
         if (is_integer_arg(lhs) && is_integer_arg(rhs)) {
             const int64_t divisor = std::get<int64_t>(rhs.property);
@@ -460,7 +467,7 @@ GqlValue evaluate_scalar_function(const GqlRow& row, const FunctionCallExpr* fc)
     // coalesce(a, b, ...): the first argument that is not null.
     if (fc->name == "coalesce") {
         for (const auto& arg : fc->args) {
-            GqlValue v = evaluate_expression(row, arg.get());
+            GqlValue v = eval_arg(arg.get());
             const bool is_null = v.type == GqlValue::NIL ||
                                  (v.type == GqlValue::PROPERTY && std::holds_alternative<std::monostate>(v.property));
             if (!is_null) return v;
@@ -470,8 +477,8 @@ GqlValue evaluate_scalar_function(const GqlRow& row, const FunctionCallExpr* fc)
     // nullif(a, b): null when the two are equal, otherwise a.
     if (fc->name == "nullif") {
         if (fc->args.size() != 2) return GqlValue();
-        GqlValue a = evaluate_expression(row, fc->args[0].get());
-        GqlValue b = evaluate_expression(row, fc->args[1].get());
+        GqlValue a = eval_arg(fc->args[0].get());
+        GqlValue b = eval_arg(fc->args[1].get());
         if (compare_gql_values(a, b) == 0) return GqlValue();
         return a;
     }

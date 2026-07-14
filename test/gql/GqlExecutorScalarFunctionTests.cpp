@@ -91,6 +91,14 @@ TEST_CASE("scalar function library (task 046)", "[gql_executor_functions][task04
         std::string card = run("MATCH (p:Person) FILTER p.name = 'Bob' RETURN cardinality([1, 2, 3]) AS c");
         INFO("cardinality: " << card);
         REQUIRE(card.find("\"c\": 3") != std::string::npos);
+
+        // cardinality wrapping an AGGREGATE: the argument must resolve to the collected list, not a
+        // per-row NULL (the group evaluator has to thread the aggregate results into the function's
+        // argument). Alice knows one person, so the collected list has one element.
+        std::string over_agg = run(
+            "MATCH (a:Person)-[:KNOWS]->(f:Person) RETURN cardinality(collect_list(f.name)) AS c");
+        INFO("over aggregate: " << over_agg);
+        REQUIRE(over_agg.find("\"c\": 1") != std::string::npos);
     }
 
     SECTION("upper, lower and the trims") {

@@ -243,3 +243,63 @@ TEST_CASE("aggregates and top-K over a bare label scan page instead of materiali
     gql_scan_chunk_size = saved_chunk;
     graph.Stop().get();
 }
+
+/*
+ * A LIMIT bounds the RESULT rows. An aggregate folds the matched rows into far fewer result rows, so the
+ * LIMIT must not be pushed into the scan -- doing so truncates the rows the aggregate folds over and
+ * answers with the limit instead of the aggregate. At SF1 `RETURN count(f) ... LIMIT 1` returned 1 for a
+ * person with 848 friends (task 044). The executor's own scan-limit gate refused this; the pushdown pass
+ * did not.
+ */
+TEST_CASE("LIMIT is not pushed into the scan when the query aggregates (task 044)", "[gql_executor_limit][task044]") {
+    auto graph = Graph("gql_limit_aggregate_task044");
+    graph.Start().get();
+    graph.Clear();
+    graph.shard.local().NodeTypeInsertPeered("Person").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "name", "string").get();
+    graph.shard.local().RelationshipTypeInsertPeered("KNOWS").get();
+
+    // One hub with 6 friends, so any scan truncation shows up as a wrong count.
+    uint64_t hub = graph.shard.local().NodeAddPeered("Person", "hub", "{\"name\": \"Hub\"}").get();
+    for (int i = 0; i < 6; ++i) {
+        uint64_t f = graph.shard.local().NodeAddPeered("Person", "f" + std::to_string(i),
+            "{\"name\": \"F" + std::to_string(i) + "\"}").get();
+        graph.shard.local().RelationshipAddPeered("KNOWS", hub, f, "{}").get();
+    }
+
+    auto run = [&graph](const std::string& q) {
+        auto query = GqlParser::parse(q);
+        GqlOptimizer::optimize(query);
+        return GqlExecutor::execute(graph, std::move(query)).get();
+    };
+
+    SECTION("count with a LIMIT still counts every matched row") {
+        std::string truth = run("MATCH (p:Person {name: 'Hub'})-[:KNOWS]->(f:Person) RETURN count(f) AS n");
+        std::string limited = run("MATCH (p:Person {name: 'Hub'})-[:KNOWS]->(f:Person) RETURN count(f) AS n LIMIT 1");
+        INFO("truth: " << truth << "  limited: " << limited);
+        REQUIRE(truth.find("\"n\": 6") != std::string::npos);
+        // The LIMIT bounds the single aggregate result row, so the count is unchanged.
+        REQUIRE(limited == truth);
+    }
+
+    SECTION("collect_list with a LIMIT still gathers every matched row") {
+        // The SF1 shape: collect_list came back holding a single element because the scan had been
+        // truncated to the LIMIT before the accumulator ever saw the rest.
+        std::string res = run("MATCH (p:Person {name: 'Hub'})-[:KNOWS]->(f:Person) "
+                              "RETURN collect_list(f.name) AS names LIMIT 1");
+        INFO("result: " << res);
+        for (int i = 0; i < 6; ++i) {
+            REQUIRE(res.find("\"F" + std::to_string(i) + "\"") != std::string::npos);
+        }
+    }
+
+    SECTION("a non-aggregating LIMIT is still pushed down and bounds the rows") {
+        std::string res = run("MATCH (p:Person)-[:KNOWS]->(f:Person) RETURN f.name AS n LIMIT 2");
+        INFO("result: " << res);
+        size_t rows = 0, pos = 0;
+        while ((pos = res.find("\"n\":", pos)) != std::string::npos) { rows++; pos += 4; }
+        REQUIRE(rows == 2);
+    }
+
+    graph.Stop().get();
+}

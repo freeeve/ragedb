@@ -60,7 +60,8 @@ enum class ExpressionKind {
     CASE_WHEN,        ///< CASE WHEN cond THEN val [WHEN ...] [ELSE val] END conditional expression
     IN_LIST,          ///< Membership test against a list value: x IN <listExpr>
     CAST,             ///< Type conversion: CAST(x AS STRING | INTEGER | FLOAT | BOOLEAN)
-    IS_LABELED        ///< Label predicate: x IS [NOT] LABELED <labelExpression>
+    IS_LABELED,       ///< Label predicate: x IS [NOT] LABELED <labelExpression>
+    LIST_LITERAL      ///< A list value written out: [a, b, c]
 };
 
 /**
@@ -270,6 +271,26 @@ struct InExpr : public Expression {
     }
     std::unique_ptr<Expression> clone() const override {
         return std::make_unique<InExpr>(value ? value->clone() : nullptr, list ? list->clone() : nullptr);
+    }
+};
+
+/**
+ * @brief Represents a list literal: [a, b, c]. Evaluates to a LIST value, so it can be bound, compared, or
+ *        expanded by FOR.
+ */
+struct ListExpr : public Expression {
+    std::vector<std::unique_ptr<Expression>> elements;
+    explicit ListExpr(std::vector<std::unique_ptr<Expression>> e) {
+        kind = ExpressionKind::LIST_LITERAL;
+        elements = std::move(e);
+    }
+    std::unique_ptr<Expression> clone() const override {
+        std::vector<std::unique_ptr<Expression>> copy;
+        copy.reserve(elements.size());
+        for (const auto& e : elements) {
+            copy.push_back(e ? e->clone() : nullptr);
+        }
+        return std::make_unique<ListExpr>(std::move(copy));
     }
 };
 
@@ -497,6 +518,19 @@ struct ReturnItem {
 };
 
 /**
+ * @brief ISO GQL `FOR x IN <listExpr>` (the standard's UNWIND): expands a list-valued expression into one
+ *        row per element, bound to the variable. Unlike LET, which adds a column to each row, FOR
+ *        multiplies the rows.
+ */
+struct ForBinding {
+    std::string variable;                 ///< The element variable each row binds.
+    std::unique_ptr<Expression> list_expr; ///< The list-valued expression to expand.
+    ForBinding clone() const {
+        return ForBinding{ variable, list_expr ? list_expr->clone() : nullptr };
+    }
+};
+
+/**
  * @brief Specifies sorting requirements in the ORDER BY clause.
  */
 struct SortSpec {
@@ -621,6 +655,7 @@ struct GqlQuery {
     std::vector<WriteOp> writes;             ///< Sequence of write/mutation operations.
     std::vector<ReturnItem> returns;         ///< Projected RETURN clause items.
     std::vector<ReturnItem> let_bindings;    ///< ISO GQL LET: computed bindings added to the working table before projection.
+    std::vector<ForBinding> for_bindings;    ///< ISO GQL FOR: list expansions applied to the working table before LET/FILTER/RETURN.
     bool distinct = false;                   ///< True if distinct results are required.
     std::vector<SortSpec> order_by;          ///< Sequence of sort specifications.
     std::optional<uint64_t> limit;           ///< Optional maximum number of rows to return.
@@ -673,6 +708,10 @@ struct GqlQuery {
             copy.returns.push_back(r.clone());
         }
 
+        copy.for_bindings.reserve(for_bindings.size());
+        for (const auto& f : for_bindings) {
+            copy.for_bindings.push_back(f.clone());
+        }
         copy.let_bindings.reserve(let_bindings.size());
         for (const auto& l : let_bindings) {
             copy.let_bindings.push_back(l.clone());

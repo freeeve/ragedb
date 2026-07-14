@@ -362,6 +362,45 @@ GqlValue apply_is_labeled(const GqlValue& value, const std::shared_ptr<LabelExpr
     return GqlValue(negated ? !labeled : labeled);
 }
 
+std::optional<std::vector<GqlValue>> as_list_elements(const GqlValue& value) {
+    if (value.type == GqlValue::LIST) {
+        if (!value.list) return std::vector<GqlValue>{};
+        return *value.list;
+    }
+    if (value.type == GqlValue::RELATIONSHIP_LIST) {
+        std::vector<GqlValue> elements;
+        if (value.relationship_list) {
+            elements.reserve(value.relationship_list->size());
+            for (const auto& rel : *value.relationship_list) {
+                elements.push_back(GqlValue(rel));
+            }
+        }
+        return elements;
+    }
+    if (value.type == GqlValue::PROPERTY) {
+        // A stored list property (e.g. a string list) is a list too, even though it arrives as a variant
+        // alternative rather than as the LIST type.
+        std::vector<GqlValue> elements;
+        if (std::holds_alternative<std::vector<bool>>(value.property)) {
+            for (bool b : std::get<std::vector<bool>>(value.property)) elements.push_back(GqlValue(b));
+            return elements;
+        }
+        if (std::holds_alternative<std::vector<int64_t>>(value.property)) {
+            for (int64_t i : std::get<std::vector<int64_t>>(value.property)) elements.push_back(GqlValue(i));
+            return elements;
+        }
+        if (std::holds_alternative<std::vector<double>>(value.property)) {
+            for (double d : std::get<std::vector<double>>(value.property)) elements.push_back(GqlValue(d));
+            return elements;
+        }
+        if (std::holds_alternative<std::vector<std::string>>(value.property)) {
+            for (const auto& s : std::get<std::vector<std::string>>(value.property)) elements.push_back(GqlValue(s));
+            return elements;
+        }
+    }
+    return std::nullopt;
+}
+
 GqlValue evaluate_expression(const GqlRow& row, const Expression* expr) {
     if (!expr) return GqlValue();
 
@@ -397,6 +436,18 @@ GqlValue evaluate_expression(const GqlRow& row, const Expression* expr) {
         }
         case ExpressionKind::FUNCTION_CALL: {
             return evaluate_scalar_function(row, static_cast<const FunctionCallExpr*>(expr));
+        }
+        case ExpressionKind::LIST_LITERAL: {
+            auto* le = static_cast<const ListExpr*>(expr);
+            auto items = std::make_shared<std::vector<GqlValue>>();
+            items->reserve(le->elements.size());
+            for (const auto& element : le->elements) {
+                items->push_back(evaluate_expression(row, element.get()));
+            }
+            GqlValue out;
+            out.type = GqlValue::LIST;
+            out.list = std::move(items);
+            return out;
         }
         case ExpressionKind::CAST: {
             auto* c = static_cast<const CastExpr*>(expr);

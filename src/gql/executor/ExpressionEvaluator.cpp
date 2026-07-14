@@ -74,6 +74,12 @@ bool has_aggregates(const Expression* expr) {
     if (expr->kind == ExpressionKind::IS_LABELED) {
         return has_aggregates(static_cast<const IsLabeledExpr*>(expr)->value.get());
     }
+    if (expr->kind == ExpressionKind::LIST_LITERAL) {
+        for (const auto& element : static_cast<const ListExpr*>(expr)->elements) {
+            if (has_aggregates(element.get())) return true;
+        }
+        return false;
+    }
     return false;
 }
 
@@ -117,6 +123,10 @@ void find_aggregates(const Expression* expr, std::vector<const AggregateExpr*>& 
         find_aggregates(static_cast<const CastExpr*>(expr)->value.get(), aggregates);
     } else if (expr->kind == ExpressionKind::IS_LABELED) {
         find_aggregates(static_cast<const IsLabeledExpr*>(expr)->value.get(), aggregates);
+    } else if (expr->kind == ExpressionKind::LIST_LITERAL) {
+        for (const auto& element : static_cast<const ListExpr*>(expr)->elements) {
+            find_aggregates(element.get(), aggregates);
+        }
     }
 }
 
@@ -165,6 +175,18 @@ GqlValue evaluate_group_expression(const GqlRow& representative, const std::map<
         case ExpressionKind::FUNCTION_CALL: {
             // Scalar functions evaluate over the representative row's bindings (grouping keys).
             return evaluate_scalar_function(representative, static_cast<const FunctionCallExpr*>(expr));
+        }
+        case ExpressionKind::LIST_LITERAL: {
+            auto* le = static_cast<const ListExpr*>(expr);
+            auto items = std::make_shared<std::vector<GqlValue>>();
+            items->reserve(le->elements.size());
+            for (const auto& element : le->elements) {
+                items->push_back(evaluate_group_expression(representative, aggregate_results, element.get()));
+            }
+            GqlValue out;
+            out.type = GqlValue::LIST;
+            out.list = std::move(items);
+            return out;
         }
         case ExpressionKind::CAST: {
             auto* c = static_cast<const CastExpr*>(expr);

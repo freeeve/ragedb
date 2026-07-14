@@ -518,6 +518,13 @@ GqlType GqlTypechecker::check_expression(const Expression& expr) {
             check_expression(*l.value);
             return GqlType::BOOLEAN;
         }
+        case ExpressionKind::LIST_LITERAL: {
+            const auto& le = static_cast<const ListExpr&>(expr);
+            for (const auto& element : le.elements) {
+                if (element) check_expression(*element);
+            }
+            return GqlType::ANY;
+        }
     }
     return GqlType::ANY;
 }
@@ -683,6 +690,18 @@ void GqlTypechecker::check_segment_body(const GqlQuery& query) {
                 meet_variable(match.path_count_target_var, GqlType::INTEGER, {});
             }
             // cost_expr typechecking is now performed inside check_path_pattern per edge.
+        }
+    }
+
+    // Register ISO GQL FOR variables before LET, matching execution order: FOR expands the working table
+    // first, so a LET may reference the element variable. The element type is not known statically (the
+    // list may hold anything), so it is ANY.
+    for (const auto& binding : query.for_bindings) {
+        if (binding.list_expr) {
+            check_expression(*binding.list_expr);
+        }
+        if (!binding.variable.empty()) {
+            meet_variable(binding.variable, GqlType::ANY, {});
         }
     }
 

@@ -132,6 +132,14 @@ GqlValue apply_cast(const GqlValue& value, CastType target);
 GqlValue apply_is_labeled(const GqlValue& value, const std::shared_ptr<LabelExpression>& label_expr, bool negated);
 
 /**
+ * @brief Views a value as a sequence of elements, for the things that are lists in GQL but are not all
+ *        the LIST type at runtime: a LIST, a relationship list, and a list-valued property (a stored
+ *        vector of bools/ints/doubles/strings). Returns nullopt for anything that is not a list, which
+ *        FOR expands to no rows. Used by FOR (UNWIND).
+ */
+std::optional<std::vector<GqlValue>> as_list_elements(const GqlValue& value);
+
+/**
  * @brief Serializes a GqlValue to its JSON string representation.
  */
 std::string serialize_gql_value(const GqlValue& val);

@@ -191,6 +191,13 @@ static std::unique_ptr<Expression> substitute_return_aliases(
             l->value = substitute_return_aliases(std::move(l->value), aliases);
             return expr;
         }
+        case ExpressionKind::LIST_LITERAL: {
+            auto* le = static_cast<ListExpr*>(expr.get());
+            for (auto& element : le->elements) {
+                element = substitute_return_aliases(std::move(element), aliases);
+            }
+            return expr;
+        }
         default:
             return expr;
     }
@@ -507,11 +514,22 @@ GqlQuery GqlParser::parse_single_query() {
             item.expr = parse_expression();
             query.let_bindings.push_back(std::move(item));
         } while (match(TokenType::COMMA));
+    } else if (match(TokenType::FOR)) {
+        // ISO GQL FOR expands a list into one row per element (the standard's UNWIND). Unlike LET, which
+        // adds a column, FOR multiplies the working table's rows.
+        do {
+            ForBinding binding;
+            binding.variable = consume_identifier("Expected variable name after 'FOR'");
+            consume(TokenType::IN_KW, "Expected 'IN' after FOR variable");
+            binding.list_expr = parse_expression();
+            query.for_bindings.push_back(std::move(binding));
+        } while (match(TokenType::COMMA));
     }
-    // A segment is a free sequence of simple statements (MATCH / FILTER / LET); keep extending it while
-    // more of them follow. MATCH ... WHERE ... MATCH ... and FILTER ... MATCH ... both round-trip here.
+    // A segment is a free sequence of simple statements (MATCH / FILTER / LET / FOR); keep extending it
+    // while more of them follow. MATCH ... WHERE ... MATCH ... and FILTER ... MATCH ... both round-trip here.
     if (check(TokenType::MATCH) || (check(TokenType::OPTIONAL) && peek(1).type == TokenType::MATCH) ||
-        check(TokenType::WHERE) || check(TokenType::FILTER_KW) || check(TokenType::LET_KW)) {
+        check(TokenType::WHERE) || check(TokenType::FILTER_KW) || check(TokenType::LET_KW) ||
+        check(TokenType::FOR)) {
         continue;
     }
     break;
@@ -583,8 +601,10 @@ GqlQuery GqlParser::parse_single_query() {
     }
 
     // Verify we have at least one MATCH or write operation (a continuation segment after WITH may
-    // have neither--it operates on the rows piped in from the previous segment).
-    if (query.matches.empty() && query.writes.empty() && with_segments.empty()) {
+    // have neither--it operates on the rows piped in from the previous segment). A FOR statement is
+    // also a row source in its own right: `FOR x IN [1, 2, 3] RETURN x` matches nothing but still
+    // produces rows.
+    if (query.matches.empty() && query.writes.empty() && with_segments.empty() && query.for_bindings.empty()) {
         throw std::runtime_error("Query must contain at least one MATCH or write clause");
     }
 
@@ -1622,6 +1642,18 @@ std::unique_ptr<Expression> GqlParser::parse_primary() {
         std::unique_ptr<Expression> sub_where;
         parse_braced_subquery(matches, sub_where);
         return std::make_unique<ExistsExpr>(std::move(matches), std::move(sub_where));
+    }
+    // List literal: [a, b, c]. (The `x IN [a, b]` form is desugared to OR earlier, so it never reaches
+    // here; this is the standalone list value -- what FOR expands and what a list-typed binding holds.)
+    if (match(TokenType::LBRACKET)) {
+        std::vector<std::unique_ptr<Expression>> elements;
+        if (!check(TokenType::RBRACKET)) {
+            do {
+                elements.push_back(parse_expression());
+            } while (match(TokenType::COMMA));
+        }
+        consume(TokenType::RBRACKET, "Expected ']' to close list literal");
+        return std::make_unique<ListExpr>(std::move(elements));
     }
     // CAST(<expr> AS <type>). The primitive type names are lexed as their own keywords (they are also
     // schema-DDL types), so accept those tokens as well as the spellings that arrive as plain names.

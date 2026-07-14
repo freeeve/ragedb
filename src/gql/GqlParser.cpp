@@ -90,6 +90,148 @@ void GqlParser::consume(TokenType type, const std::string& error_message) {
     throw std::runtime_error(error_message + " (found: " + peek().text + ")");
 }
 
+/**
+ * @brief Consume the current token as an identifier and return its text. Accepts NAME plus any
+ *        keyword token, so reserved words (e.g. `with`) remain usable as aliases and names.
+ *
+ * @param error_message The descriptive message to include in the thrown exception.
+ * @throws std::runtime_error If the current token is not identifier-like.
+ */
+std::string GqlParser::consume_identifier(const std::string& error_message) {
+    TokenType type = peek().type;
+    if (type == TokenType::NAME || (type >= TokenType::TRUE_KW && type < TokenType::LPAREN)) {
+        std::string text = peek().text;
+        advance();
+        return text;
+    }
+    throw std::runtime_error(error_message + " (found: " + peek().text + ")");
+}
+
+/**
+ * @brief Parse a comma-separated projection list (RETURN or WITH items) into query.returns.
+ *        WITH items pass require_alias_for_expressions: a projected column's name becomes the
+ *        binding the next segment resolves, so anything other than a plain variable has no usable
+ *        name of its own and must be aliased.
+ */
+void GqlParser::parse_return_items(GqlQuery& query, bool require_alias_for_expressions) {
+    do {
+        ReturnItem item;
+        item.expr = parse_expression();
+        if (match(TokenType::AS)) {
+            item.alias = consume_identifier("Expected alias name after 'AS'");
+        }
+        if (require_alias_for_expressions && !item.alias && item.expr->kind != ExpressionKind::VARIABLE) {
+            throw std::runtime_error("WITH items other than a plain variable must be aliased with AS");
+        }
+        query.returns.push_back(std::move(item));
+    } while (match(TokenType::COMMA));
+}
+
+/**
+ * @brief Replace references to the projection's output aliases inside an ORDER BY sort key with
+ *        clones of the aliased expressions. ORDER BY is evaluated after the projection, so its
+ *        aliases are in scope for the sort keys (as in Cypher and SQL); the executor evaluates
+ *        sort keys against pre-projection rows, so the substitution reconstructs that scope.
+ *        Aggregation arguments are not descended into (an alias cannot appear there).
+ */
+static std::unique_ptr<Expression> substitute_return_aliases(
+        std::unique_ptr<Expression> expr, const std::map<std::string, const Expression*>& aliases) {
+    if (!expr) return expr;
+    switch (expr->kind) {
+        case ExpressionKind::VARIABLE: {
+            auto it = aliases.find(static_cast<const VariableExpr*>(expr.get())->name);
+            if (it != aliases.end()) {
+                return it->second->clone();
+            }
+            return expr;
+        }
+        case ExpressionKind::UNARY_OP: {
+            auto* un = static_cast<UnaryOpExpr*>(expr.get());
+            un->expr = substitute_return_aliases(std::move(un->expr), aliases);
+            return expr;
+        }
+        case ExpressionKind::BINARY_OP: {
+            auto* bin = static_cast<BinaryOpExpr*>(expr.get());
+            bin->left = substitute_return_aliases(std::move(bin->left), aliases);
+            bin->right = substitute_return_aliases(std::move(bin->right), aliases);
+            return expr;
+        }
+        case ExpressionKind::FUNCTION_CALL: {
+            auto* fc = static_cast<FunctionCallExpr*>(expr.get());
+            for (auto& a : fc->args) {
+                a = substitute_return_aliases(std::move(a), aliases);
+            }
+            return expr;
+        }
+        case ExpressionKind::CASE_WHEN: {
+            auto* ce = static_cast<CaseExpr*>(expr.get());
+            for (auto& b : ce->branches) {
+                b.first = substitute_return_aliases(std::move(b.first), aliases);
+                b.second = substitute_return_aliases(std::move(b.second), aliases);
+            }
+            if (ce->else_expr) {
+                ce->else_expr = substitute_return_aliases(std::move(ce->else_expr), aliases);
+            }
+            return expr;
+        }
+        case ExpressionKind::IN_LIST: {
+            auto* in = static_cast<InExpr*>(expr.get());
+            in->value = substitute_return_aliases(std::move(in->value), aliases);
+            in->list = substitute_return_aliases(std::move(in->list), aliases);
+            return expr;
+        }
+        default:
+            return expr;
+    }
+}
+
+/**
+ * @brief Bind the RETURN/WITH projection's output aliases into the ORDER BY sort-key scope by
+ *        substituting them with their defining expressions (task 027).
+ */
+static void resolve_order_by_aliases(GqlQuery& query) {
+    if (query.order_by.empty() || query.returns.empty()) return;
+    std::map<std::string, const Expression*> aliases;
+    for (const auto& item : query.returns) {
+        if (item.alias && item.expr) {
+            aliases[*item.alias] = item.expr.get();
+        }
+    }
+    if (aliases.empty()) return;
+    for (auto& spec : query.order_by) {
+        spec.expr = substitute_return_aliases(std::move(spec.expr), aliases);
+    }
+}
+
+/**
+ * @brief Parse an optional ORDER BY clause (with per-key ASC/DESC) into query.order_by.
+ */
+void GqlParser::parse_order_by(GqlQuery& query) {
+    if (!match(TokenType::ORDER_BY)) return;
+    do {
+        SortSpec spec;
+        spec.expr = parse_expression();
+        if (match(TokenType::ASC)) {
+            spec.ascending = true;
+        } else if (match(TokenType::DESC)) {
+            spec.ascending = false;
+        } else {
+            spec.ascending = true;
+        }
+        query.order_by.push_back(std::move(spec));
+    } while (match(TokenType::COMMA));
+}
+
+/**
+ * @brief Parse an optional LIMIT clause into query.limit.
+ */
+void GqlParser::parse_limit(GqlQuery& query) {
+    if (!match(TokenType::LIMIT)) return;
+    std::string num_str = peek().text;
+    consume(TokenType::NUMBER, "Expected integer limit value");
+    query.limit = std::stoull(num_str);
+}
+
 static void validate_insert_label_expr(const std::shared_ptr<LabelExpression>& expr) {
     if (!expr) return;
     if (expr->kind != LabelExprKind::LITERAL) {
@@ -108,11 +250,21 @@ static void validate_insert_label_expr(const std::shared_ptr<LabelExpression>& e
  * @throws std::runtime_error If syntax errors are encountered.
  */
 GqlQuery GqlParser::parse_single_query() {
-    GqlQuery query;
-
+    std::vector<std::shared_ptr<GqlQuery>> with_segments;
+    std::unique_ptr<Expression> pending_having;
     int match_id_counter = 0;
     int optional_group_counter = 0;
-    // Parse MATCH/OPTIONAL MATCH clauses
+
+    while (true) {
+    GqlQuery query;
+    // A WHERE that followed a preceding WITH filters the rows piped into this segment.
+    if (pending_having) {
+        query.where_expr = std::move(pending_having);
+    }
+    // Parse MATCH/OPTIONAL MATCH clauses. A WHERE may sit between MATCH groups
+    // (MATCH ... WHERE ... MATCH ... RETURN): after each group we take an optional WHERE and loop
+    // back so a following MATCH keeps extending the same segment.
+    while (true) {
     while (check(TokenType::MATCH) || (check(TokenType::OPTIONAL) && peek(1).type == TokenType::MATCH)) {
         MatchStatement stmt;
         if (match(TokenType::OPTIONAL)) {
@@ -315,9 +467,33 @@ GqlQuery GqlParser::parse_single_query() {
         }
     }
 
-    // Parse optional global WHERE clause
-    if (match(TokenType::WHERE)) {
-        query.where_expr = parse_expression();
+    // A WHERE after a MATCH group filters those rows; the ISO GQL FILTER statement is its synonym on
+    // the working table. AND-combine either with any HAVING carried in from a prior WITH/NEXT and with
+    // earlier interleaved predicates in this segment.
+    if (match(TokenType::WHERE) || match(TokenType::FILTER_KW)) {
+        auto w = parse_expression();
+        if (query.where_expr) {
+            query.where_expr = std::make_unique<BinaryOpExpr>(BinaryOpKind::AND, std::move(query.where_expr), std::move(w));
+        } else {
+            query.where_expr = std::move(w);
+        }
+    } else if (match(TokenType::LET_KW)) {
+        // ISO GQL LET adds computed bindings to the working table, usable by the rest of the segment.
+        do {
+            ReturnItem item;
+            item.alias = consume_identifier("Expected variable name after 'LET'");
+            consume(TokenType::EQ, "Expected '=' after LET variable");
+            item.expr = parse_expression();
+            query.let_bindings.push_back(std::move(item));
+        } while (match(TokenType::COMMA));
+    }
+    // A segment is a free sequence of simple statements (MATCH / FILTER / LET); keep extending it while
+    // more of them follow. MATCH ... WHERE ... MATCH ... and FILTER ... MATCH ... both round-trip here.
+    if (check(TokenType::MATCH) || (check(TokenType::OPTIONAL) && peek(1).type == TokenType::MATCH) ||
+        check(TokenType::WHERE) || check(TokenType::FILTER_KW) || check(TokenType::LET_KW)) {
+        continue;
+    }
+    break;
     }
 
     // Parse Write Operations (INSERT, SET, REMOVE, DELETE, DETACH)
@@ -385,9 +561,62 @@ GqlQuery GqlParser::parse_single_query() {
         }
     }
 
-    // Verify we have at least one MATCH or write operation
-    if (query.matches.empty() && query.writes.empty()) {
+    // Verify we have at least one MATCH or write operation (a continuation segment after WITH may
+    // have neither--it operates on the rows piped in from the previous segment).
+    if (query.matches.empty() && query.writes.empty() && with_segments.empty()) {
         throw std::runtime_error("Query must contain at least one MATCH or write clause");
+    }
+
+    // ISO GQL standalone ordering/paging statement: a segment may begin with ORDER BY [LIMIT] operating
+    // on the working table piped in from the previous segment (no MATCH/RETURN of its own yet).
+    if ((check(TokenType::ORDER_BY) || check(TokenType::LIMIT)) &&
+        query.matches.empty() && query.returns.empty() && query.let_bindings.empty() &&
+        !with_segments.empty()) {
+        parse_order_by(query);
+        parse_limit(query);
+        // If a MATCH follows, the sort/page is a segment boundary: it must forward the sorted+limited
+        // working table to the next MATCH. Synthesize a passthrough projection of the previous segment's
+        // output columns so the existing projection pipeline carries every binding forward.
+        if (check(TokenType::MATCH) || (check(TokenType::OPTIONAL) && peek(1).type == TokenType::MATCH)) {
+            for (const auto& item : with_segments.back()->returns) {
+                std::string col = item.alias
+                    ? *item.alias
+                    : (item.expr && item.expr->kind == ExpressionKind::VARIABLE
+                           ? static_cast<VariableExpr*>(item.expr.get())->name
+                           : std::string());
+                if (!col.empty()) {
+                    ReturnItem pass;
+                    pass.expr = std::make_unique<VariableExpr>(col);
+                    pass.alias = col;
+                    query.returns.push_back(std::move(pass));
+                }
+            }
+            resolve_order_by_aliases(query);
+            with_segments.push_back(std::make_shared<GqlQuery>(std::move(query)));
+            continue;
+        }
+        // Otherwise a RETURN follows and re-projects the ordered/paged rows. Push the ORDER BY/LIMIT
+        // into the producing (previous) segment so its streaming top-K bounds the sort during the
+        // traversal, instead of materialising the whole intermediate to sort it here (task 034). Valid
+        // because the order keys are the previous segment's output columns and this segment only
+        // re-projects; only push when that segment has no ordering/paging of its own to clobber.
+        auto& producer = with_segments.back();
+        if (producer->order_by.empty() && !producer->limit.has_value()) {
+            producer->order_by = std::move(query.order_by);
+            producer->limit = query.limit;
+            query.order_by.clear();
+            query.limit.reset();
+            resolve_order_by_aliases(*producer);
+        }
+    }
+
+    // openCypher WITH is not ISO GQL. RageDB is a pure GQL dialect: reject WITH with guidance toward
+    // the linear-query equivalents (RETURN ... NEXT for a projection boundary, LET for a value binding,
+    // FILTER for a post-projection predicate). See task 033.
+    if (check(TokenType::WITH)) {
+        throw std::runtime_error(
+            "WITH is not GQL: use 'RETURN ... NEXT' for a projection boundary, 'LET x = ...' for a "
+            "value binding, or 'FILTER ...' for a post-projection predicate");
     }
 
     // Parse RETURN clause (optional if we performed writes, otherwise mandatory)
@@ -395,24 +624,48 @@ GqlQuery GqlParser::parse_single_query() {
         if (match(TokenType::DISTINCT)) {
             query.distinct = true;
         }
+        parse_return_items(query, false);
 
-        do {
-            ReturnItem item;
-            item.expr = parse_expression();
-            if (match(TokenType::AS)) {
-                std::string alias = peek().text;
-                consume(TokenType::NAME, "Expected alias name after 'AS'");
-                item.alias = alias;
+        // ISO GQL: `RETURN ... [ORDER BY ...] [LIMIT ...] NEXT` is an intermediate projection that
+        // feeds the next linear-query statement -- the same pipeline boundary as openCypher WITH.
+        // Detect it with a speculative scan past the optional result clauses so a final RETURN leaves
+        // any trailing ORDER BY / LIMIT for the (union-aware) top-level parser.
+        size_t saved_pos = pos;
+        {
+            GqlQuery scratch;
+            parse_order_by(scratch);
+            parse_limit(scratch);
+        }
+        bool intermediate = check(TokenType::NEXT_KW);
+        pos = saved_pos;
+        if (intermediate) {
+            // A RETURN feeding NEXT projects columns that bind forward, so a non-variable projection
+            // needs an alias to name its forwarded column (as the openCypher WITH form required).
+            for (const auto& item : query.returns) {
+                if (!item.alias && item.expr && item.expr->kind != ExpressionKind::VARIABLE) {
+                    throw std::runtime_error("RETURN items before NEXT other than a plain variable must be aliased with AS");
+                }
             }
-            query.returns.push_back(std::move(item));
-        } while (match(TokenType::COMMA));
+            parse_order_by(query);
+            resolve_order_by_aliases(query);
+            parse_limit(query);
+            consume(TokenType::NEXT_KW, "Expected 'NEXT'");
+            // A FILTER/WHERE right after NEXT is a HAVING predicate on the projected rows.
+            if (match(TokenType::FILTER_KW) || match(TokenType::WHERE)) {
+                pending_having = parse_expression();
+            }
+            with_segments.push_back(std::make_shared<GqlQuery>(std::move(query)));
+            continue;
+        }
     } else {
         if (query.writes.empty()) {
             throw std::runtime_error("Query must contain either a RETURN clause or at least one write clause");
         }
     }
 
+    query.with_segments = std::move(with_segments);
     return query;
+    }  // end while(true) over pipeline segments
 }
 
 GqlQuery GqlParser::parse_query() {
@@ -674,28 +927,12 @@ GqlQuery GqlParser::parse_query() {
 
     GqlQuery query = parse_union();
 
-    // Parse optional top-level ORDER BY clause
-    if (match(TokenType::ORDER_BY)) {
-        do {
-            SortSpec spec;
-            spec.expr = parse_expression();
-            if (match(TokenType::ASC)) {
-                spec.ascending = true;
-            } else if (match(TokenType::DESC)) {
-                spec.ascending = false;
-            } else {
-                spec.ascending = true; // default
-            }
-            query.order_by.push_back(std::move(spec));
-        } while (match(TokenType::COMMA));
+    // Parse optional top-level ORDER BY / LIMIT clauses
+    parse_order_by(query);
+    if (query.kind == QueryKind::SINGLE) {
+        resolve_order_by_aliases(query);
     }
-
-    // Parse optional top-level LIMIT clause
-    if (match(TokenType::LIMIT)) {
-        std::string num_str = peek().text;
-        consume(TokenType::NUMBER, "Expected integer limit value");
-        query.limit = std::stoull(num_str);
-    }
+    parse_limit(query);
 
     query.explain = explain;
     query.profile = profile;
@@ -1118,6 +1355,38 @@ std::unique_ptr<Expression> GqlParser::parse_comparison() {
             continue;
         }
 
+        // x IN [a, b, ...] (a literal list) desugars to (x = a OR x = b OR ...), reusing tested EQ/OR
+        // execution; an empty list is always false. x IN <expr> (a list-valued right operand, e.g. a
+        // collect_list result) becomes an InExpr evaluated as runtime membership.
+        if (match(TokenType::IN_KW)) {
+            if (check(TokenType::LBRACKET)) {
+                advance(); // consume '['
+                std::vector<std::unique_ptr<Expression>> items;
+                if (!check(TokenType::RBRACKET)) {
+                    do {
+                        items.push_back(parse_expression());
+                    } while (match(TokenType::COMMA));
+                }
+                consume(TokenType::RBRACKET, "Expected ']' to close 'IN' list");
+                if (items.empty()) {
+                    expr = std::make_unique<LiteralExpr>(false);
+                } else {
+                    std::unique_ptr<Expression> disjunction;
+                    for (auto& item : items) {
+                        auto eq = std::make_unique<BinaryOpExpr>(BinaryOpKind::EQ, expr->clone(), std::move(item));
+                        disjunction = disjunction
+                            ? std::make_unique<BinaryOpExpr>(BinaryOpKind::OR, std::move(disjunction), std::move(eq))
+                            : std::move(eq);
+                    }
+                    expr = std::move(disjunction);
+                }
+            } else {
+                auto list_expr = parse_add_sub();
+                expr = std::make_unique<InExpr>(std::move(expr), std::move(list_expr));
+            }
+            continue;
+        }
+
         if (check(TokenType::EQ) || check(TokenType::NE) ||
             check(TokenType::LT) || check(TokenType::LE) ||
             check(TokenType::GT) || check(TokenType::GE) ||
@@ -1209,11 +1478,11 @@ std::unique_ptr<Expression> GqlParser::parse_unary() {
  * @return std::unique_ptr<Expression> Parsed expression node.
  * @throws std::runtime_error If an unexpected token or syntax issue is encountered.
  */
-std::unique_ptr<Expression> GqlParser::parse_primary() {
-    if (match(TokenType::EXISTS)) {
-        consume(TokenType::LBRACE, "Expected '{' after EXISTS");
-        std::vector<MatchStatement> matches;
-        int sub_match_id = 0;
+void GqlParser::parse_braced_subquery(std::vector<MatchStatement>& matches,
+                                      std::unique_ptr<Expression>& sub_where) {
+    consume(TokenType::LBRACE, "Expected '{' to start subquery");
+    int sub_match_id = 0;
+    {
         while (check(TokenType::MATCH) || (check(TokenType::OPTIONAL) && peek(1).type == TokenType::MATCH)) {
             MatchStatement stmt;
             if (match(TokenType::OPTIONAL)) {
@@ -1296,12 +1565,61 @@ std::unique_ptr<Expression> GqlParser::parse_primary() {
             stmt.id = sub_match_id++;
             matches.push_back(std::move(stmt));
         }
-        std::unique_ptr<Expression> sub_where = nullptr;
-        if (match(TokenType::WHERE)) {
-            sub_where = parse_expression();
+        // openCypher-style bare pattern subquery, e.g. EXISTS { (a)-[:KNOWS]-(b) }: treat the
+        // pattern as an implicit MATCH (this is the form the LDBC queries use).
+        if (matches.empty() && !check(TokenType::RBRACE) && !check(TokenType::WHERE)) {
+            MatchStatement stmt;
+            stmt.pattern = parse_path_pattern();
+            stmt.id = sub_match_id++;
+            matches.push_back(std::move(stmt));
         }
-        consume(TokenType::RBRACE, "Expected '}' after EXISTS subquery");
+    }
+    sub_where = nullptr;
+    if (match(TokenType::WHERE)) {
+        sub_where = parse_expression();
+    }
+    consume(TokenType::RBRACE, "Expected '}' after subquery");
+}
+
+std::unique_ptr<Expression> GqlParser::parse_primary() {
+    if (match(TokenType::EXISTS)) {
+        std::vector<MatchStatement> matches;
+        std::unique_ptr<Expression> sub_where;
+        parse_braced_subquery(matches, sub_where);
         return std::make_unique<ExistsExpr>(std::move(matches), std::move(sub_where));
+    }
+    // ISO GQL COUNT { <pattern subquery> } counts subquery matches (distinct from the count(x)
+    // aggregate). It shares the braced-subquery body with EXISTS and reuses SizeExpr (a match count).
+    if (check(TokenType::NAME) && peek(1).type == TokenType::LBRACE) {
+        std::string upper_name = peek().text;
+        std::transform(upper_name.begin(), upper_name.end(), upper_name.begin(),
+                       [](unsigned char c) { return std::toupper(c); });
+        if (upper_name == "COUNT") {
+            advance(); // consume COUNT
+            std::vector<MatchStatement> matches;
+            std::unique_ptr<Expression> sub_where;
+            parse_braced_subquery(matches, sub_where);
+            return std::make_unique<SizeExpr>(std::move(matches), std::move(sub_where));
+        }
+    }
+    // Searched CASE expression: CASE WHEN cond THEN val [WHEN ...] [ELSE val] END.
+    if (match(TokenType::CASE_KW)) {
+        std::vector<std::pair<std::unique_ptr<Expression>, std::unique_ptr<Expression>>> branches;
+        while (match(TokenType::WHEN_KW)) {
+            auto cond = parse_expression();
+            consume(TokenType::THEN_KW, "Expected 'THEN' after CASE WHEN condition");
+            auto val = parse_expression();
+            branches.emplace_back(std::move(cond), std::move(val));
+        }
+        if (branches.empty()) {
+            throw std::runtime_error("CASE expression requires at least one WHEN branch");
+        }
+        std::unique_ptr<Expression> else_expr = nullptr;
+        if (match(TokenType::ELSE_KW)) {
+            else_expr = parse_expression();
+        }
+        consume(TokenType::END_KW, "Expected 'END' to close CASE expression");
+        return std::make_unique<CaseExpr>(std::move(branches), std::move(else_expr));
     }
     if (match(TokenType::TRUE_KW)) {
         return std::make_unique<LiteralExpr>(true);
@@ -1338,27 +1656,34 @@ std::unique_ptr<Expression> GqlParser::parse_primary() {
         if (peek(1).type == TokenType::LPAREN) {
             std::string upper_name = var;
             std::transform(upper_name.begin(), upper_name.end(), upper_name.begin(), [](unsigned char c){ return std::toupper(c); });
-            if (upper_name == "COUNT" || upper_name == "SUM" || upper_name == "AVG" || upper_name == "MIN" || upper_name == "MAX") {
+            if (upper_name == "COUNT" || upper_name == "SUM" || upper_name == "AVG" || upper_name == "MIN" || upper_name == "MAX" ||
+                upper_name == "COLLECT" || upper_name == "COLLECT_LIST") {
                 advance(); // consume function name
                 consume(TokenType::LPAREN, "Expected '(' after aggregate function");
                 
                 std::unique_ptr<Expression> arg = nullptr;
+                bool distinct = false;
                 // Special case for count(*)
                 if (upper_name == "COUNT" && check(TokenType::STAR)) {
                     advance(); // consume '*'
                 } else {
+                    // Optional DISTINCT before the aggregated expression, e.g. count(DISTINCT x).
+                    if (match(TokenType::DISTINCT)) {
+                        distinct = true;
+                    }
                     arg = parse_expression();
                 }
                 consume(TokenType::RPAREN, "Expected ')' after aggregate function argument");
-                
+
                 AggregateKind fn;
                 if (upper_name == "COUNT") fn = AggregateKind::COUNT;
                 else if (upper_name == "SUM") fn = AggregateKind::SUM;
                 else if (upper_name == "AVG") fn = AggregateKind::AVG;
                 else if (upper_name == "MIN") fn = AggregateKind::MIN;
+                else if (upper_name == "COLLECT" || upper_name == "COLLECT_LIST") fn = AggregateKind::COLLECT;
                 else fn = AggregateKind::MAX;
-                
-                return std::make_unique<AggregateExpr>(fn, std::move(arg));
+
+                return std::make_unique<AggregateExpr>(fn, std::move(arg), distinct);
             } else if (upper_name == "SIZE") {
                 advance(); // consume "size"
                 consume(TokenType::LPAREN, "Expected '(' after size");
@@ -1376,6 +1701,22 @@ std::unique_ptr<Expression> GqlParser::parse_primary() {
                 
                 consume(TokenType::RPAREN, "Expected ')' after size expression");
                 return std::make_unique<SizeExpr>(std::move(matches), std::move(sub_where));
+            } else {
+                // Generic scalar function call: name ( arg, ... ) -- e.g. length(p),
+                // zoned_datetime('2010-01-01'). Dispatched by name in the evaluator/typechecker.
+                advance(); // consume function name
+                consume(TokenType::LPAREN, "Expected '(' after function name");
+                std::vector<std::unique_ptr<Expression>> args;
+                if (!check(TokenType::RPAREN)) {
+                    do {
+                        args.push_back(parse_expression());
+                    } while (match(TokenType::COMMA));
+                }
+                consume(TokenType::RPAREN, "Expected ')' after function arguments");
+                std::string lname = var;
+                std::transform(lname.begin(), lname.end(), lname.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                return std::make_unique<FunctionCallExpr>(std::move(lname), std::move(args));
             }
         }
 
@@ -1391,6 +1732,28 @@ std::unique_ptr<Expression> GqlParser::parse_primary() {
             return std::make_unique<PropertyLookupExpr>(var, prop);
         }
         return std::make_unique<VariableExpr>(var);
+    }
+
+    // A keyword that reaches expression position (all keyword-led forms -- literals, NOT, EXISTS --
+    // were handled above) can only be an identifier shadowed by a reserved word: keep variables and
+    // aliases named e.g. `with` referencable.
+    {
+        TokenType t = peek().type;
+        if (t >= TokenType::TRUE_KW && t < TokenType::LPAREN) {
+            std::string var = peek().text;
+            advance();
+            if (match(TokenType::DOT)) {
+                std::string prop = peek().text;
+                TokenType pt = peek().type;
+                if (pt == TokenType::NAME || (pt >= TokenType::TRUE_KW && pt < TokenType::LPAREN)) {
+                    advance();
+                } else {
+                    throw std::runtime_error("Expected property name after '.' (found: " + prop + ")");
+                }
+                return std::make_unique<PropertyLookupExpr>(var, prop);
+            }
+            return std::make_unique<VariableExpr>(var);
+        }
     }
 
     throw std::runtime_error("Unexpected token in expression: " + peek().text);

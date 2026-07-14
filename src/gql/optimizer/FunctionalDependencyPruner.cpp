@@ -159,7 +159,9 @@ void FunctionalDependencyPruner::functional_dependency_pass(GqlQuery& query) {
         if (!expr) return;
         if (expr->kind == ExpressionKind::AGGREGATION) {
             auto* agg = static_cast<AggregateExpr*>(expr.get());
-            if (agg->fn_kind == AggregateKind::COUNT && agg->expr && agg->expr->kind == ExpressionKind::PROPERTY_LOOKUP) {
+            // count(DISTINCT b.y) must keep its expression: the executor's dedup branch is gated on
+            // agg->expr, so nulling it silently degrades DISTINCT to a plain row count.
+            if (agg->fn_kind == AggregateKind::COUNT && !agg->distinct && agg->expr && agg->expr->kind == ExpressionKind::PROPERTY_LOOKUP) {
                 auto* pl = static_cast<PropertyLookupExpr*>(agg->expr.get());
                 std::string var = pl->variable;
                 std::string y = pl->property;

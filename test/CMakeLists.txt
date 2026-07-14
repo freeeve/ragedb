@@ -47,6 +47,8 @@ add_executable(tests tests.cpp shard/ShardIds.cpp shard/Ids.cpp shard/NodeTypes.
         gql/optimizer_performance/LimitPushdownPerformanceTests.cpp
         gql/optimizer/Phase16_21OptimizerTests.cpp
         gql/optimizer/AlglibOptimizerTests.cpp
+        gql/optimizer/DistinctAggregateGuardTests.cpp
+        gql/optimizer/SemanticDifferentialTests.cpp
         gql/optimizer_performance/TransitiveFilterPerformanceTests.cpp
         gql/optimizer_performance/EdgeContradictionPerformanceTests.cpp
         gql/optimizer_performance/AntiSemiJoinPerformanceTests.cpp
@@ -55,6 +57,8 @@ add_executable(tests tests.cpp shard/ShardIds.cpp shard/Ids.cpp shard/NodeTypes.
         gql/optimizer_performance/DirectionSwapPerformanceTests.cpp
         gql/optimizer_performance/AlglibPerformanceTests.cpp
         gql/GqlExecutorReadTests.cpp
+        gql/GqlExecutorWithPipelineTests.cpp
+        gql/GqlExecutorLimitPushdownTests.cpp
         gql/GqlExecutorComplexTests.cpp
         gql/GqlExecutorSubqueryTests.cpp
         gql/GqlExecutorExplainProfileTests.cpp
@@ -65,9 +69,11 @@ add_executable(tests tests.cpp shard/ShardIds.cpp shard/Ids.cpp shard/NodeTypes.
         gql/GqlExecutorPatternTests.cpp
         gql/GqlExecutorWriteTests.cpp
         gql/GqlExecutorAggregationTests.cpp
+        gql/GqlExecutorGroupedExpansionTests.cpp
         gql/GqlExecutorSchemaTests.cpp
         gql/GqlTypecheckerTests.cpp
         gql/GqlQueryCacheTests.cpp
+        gql/GqlCacheInvalidationTests.cpp
 
         ../src/main/util/stop_signal.hh
         ../src/main/handlers/HealthCheck.cpp ../src/main/handlers/HealthCheck.h
@@ -111,7 +117,6 @@ add_executable(tests tests.cpp shard/ShardIds.cpp shard/Ids.cpp shard/NodeTypes.
         ../src/gql/optimizer/EqualityJoinEliminator.cpp ../src/gql/optimizer/EqualityJoinEliminator.h
         ../src/gql/optimizer/DisjointConceptPruner.cpp ../src/gql/optimizer/DisjointConceptPruner.h
         ../src/gql/optimizer/DirectionSwapOptimizer.cpp ../src/gql/optimizer/DirectionSwapOptimizer.h
-        ../src/gql/optimizer/SymmetricTraversalOptimizer.cpp ../src/gql/optimizer/SymmetricTraversalOptimizer.h
         ../src/gql/optimizer/TransitivePathOptimizer.cpp ../src/gql/optimizer/TransitivePathOptimizer.h
         ../src/gql/optimizer/IrreflexiveContradictionPruner.cpp ../src/gql/optimizer/IrreflexiveContradictionPruner.h
         ../src/gql/optimizer/AntisymmetricLoopCollapser.cpp ../src/gql/optimizer/AntisymmetricLoopCollapser.h
@@ -205,7 +210,6 @@ add_executable(tests2 main/ConnectedHandler.cpp
         ../src/gql/optimizer/EqualityJoinEliminator.cpp ../src/gql/optimizer/EqualityJoinEliminator.h
         ../src/gql/optimizer/DisjointConceptPruner.cpp ../src/gql/optimizer/DisjointConceptPruner.h
         ../src/gql/optimizer/DirectionSwapOptimizer.cpp ../src/gql/optimizer/DirectionSwapOptimizer.h
-        ../src/gql/optimizer/SymmetricTraversalOptimizer.cpp ../src/gql/optimizer/SymmetricTraversalOptimizer.h
         ../src/gql/optimizer/TransitivePathOptimizer.cpp ../src/gql/optimizer/TransitivePathOptimizer.h
         ../src/gql/optimizer/IrreflexiveContradictionPruner.cpp ../src/gql/optimizer/IrreflexiveContradictionPruner.h
         ../src/gql/optimizer/AntisymmetricLoopCollapser.cpp ../src/gql/optimizer/AntisymmetricLoopCollapser.h

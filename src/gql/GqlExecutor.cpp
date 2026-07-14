@@ -24,11 +24,13 @@
 #include "GqlParser.h"
 #include "GqlOptimizer.h"
 #include "GqlQueryCache.h"
+#include "optimizer/OptimizerUtils.h"
 #include "executor/FactorNode.h"
 #include "executor/JoinHelpers.h"
 #include "executor/ExpressionEvaluator.h"
 #include "executor/PathTraverser.h"
-#include "executor/WccCache.h"
+#include "../graph/cache/WccCache.h"
+#include "../graph/cache/TransitiveReachabilityCache.h"
 #include "executor/ProjectionPruner.h"
 #include "executor/StarJoinRewriter.h"
 #include "executor/PlanBuilder.h"
@@ -36,6 +38,7 @@
 #include "executor/LftjExecutor.h"
 
 #include <sstream>
+#include <optional>
 #include <unordered_set>
 #include <unordered_map>
 #include <set>
@@ -44,6 +47,7 @@
 #include <cstdlib>
 #include <chrono>
 #include <seastar/core/when_all.hh>
+#include <seastar/core/loop.hh>
 
 namespace ragedb::gql {
 
@@ -157,48 +161,909 @@ struct GqlRowOuterVarsLess {
  * @param query_ptr Shared pointer to the GQL query.
  * @return A future resolving to a QueryResult containing columns and values.
  */
-static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph, std::shared_ptr<GqlQuery> query_ptr) {
+/**
+ * @brief Derive the output column name for a RETURN item. The single source of truth for column
+ *        naming: query_result_to_rows turns column names into next-segment bindings in WITH
+ *        pipelines, so every path that names columns must agree.
+ */
+static std::string return_item_column_name(const ReturnItem& item, size_t index) {
+    if (item.alias) return *item.alias;
+    if (item.expr->kind == ExpressionKind::PROPERTY_LOOKUP) {
+        auto* pl = static_cast<const PropertyLookupExpr*>(item.expr.get());
+        return pl->variable + "." + pl->property;
+    }
+    if (item.expr->kind == ExpressionKind::VARIABLE) {
+        return static_cast<const VariableExpr*>(item.expr.get())->name;
+    }
+    if (item.expr->kind == ExpressionKind::AGGREGATION) {
+        auto* ae = static_cast<const AggregateExpr*>(item.expr.get());
+        std::string fn = ae->fn_kind == AggregateKind::COUNT ? "count"
+            : ae->fn_kind == AggregateKind::SUM ? "sum"
+            : ae->fn_kind == AggregateKind::AVG ? "avg"
+            : ae->fn_kind == AggregateKind::MIN ? "min" : "max";
+        if (!ae->expr) return fn + "(*)";
+        if (ae->expr->kind == ExpressionKind::PROPERTY_LOOKUP) {
+            auto* pl = static_cast<const PropertyLookupExpr*>(ae->expr.get());
+            return fn + "(" + pl->variable + "." + pl->property + ")";
+        }
+        if (ae->expr->kind == ExpressionKind::VARIABLE) {
+            return fn + "(" + static_cast<const VariableExpr*>(ae->expr.get())->name + ")";
+        }
+        return fn + "(expr)";
+    }
+    return "column_" + std::to_string(index);
+}
+
+/**
+ * @brief A plan for answering a pure COUNT over a single node pattern from the shard count
+ *        indexes, without materializing any Node objects.
+ *
+ * This is the fast path for queries shaped like `MATCH (n:Label) RETURN count(n)` (optionally with
+ * a single property filter). Counting by materializing every node OOMs on large labels, so when a
+ * query matches this exact shape we answer it directly with AllNodesCountPeered / FindNodeCountPeered.
+ * Anything more complex falls back to the normal executor.
+ */
+struct SimpleNodeCountPlan {
+    bool has_label = false;
+    std::string label;
+    bool has_filter = false;
+    std::string filter_property;
+    Operation filter_op = Operation::EQ;
+    property_type_t filter_value;
+    std::string column_name;
+    uint64_t multiplier = 1;
+};
+
+/**
+ * @brief Detect whether a query is a pure COUNT over a single node pattern and, if so, populate a
+ *        SimpleNodeCountPlan. Returns false (fall back to the normal executor) for any shape that
+ *        cannot be answered by a single count-index lookup.
+ */
+static bool try_plan_simple_node_count(const GqlQuery& q, SimpleNodeCountPlan& out) {
+    if (q.kind != QueryKind::SINGLE) return false;
+    if (q.explain || q.profile) return false;      // keep plan/profile output on the normal path
+    if (!q.writes.empty()) return false;
+    if (q.where_expr) return false;
+    if (q.has_unnested_subquery) return false;
+    if (q.distinct) return false;
+    if (q.limit.has_value()) return false;
+    if (!q.order_by.empty()) return false;
+    if (q.matches.size() != 1) return false;
+    if (q.returns.size() != 1) return false;
+
+    const auto& item = q.returns[0];
+    if (!item.expr || item.expr->kind != ExpressionKind::AGGREGATION) return false;
+    const auto* ae = static_cast<const AggregateExpr*>(item.expr.get());
+    if (ae->fn_kind != AggregateKind::COUNT) return false;
+
+    const auto& m = q.matches[0];
+    if (m.is_optional) return false;
+    if (m.shortest_path_kind != ShortestPathKind::NONE) return false;
+    if (m.is_khop) return false;
+    if (!m.path_variable.empty()) return false;
+    if (m.limit.has_value()) return false;
+    if (!m.pattern.edges.empty()) return false;
+    if (m.pattern.nodes.size() != 1) return false;
+
+    const auto& node = m.pattern.nodes[0];
+    if (node.where_expr) return false;
+
+    // The count target must be count(*) or count(<the pattern node's variable>). For a single
+    // non-optional node every matched row binds a distinct node, so count(n) == row count.
+    if (ae->expr) {
+        if (ae->expr->kind != ExpressionKind::VARIABLE) return false;
+        const auto* ve = static_cast<const VariableExpr*>(ae->expr.get());
+        if (node.variable.empty() || ve->name != node.variable) return false;
+    }
+
+    // Only a single literal label (or no label) can be answered by the count endpoints;
+    // AND/OR/NOT/WILDCARD label expressions fall back.
+    if (node.label_expr) {
+        if (node.label_expr->kind != LabelExprKind::LITERAL) return false;
+        out.has_label = true;
+        out.label = node.label_expr->name;
+    }
+
+    // Zero filters -> count all (of the label). Exactly one filter (with a label) -> FindNodeCount.
+    // More than one filter has no single count endpoint, so fall back.
+    size_t filter_count = node.properties.size() + node.property_filters.size();
+    if (filter_count > 1) return false;
+    if (filter_count == 1) {
+        if (!out.has_label) return false;  // FindNodeCountPeered requires a node type
+        out.has_filter = true;
+        if (!node.properties.empty()) {
+            const auto& kv = *node.properties.begin();
+            out.filter_property = kv.first;
+            out.filter_op = Operation::EQ;
+            out.filter_value = kv.second;
+        } else {
+            const auto& f = node.property_filters[0];
+            out.filter_property = f.property;
+            out.filter_op = f.op;
+            out.filter_value = f.value;
+        }
+    }
+
+    out.column_name = return_item_column_name(item, 0);
+
+    out.multiplier = q.count_multiplication_factor;
+    return true;
+}
+
+/**
+ * @brief Plan for a group-anchored streaming aggregate over a single-edge expansion.
+ *
+ * Answers queries shaped like `MATCH (a:AL)-[:R]->(b:BL) RETURN b.key, count(a) ...` by iterating
+ * the group-side (b) nodes and folding each one's R-neighbours (a) into per-group accumulators, so
+ * peak memory is O(#groups + one node's degree) instead of O(#expansion rows). This avoids the OOM
+ * from materialising the whole (a,b) expansion just to aggregate it. Any shape not cleanly covered
+ * returns false and falls back to the normal (materialising) executor.
+ */
+struct EdgeAggPlan {
+    const PatternNode* group_node = nullptr;
+    const PatternNode* agg_node = nullptr;
+    std::string group_var;
+    std::string agg_var;
+    std::string agg_label;            // literal label of the aggregated node ("" = any)
+    std::string rel_type;
+    Direction dir = Direction::BOTH;  // from group node toward aggregated node
+    std::vector<const Expression*> grouping_keys;
+    std::vector<const AggregateExpr*> aggs;
+    uint64_t multiplier = 1;
+};
+
+static bool node_label_literal(const PatternNode& n, std::string& out_label) {
+    if (!n.label_expr) { out_label = ""; return true; }
+    if (n.label_expr->kind == LabelExprKind::LITERAL) { out_label = n.label_expr->name; return true; }
+    return false;
+}
+
+static bool plan_streaming_edge_aggregate(const GqlQuery& q, EdgeAggPlan& out) {
+    if (q.kind != QueryKind::SINGLE) return false;
+    if (q.explain || q.profile) return false;
+    if (!q.writes.empty()) return false;
+    if (q.where_expr) return false;
+    if (q.has_unnested_subquery) return false;
+    if (q.distinct) return false;
+    if (q.matches.size() != 1) return false;
+
+    const auto& m = q.matches[0];
+    if (m.is_optional) return false;
+    if (m.shortest_path_kind != ShortestPathKind::NONE) return false;
+    if (m.is_khop) return false;
+    if (!m.path_variable.empty()) return false;
+    if (m.limit.has_value()) return false;
+    if (m.pattern.nodes.size() != 2 || m.pattern.edges.size() != 1) return false;
+
+    const auto& edge = m.pattern.edges[0];
+    if (edge.is_variable_length) return false;
+    if (edge.where_expr) return false;
+    if (!edge.properties.empty() || !edge.property_filters.empty()) return false;
+    if (!edge.label_expr || edge.label_expr->kind != LabelExprKind::LITERAL) return false;
+    out.rel_type = edge.label_expr->name;
+
+    for (const auto& item : q.returns) find_aggregates(item.expr.get(), out.aggs);
+    for (const auto& spec : q.order_by) find_aggregates(spec.expr.get(), out.aggs);
+    if (out.aggs.empty()) return false;
+
+    // DISTINCT aggregates (e.g. count(DISTINCT x)) need per-group value dedup, which the streaming
+    // accumulator does not perform; collect_list gathers a list the accumulator does not build. Both
+    // fall back to the normal grouped aggregation path.
+    for (const auto* agg : out.aggs) {
+        if (agg->distinct) return false;
+        if (agg->fn_kind == AggregateKind::COLLECT) return false;
+    }
+
+    // Aggregates must be count(*) or over a single variable / one of its properties.
+    std::string agg_var;
+    for (const auto* agg : out.aggs) {
+        if (!agg->expr) continue;  // count(*)
+        std::string v;
+        if (agg->expr->kind == ExpressionKind::VARIABLE) v = static_cast<const VariableExpr*>(agg->expr.get())->name;
+        else if (agg->expr->kind == ExpressionKind::PROPERTY_LOOKUP) v = static_cast<const PropertyLookupExpr*>(agg->expr.get())->variable;
+        else return false;
+        if (v.empty()) return false;
+        if (agg_var.empty()) agg_var = v;
+        else if (agg_var != v) return false;  // aggregates span two variables
+    }
+
+    const auto& n0 = m.pattern.nodes[0];
+    const auto& n1 = m.pattern.nodes[1];
+    if (n0.variable.empty() || n1.variable.empty()) return false;
+    // A self-loop pattern (both endpoints share one variable) needs the source==target join the
+    // streaming runner never applies; it would count every edge instead of self-loops only.
+    if (n0.variable == n1.variable) return false;
+
+    const PatternNode* group_node = nullptr;
+    const PatternNode* agg_node = nullptr;
+    if (!agg_var.empty()) {
+        if (agg_var == n0.variable) { agg_node = &n0; group_node = &n1; }
+        else if (agg_var == n1.variable) { agg_node = &n1; group_node = &n0; }
+        else return false;
+    }
+
+    // Grouping keys: the non-aggregate RETURN items; must reference a single variable.
+    std::set<std::string> nonagg_vars;
+    for (const auto& item : q.returns) {
+        if (has_aggregates(item.expr.get())) continue;
+        std::string v;
+        if (item.expr->kind == ExpressionKind::VARIABLE) v = static_cast<const VariableExpr*>(item.expr.get())->name;
+        else if (item.expr->kind == ExpressionKind::PROPERTY_LOOKUP) v = static_cast<const PropertyLookupExpr*>(item.expr.get())->variable;
+        else return false;
+        if (v.empty()) return false;
+        nonagg_vars.insert(v);
+        out.grouping_keys.push_back(item.expr.get());
+    }
+    if (nonagg_vars.size() > 1) return false;
+
+    if (!group_node) {
+        // pure count(*): choose the group node from the grouping keys, else default to n1.
+        if (!nonagg_vars.empty()) {
+            const std::string& gv = *nonagg_vars.begin();
+            if (gv == n0.variable) { group_node = &n0; agg_node = &n1; }
+            else if (gv == n1.variable) { group_node = &n1; agg_node = &n0; }
+            else return false;
+        } else {
+            group_node = &n1; agg_node = &n0;
+        }
+    }
+    if (!nonagg_vars.empty() && *nonagg_vars.begin() != group_node->variable) return false;
+
+    std::string group_label, agg_label;
+    if (!node_label_literal(*group_node, group_label)) return false;
+    if (!node_label_literal(*agg_node, agg_label)) return false;
+    if (!group_node->properties.empty() || !group_node->property_filters.empty() || group_node->where_expr) return false;
+    if (!agg_node->properties.empty() || !agg_node->property_filters.empty() || agg_node->where_expr) return false;
+
+    // Direction from group node toward aggregated node. RIGHT means nodes[0]->nodes[1].
+    bool group_is_n0 = (group_node == &n0);
+    if (edge.direction == EdgeDirection::ANY) out.dir = Direction::BOTH;
+    else if (edge.direction == EdgeDirection::RIGHT) out.dir = group_is_n0 ? Direction::OUT : Direction::IN;
+    else out.dir = group_is_n0 ? Direction::IN : Direction::OUT;
+
+    // Non-aggregate ORDER BY expressions are evaluated against the group representative, which
+    // binds only the group variable; a sort key on any other variable would evaluate to NIL and
+    // order the groups arbitrarily (dropping the wrong ones under LIMIT).
+    for (const auto& spec : q.order_by) {
+        if (has_aggregates(spec.expr.get())) continue;
+        std::string v;
+        if (spec.expr->kind == ExpressionKind::VARIABLE) v = static_cast<const VariableExpr*>(spec.expr.get())->name;
+        else if (spec.expr->kind == ExpressionKind::PROPERTY_LOOKUP) v = static_cast<const PropertyLookupExpr*>(spec.expr.get())->variable;
+        else return false;
+        if (v != group_node->variable) return false;
+    }
+
+    out.group_node = group_node;
+    out.agg_node = agg_node;
+    out.group_var = group_node->variable;
+    out.agg_var = agg_node->variable;
+    out.agg_label = agg_label;
+    out.multiplier = q.count_multiplication_factor;
+    return true;
+}
+
+/**
+ * @brief Incremental accumulator for one aggregate over one group--mirrors the batch fold in the
+ *        normal aggregate path so results are byte-for-byte identical.
+ */
+struct EdgeAggAccumulator {
+    AggregateKind kind;
+    const Expression* expr;  // nullptr for count(*)
+    bool distinct = false;        // DISTINCT aggregate: fold over the distinct-value set instead
+    bool count_to_sum = false;    // COUNT rewritten to a degree SUM: empty input yields 0, not null
+    int64_t count = 0;
+    int64_t sum_int = 0;
+    double sum_double = 0.0;
+    bool has_double = false;
+    int64_t val_count = 0;
+    GqlValue extreme;
+    bool extreme_set = false;
+    std::set<GqlValue, GqlValueLess> distinct_vals;
+    std::unordered_set<uint64_t> distinct_node_ids;
+    std::unordered_set<uint64_t> distinct_rel_ids;
+
+    static EdgeAggAccumulator make(const AggregateExpr* agg) {
+        EdgeAggAccumulator acc{agg->fn_kind, agg->expr.get()};
+        acc.distinct = agg->distinct && agg->expr != nullptr;
+        acc.count_to_sum = agg->count_to_sum;
+        return acc;
+    }
+
+    void add(const GqlRow& row) {
+        if (distinct) {
+            GqlValue v = evaluate_expression(row, expr);
+            if (v.type == GqlValue::NIL) return;
+            // count(DISTINCT node/rel) only needs cardinality and entities dedup by id, so store
+            // raw ids: a GqlValue set costs ~10x more per entry, which is the difference between
+            // fitting and bad_alloc for multi-million-entry distinct sets at SF1.
+            if (kind == AggregateKind::COUNT && v.type == GqlValue::NODE) {
+                distinct_node_ids.insert(v.node->getId());
+                return;
+            }
+            if (kind == AggregateKind::COUNT && v.type == GqlValue::RELATIONSHIP) {
+                distinct_rel_ids.insert(v.relationship->getId());
+                return;
+            }
+            distinct_vals.insert(std::move(v));
+            return;
+        }
+        if (kind == AggregateKind::COUNT) {
+            if (!expr) { count++; return; }
+            if (evaluate_expression(row, expr).type != GqlValue::NIL) count++;
+            return;
+        }
+        GqlValue v = evaluate_expression(row, expr);
+        if (kind == AggregateKind::SUM || kind == AggregateKind::AVG) {
+            if (v.type == GqlValue::PROPERTY) {
+                if (std::holds_alternative<int64_t>(v.property)) {
+                    if (has_double) sum_double += static_cast<double>(std::get<int64_t>(v.property));
+                    else sum_int += std::get<int64_t>(v.property);
+                    val_count++;
+                } else if (std::holds_alternative<double>(v.property)) {
+                    if (!has_double) { sum_double = static_cast<double>(sum_int); has_double = true; }
+                    sum_double += std::get<double>(v.property);
+                    val_count++;
+                }
+            }
+        } else if (kind == AggregateKind::MIN) {
+            if (v.type != GqlValue::NIL && (!extreme_set || compare_gql_values(v, extreme) < 0)) { extreme = v; extreme_set = true; }
+        } else if (kind == AggregateKind::MAX) {
+            if (v.type != GqlValue::NIL && (!extreme_set || compare_gql_values(v, extreme) > 0)) { extreme = v; extreme_set = true; }
+        }
+    }
+
+    GqlValue finalize(uint64_t multiplier) const {
+        if (distinct) return finalize_distinct(multiplier);
+        if (kind == AggregateKind::COUNT) {
+            int64_t c = count;
+            if (multiplier > 1) c *= static_cast<int64_t>(multiplier);
+            return GqlValue(c);
+        }
+        if (kind == AggregateKind::SUM) {
+            if (val_count == 0) return count_to_sum ? GqlValue(static_cast<int64_t>(0)) : GqlValue();
+            return has_double ? GqlValue(sum_double) : GqlValue(sum_int);
+        }
+        if (kind == AggregateKind::AVG) {
+            if (val_count == 0) return GqlValue();
+            return has_double ? GqlValue(sum_double / static_cast<double>(val_count))
+                              : GqlValue(static_cast<double>(sum_int) / static_cast<double>(val_count));
+        }
+        return extreme_set ? extreme : GqlValue();
+    }
+
+    GqlValue finalize_distinct(uint64_t multiplier) const {
+        if (kind == AggregateKind::COUNT) {
+            int64_t c = static_cast<int64_t>(distinct_vals.size() + distinct_node_ids.size() + distinct_rel_ids.size());
+            if (multiplier > 1) c *= static_cast<int64_t>(multiplier);
+            return GqlValue(c);
+        }
+        if (kind == AggregateKind::MIN) return distinct_vals.empty() ? GqlValue() : *distinct_vals.begin();
+        if (kind == AggregateKind::MAX) return distinct_vals.empty() ? GqlValue() : *distinct_vals.rbegin();
+        int64_t s_int = 0;
+        double s_double = 0.0;
+        bool dbl = false;
+        int64_t n = 0;
+        for (const auto& v : distinct_vals) {
+            if (v.type != GqlValue::PROPERTY) continue;
+            if (std::holds_alternative<int64_t>(v.property)) {
+                if (dbl) s_double += static_cast<double>(std::get<int64_t>(v.property));
+                else s_int += std::get<int64_t>(v.property);
+                n++;
+            } else if (std::holds_alternative<double>(v.property)) {
+                if (!dbl) { s_double = static_cast<double>(s_int); dbl = true; }
+                s_double += std::get<double>(v.property);
+                n++;
+            }
+        }
+        if (n == 0) return GqlValue();
+        if (kind == AggregateKind::SUM) return dbl ? GqlValue(s_double) : GqlValue(s_int);
+        double total = dbl ? s_double : static_cast<double>(s_int);
+        return GqlValue(total / static_cast<double>(n));
+    }
+};
+
+struct EdgeAggGroupState {
+    bool initialized = false;
+    GqlRow rep;
+    std::vector<EdgeAggAccumulator> accs;
+};
+
+struct EdgeAggRunState {
+    std::map<std::vector<GqlValue>, EdgeAggGroupState, GqlValueVectorLess> groups;
+};
+
+/**
+ * @brief Execute a group-anchored streaming aggregate (see EdgeAggPlan). Iterates the group-side
+ *        nodes, folds each one's aggregated-side neighbours into per-group accumulators, then
+ *        projects/sorts/limits the (small) group set exactly as the normal aggregate path does.
+ */
+static seastar::future<QueryResult> run_streaming_edge_aggregate(
+        ragedb::Graph& graph, std::shared_ptr<GqlQuery> query_ptr, EdgeAggPlan plan) {
+    auto state = std::make_shared<EdgeAggRunState>();
+    auto plan_ptr = std::make_shared<EdgeAggPlan>(std::move(plan));
+
+    // Keep the group node's properties intact (grouping keys read them); the default pruner would
+    // strip every property.
+    ProjectionPruner group_pruner;
+    group_pruner.whole_objects.insert(plan_ptr->group_var);
+
+    // Whether any accumulator evaluates an expression against the row: pure count(*) folds never
+    // look at the neighbour binding, so the per-neighbour row write is skipped entirely for them.
+    const bool needs_neighbor_binding = std::any_of(plan_ptr->aggs.begin(), plan_ptr->aggs.end(),
+        [](const AggregateExpr* a) { return a->expr != nullptr; });
+
+    return get_start_nodes(graph, *plan_ptr->group_node, 0, group_pruner)
+    .then([&graph, state, plan_ptr, needs_neighbor_binding](std::vector<Node> group_nodes) {
+        auto nodes = std::make_shared<std::vector<Node>>(std::move(group_nodes));
+        // Bounded fan-out instead of one-at-a-time: each group's neighbour fetch is an RPC, and
+        // awaiting them serially leaves the reactor idle for num_groups x latency.
+        return seastar::max_concurrent_for_each(nodes->begin(), nodes->end(), 32,
+            [&graph, state, plan_ptr, needs_neighbor_binding](Node& g) {
+                uint64_t gid = g.getId();
+                return graph.shard.local().NodeGetNeighborsPeered(gid, plan_ptr->dir, plan_ptr->rel_type)
+                .then([state, plan_ptr, needs_neighbor_binding, g = std::move(g)](std::vector<Node> neighbors) {
+                    const auto& plan = *plan_ptr;
+                    GqlRow rep;
+                    rep.bindings[plan.group_var] = GqlValue(g);
+
+                    bool any = false;
+                    EdgeAggGroupState* gstate = nullptr;
+                    GqlRow row;  // reused across neighbours: only the aggregated binding changes
+                    for (auto& n : neighbors) {
+                        if (!plan.agg_label.empty() && n.getType() != plan.agg_label) continue;
+                        if (!any) {
+                            std::vector<GqlValue> key;
+                            for (const auto* gk : plan.grouping_keys) key.push_back(evaluate_expression(rep, gk));
+                            gstate = &state->groups[key];
+                            if (!gstate->initialized) {
+                                gstate->rep = rep;
+                                for (const auto* agg : plan.aggs) gstate->accs.push_back(EdgeAggAccumulator::make(agg));
+                                gstate->initialized = true;
+                            }
+                            if (needs_neighbor_binding) row = rep;
+                            any = true;
+                        }
+                        if (needs_neighbor_binding) {
+                            row.bindings[plan.agg_var] = GqlValue(std::move(n));
+                        }
+                        for (auto& acc : gstate->accs) acc.add(row);
+                    }
+                });
+            }
+        ).then([state, plan_ptr, nodes] { (void)nodes; });
+    }).then([query_ptr, state, plan_ptr] {
+        const auto& query = *query_ptr;
+        const auto& plan = *plan_ptr;
+
+        QueryResult result;
+        for (size_t i = 0; i < query.returns.size(); ++i) {
+            result.column_names.push_back(return_item_column_name(query.returns[i], i));
+        }
+
+        // Ungrouped aggregate over an empty expansion still yields one row (e.g. count -> 0).
+        if (state->groups.empty() && plan.grouping_keys.empty()) {
+            EdgeAggGroupState empty_group;
+            empty_group.rep = GqlRow{};
+            for (const auto* agg : plan.aggs) empty_group.accs.push_back(EdgeAggAccumulator::make(agg));
+            empty_group.initialized = true;
+            state->groups[{}] = std::move(empty_group);
+        }
+
+        struct GroupRow { std::vector<GqlValue> projected; std::vector<GqlValue> sort_keys; };
+        std::vector<GroupRow> rows;
+        for (auto& [key, gstate] : state->groups) {
+            (void)key;
+            std::map<const AggregateExpr*, GqlValue> agg_results;
+            for (size_t i = 0; i < plan.aggs.size(); ++i) {
+                agg_results[plan.aggs[i]] = gstate.accs[i].finalize(plan.multiplier);
+            }
+            GroupRow gr;
+            for (const auto& item : query.returns) {
+                gr.projected.push_back(evaluate_group_expression(gstate.rep, agg_results, item.expr.get()));
+            }
+            for (const auto& spec : query.order_by) {
+                gr.sort_keys.push_back(evaluate_group_expression(gstate.rep, agg_results, spec.expr.get()));
+            }
+            rows.push_back(std::move(gr));
+        }
+
+        if (!query.order_by.empty()) {
+            auto comp = [&query](const GroupRow& a, const GroupRow& b) {
+                for (size_t i = 0; i < query.order_by.size(); ++i) {
+                    int cmp = compare_gql_values(a.sort_keys[i], b.sort_keys[i]);
+                    if (cmp != 0) return query.order_by[i].ascending ? (cmp < 0) : (cmp > 0);
+                }
+                return false;
+            };
+            if (query.limit && *query.limit < rows.size()) {
+                std::partial_sort(rows.begin(), rows.begin() + *query.limit, rows.end(), comp);
+                rows.resize(*query.limit);
+            } else {
+                std::stable_sort(rows.begin(), rows.end(), comp);
+            }
+        } else if (query.limit && *query.limit < rows.size()) {
+            rows.resize(*query.limit);
+        }
+
+        for (auto& gr : rows) result.rows.push_back(std::move(gr.projected));
+        return result;
+    });
+}
+
+static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph, std::shared_ptr<GqlQuery> query_ptr, std::optional<std::vector<GqlRow>> incoming = std::nullopt);
+
+/**
+ * @brief Convert a completed segment's QueryResult into input rows for the next WITH-pipeline
+ *        segment: each projected output column becomes a binding under its column name. Takes the
+ *        result by value and moves every cell, so the pipe holds one copy of the data, not two.
+ */
+static std::vector<GqlRow> query_result_to_rows(QueryResult res) {
+    std::vector<GqlRow> rows;
+    rows.reserve(res.rows.size());
+    for (auto& r : res.rows) {
+        GqlRow gr;
+        for (size_t i = 0; i < res.column_names.size() && i < r.size(); ++i) {
+            gr.bindings[res.column_names[i]] = std::move(r[i]);
+        }
+        rows.push_back(std::move(gr));
+    }
+    return rows;
+}
+
+/**
+ * @brief Execute WITH-pipeline segments [idx..], piping each one's projected rows into the next, and
+ *        return the rows to feed into the final (RETURN) segment. An empty segment still pipes its
+ *        (empty) rows onward: a later ungrouped aggregate over zero rows must yield one row (count 0).
+ */
+static seastar::future<std::vector<GqlRow>> execute_with_segments(
+        ragedb::Graph& graph, std::shared_ptr<GqlQuery> query_ptr, size_t idx,
+        std::optional<std::vector<GqlRow>> incoming) {
+    if (idx >= query_ptr->with_segments.size()) {
+        return seastar::make_ready_future<std::vector<GqlRow>>(
+            incoming.has_value() ? std::move(*incoming) : std::vector<GqlRow>{});
+    }
+    auto seg = query_ptr->with_segments[idx];
+    return execute_query_internal(graph, seg, std::move(incoming)).then(
+        [&graph, query_ptr, idx](QueryResult res) {
+            std::vector<GqlRow> rows = query_result_to_rows(std::move(res));
+            return execute_with_segments(graph, query_ptr, idx + 1,
+                std::optional<std::vector<GqlRow>>(std::move(rows)));
+        });
+}
+
+/**
+ * @brief Whether a query's single match statement can be driven through the streaming traversal
+ *        sink: a plain (non-optional, non-search, non-fast-path) pattern with at least one edge
+ *        and nothing that needs the materialised row set as a whole. The streamed shapes are the
+ *        expansion-heavy ones that OOM when collected (tasks 018/020).
+ */
+static bool match_streamable(const MatchStatement& m) {
+    if (m.is_optional || m.is_search || m.is_khop) return false;
+    if (m.shortest_path_kind != ShortestPathKind::NONE) return false;
+    if (m.algebraic_path_count || m.khop_count_only) return false;
+    if (m.equivalence_partition_lookup || m.transitive_reachability_lookup) return false;
+    if (!m.path_variable.empty()) return false;
+    if (m.limit.has_value()) return false;
+    if (m.pattern.edges.empty()) return false;
+    return true;
+}
+
+static bool stream_eligible(const GqlQuery& q) {
+    if (q.kind != QueryKind::SINGLE) return false;
+    if (q.explain || q.profile) return false;
+    if (!q.writes.empty()) return false;
+    if (q.has_unnested_subquery) return false;
+    if (q.matches.size() != 1) return false;
+    if (!q.let_bindings.empty()) return false; // LET adds computed columns; use the materialising path
+    return match_streamable(q.matches[0]);
+}
+
+/**
+ * @brief Whether a grouped/ungrouped aggregate can be streamed through a MULTI-match chain: every
+ *        match is individually streamable and the segment carries no shape that needs the whole
+ *        materialised row set. This bounds the FoF + expansion + count(DISTINCT) class (tasks 018/029)
+ *        that OOM-crashes when the full (frontier x expansion) join is collected before aggregating.
+ *        Cross-match DIFFERENT-EDGES uniqueness is enforced on the completed row in the fold sink.
+ */
+static bool stream_group_eligible(const GqlQuery& q) {
+    if (q.kind != QueryKind::SINGLE) return false;
+    if (q.explain || q.profile) return false;
+    if (!q.writes.empty()) return false;
+    if (q.has_unnested_subquery) return false;
+    if (!q.let_bindings.empty()) return false;
+    if (q.matches.empty()) return false;
+    for (const auto& m : q.matches) {
+        if (!match_streamable(m)) return false;
+    }
+    return true;
+}
+
+/**
+ * @brief Streamed ORDER BY + LIMIT: fold every matched row into a bounded top-K heap as the
+ *        traversal produces it, so peak memory is K rows plus one traversal chunk instead of the
+ *        whole expansion (the IC2/IC9 OOM class). Row-level filters (path modes, residual WHERE)
+ *        are applied before the heap; the projection runs over the K winners at the end.
+ */
+static seastar::future<QueryResult> run_streaming_topk(
+        ragedb::Graph& graph, std::shared_ptr<GqlQuery> query_ptr,
+        std::optional<std::vector<GqlRow>> incoming, const ProjectionPruner& pruner) {
+    struct TopKEntry {
+        std::vector<GqlValue> keys;
+        GqlRow row;
+    };
+    struct TopKState {
+        std::vector<TopKEntry> heap;
+        size_t k = 0;
+    };
+    auto st = std::make_shared<TopKState>();
+    st->k = *query_ptr->limit;
+
+    // Orders entries by the ORDER BY specs; the heap is a max-heap under this comparator, so its
+    // front is the current worst kept entry.
+    auto entry_less = [query_ptr](const TopKEntry& a, const TopKEntry& b) {
+        for (size_t i = 0; i < query_ptr->order_by.size(); ++i) {
+            int cmp = compare_gql_values(a.keys[i], b.keys[i]);
+            if (cmp != 0) return query_ptr->order_by[i].ascending ? (cmp < 0) : (cmp > 0);
+        }
+        return false;
+    };
+
+    auto sink = std::make_shared<GqlRowSink>();
+    sink->consume = [st, query_ptr, entry_less](std::vector<GqlRow> rows) {
+        const auto& stmt = query_ptr->matches[0];
+        for (auto& r : rows) {
+            if (!satisfies_match_path_modes(r, stmt.match_mode, stmt.path_mode, stmt.pattern)) continue;
+            if (query_ptr->where_expr && !evaluate_expression(r, query_ptr->where_expr.get()).is_truthy()) continue;
+            TopKEntry e;
+            e.keys.reserve(query_ptr->order_by.size());
+            for (const auto& spec : query_ptr->order_by) {
+                e.keys.push_back(evaluate_expression(r, spec.expr.get()));
+            }
+            if (st->heap.size() < st->k) {
+                e.row = std::move(r);
+                st->heap.push_back(std::move(e));
+                std::push_heap(st->heap.begin(), st->heap.end(), entry_less);
+            } else if (st->k > 0 && entry_less(e, st->heap.front())) {
+                e.row = std::move(r);
+                std::pop_heap(st->heap.begin(), st->heap.end(), entry_less);
+                st->heap.back() = std::move(e);
+                std::push_heap(st->heap.begin(), st->heap.end(), entry_less);
+            }
+        }
+        return seastar::make_ready_future<>();
+    };
+
+    auto rows_in = std::make_shared<std::vector<GqlRow>>(
+        incoming.has_value() ? std::move(*incoming) : std::vector<GqlRow>{ GqlRow{} });
+    return seastar::max_concurrent_for_each(rows_in->begin(), rows_in->end(), gql_stream_concurrency,
+        [&graph, query_ptr, pruner, sink](GqlRow& in) {
+            const auto& stmt = query_ptr->matches[0];
+            return traverse_path_pattern(graph, stmt.pattern, in, 0, pruner, "", true, false,
+                                         stmt.path_mode, sink.get()).discard_result();
+        })
+    .then([st, query_ptr, entry_less, rows_in, sink] {
+        std::sort(st->heap.begin(), st->heap.end(), entry_less);
+        QueryResult res;
+        res.is_sorted = true;
+        for (size_t i = 0; i < query_ptr->returns.size(); ++i) {
+            res.column_names.push_back(return_item_column_name(query_ptr->returns[i], i));
+        }
+        for (auto& e : st->heap) {
+            std::vector<GqlValue> projected;
+            projected.reserve(query_ptr->returns.size());
+            for (const auto& item : query_ptr->returns) {
+                projected.push_back(evaluate_expression(e.row, item.expr.get()));
+            }
+            res.rows.push_back(std::move(projected));
+        }
+        return res;
+    });
+}
+
+/**
+ * @brief Collect the user-named edge variables that participate in a DIFFERENT EDGES match (GQL's
+ *        default). Auto-generated (`_`-prefixed) edge variables are excluded, matching the batch path.
+ */
+static std::set<std::string> collect_different_edge_vars(const GqlQuery& q) {
+    std::set<std::string> vars;
+    for (const auto& stmt : q.matches) {
+        if (stmt.match_mode == MatchMode::DIFFERENT_EDGES) {
+            for (const auto& edge : stmt.pattern.edges) {
+                if (!edge.variable.empty() && edge.variable[0] != '_') vars.insert(edge.variable);
+            }
+        }
+    }
+    return vars;
+}
+
+/** @brief Whether the relationships bound to the DIFFERENT-EDGES variables in a completed row are all
+ *         distinct (the cross-match GQL uniqueness the batch path enforces at PathTraverser.cpp). */
+static bool row_edges_all_distinct(const GqlRow& row, const std::set<std::string>& diff_edge_vars) {
+    if (diff_edge_vars.empty()) return true;
+    std::vector<uint64_t> rel_ids;
+    for (const auto& var : diff_edge_vars) {
+        auto it = row.bindings.find(var);
+        if (it == row.bindings.end()) continue;
+        const auto& val = it->second;
+        if (val.type == GqlValue::RELATIONSHIP) {
+            rel_ids.push_back(val.relationship->getId());
+        } else if (val.type == GqlValue::RELATIONSHIP_LIST) {
+            for (const auto& r : *val.relationship_list) rel_ids.push_back(r.getId());
+        } else if (val.type == GqlValue::PATH) {
+            for (const auto& r : val.path->GetRelationships()) rel_ids.push_back(r.getId());
+        }
+    }
+    std::set<uint64_t> uniq(rel_ids.begin(), rel_ids.end());
+    return uniq.size() == rel_ids.size();
+}
+
+/**
+ * @brief Stream one input row through matches[idx..], emitting each fully-joined row to final_sink.
+ *        Cross-match binding works because traverse_path_pattern uses already-bound variables in the
+ *        row as pattern anchors; each match's path/mode constraint is checked on its own output before
+ *        driving the next match. This keeps a multi-match expansion (FoF -> forum -> post) bounded to
+ *        one traversal chunk instead of the whole join (task 029).
+ */
+static seastar::future<> stream_match_chain(
+        ragedb::Graph& graph, std::shared_ptr<GqlQuery> query_ptr,
+        std::shared_ptr<const ProjectionPruner> pruner, size_t idx, GqlRow row,
+        std::shared_ptr<GqlRowSink> final_sink) {
+    if (idx >= query_ptr->matches.size()) {
+        return final_sink->consume(std::vector<GqlRow>{ std::move(row) });
+    }
+    const auto& stmt = query_ptr->matches[idx];
+    auto next_sink = std::make_shared<GqlRowSink>();
+    next_sink->consume = [&graph, query_ptr, pruner, idx, final_sink,
+                          mode = stmt.match_mode, pmode = stmt.path_mode,
+                          pattern = &stmt.pattern](std::vector<GqlRow> rows) {
+        auto rows_ptr = std::make_shared<std::vector<GqlRow>>(std::move(rows));
+        return seastar::max_concurrent_for_each(*rows_ptr, gql_stream_inner_concurrency,
+            [&graph, query_ptr, pruner, idx, final_sink, mode, pmode, pattern](GqlRow& r) {
+                if (!satisfies_match_path_modes(r, mode, pmode, *pattern)) {
+                    return seastar::make_ready_future<>();
+                }
+                return stream_match_chain(graph, query_ptr, pruner, idx + 1, std::move(r), final_sink);
+            }).finally([rows_ptr] {});
+    };
+    return traverse_path_pattern(graph, stmt.pattern, row, 0, *pruner, "", true, false,
+                                 stmt.path_mode, next_sink.get())
+        .discard_result().finally([next_sink] {});
+}
+
+/**
+ * @brief Streamed grouped aggregation over one or more match statements (with or without piped input
+ *        rows): every fully-joined row folds into per-group incremental accumulators as it is
+ *        produced, so peak memory is O(groups) instead of the whole expansion (the FoF DISTINCT ->
+ *        expand -> aggregate crash class, tasks 018/029). Grouping keys are the non-aggregate RETURN
+ *        items, the group representative is its first row, and the final project/sort/limit runs over
+ *        the group set.
+ */
+static seastar::future<QueryResult> run_streaming_group_fold(
+        ragedb::Graph& graph, std::shared_ptr<GqlQuery> query_ptr,
+        std::optional<std::vector<GqlRow>> incoming, const ProjectionPruner& pruner,
+        std::vector<const Expression*> grouping_keys, std::vector<const AggregateExpr*> aggs) {
+    struct GroupState {
+        GqlRow rep;
+        std::vector<EdgeAggAccumulator> accs;
+    };
+    struct FoldState {
+        std::map<std::vector<GqlValue>, GroupState, GqlValueVectorLess> groups;
+    };
+    auto st = std::make_shared<FoldState>();
+    auto keys_ptr = std::make_shared<std::vector<const Expression*>>(std::move(grouping_keys));
+    auto aggs_ptr = std::make_shared<std::vector<const AggregateExpr*>>(std::move(aggs));
+
+    auto diff_edge_vars = std::make_shared<std::set<std::string>>(collect_different_edge_vars(*query_ptr));
+    auto sink = std::make_shared<GqlRowSink>();
+    sink->consume = [st, query_ptr, keys_ptr, aggs_ptr, diff_edge_vars](std::vector<GqlRow> rows) {
+        for (auto& r : rows) {
+            // Per-match path/mode constraints were checked in the chain; here the row is fully joined,
+            // so apply the cross-match DIFFERENT-EDGES uniqueness and the segment WHERE, then fold.
+            if (!row_edges_all_distinct(r, *diff_edge_vars)) continue;
+            if (query_ptr->where_expr && !evaluate_expression(r, query_ptr->where_expr.get()).is_truthy()) continue;
+            std::vector<GqlValue> key;
+            key.reserve(keys_ptr->size());
+            for (const auto* gk : *keys_ptr) key.push_back(evaluate_expression(r, gk));
+            auto [it, inserted] = st->groups.try_emplace(std::move(key));
+            if (inserted) {
+                it->second.rep = r;
+                it->second.accs.reserve(aggs_ptr->size());
+                for (const auto* agg : *aggs_ptr) it->second.accs.push_back(EdgeAggAccumulator::make(agg));
+            }
+            for (auto& acc : it->second.accs) acc.add(r);
+        }
+        return seastar::make_ready_future<>();
+    };
+
+    auto pruner_ptr = std::make_shared<const ProjectionPruner>(pruner);
+    auto rows_in = std::make_shared<std::vector<GqlRow>>(
+        incoming.has_value() ? std::move(*incoming) : std::vector<GqlRow>{ GqlRow{} });
+    return seastar::max_concurrent_for_each(rows_in->begin(), rows_in->end(), gql_stream_concurrency,
+        [&graph, query_ptr, pruner_ptr, sink](GqlRow& in) {
+            return stream_match_chain(graph, query_ptr, pruner_ptr, 0, in, sink);
+        })
+    .then([st, query_ptr, keys_ptr, aggs_ptr, rows_in, sink] {
+        const auto& query = *query_ptr;
+
+        QueryResult result;
+        for (size_t i = 0; i < query.returns.size(); ++i) {
+            result.column_names.push_back(return_item_column_name(query.returns[i], i));
+        }
+
+        // Ungrouped aggregate over an empty expansion still yields one row (e.g. count -> 0).
+        if (st->groups.empty() && keys_ptr->empty()) {
+            GroupState empty_group;
+            empty_group.rep = GqlRow{};
+            for (const auto* agg : *aggs_ptr) empty_group.accs.push_back(EdgeAggAccumulator::make(agg));
+            st->groups[{}] = std::move(empty_group);
+        }
+
+        struct GroupRow {
+            std::vector<GqlValue> projected;
+            std::vector<GqlValue> sort_keys;
+        };
+        std::vector<GroupRow> rows;
+        rows.reserve(st->groups.size());
+        for (auto& [key, gstate] : st->groups) {
+            (void)key;
+            std::map<const AggregateExpr*, GqlValue> agg_results;
+            for (size_t i = 0; i < aggs_ptr->size(); ++i) {
+                agg_results[(*aggs_ptr)[i]] = gstate.accs[i].finalize(query.count_multiplication_factor);
+            }
+            GroupRow gr;
+            for (const auto& item : query.returns) {
+                gr.projected.push_back(evaluate_group_expression(gstate.rep, agg_results, item.expr.get()));
+            }
+            for (const auto& spec : query.order_by) {
+                gr.sort_keys.push_back(evaluate_group_expression(gstate.rep, agg_results, spec.expr.get()));
+            }
+            rows.push_back(std::move(gr));
+        }
+
+        if (!query.order_by.empty()) {
+            auto comp = [&query](const GroupRow& a, const GroupRow& b) {
+                for (size_t i = 0; i < query.order_by.size(); ++i) {
+                    int cmp = compare_gql_values(a.sort_keys[i], b.sort_keys[i]);
+                    if (cmp != 0) return query.order_by[i].ascending ? (cmp < 0) : (cmp > 0);
+                }
+                return false;
+            };
+            if (query.limit && *query.limit < rows.size()) {
+                std::partial_sort(rows.begin(), rows.begin() + static_cast<std::ptrdiff_t>(*query.limit), rows.end(), comp);
+                rows.resize(*query.limit);
+            } else {
+                std::stable_sort(rows.begin(), rows.end(), comp);
+            }
+        } else if (query.limit && *query.limit < rows.size()) {
+            rows.resize(*query.limit);
+        }
+
+        for (auto& gr : rows) result.rows.push_back(std::move(gr.projected));
+        return result;
+    });
+}
+
+static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph, std::shared_ptr<GqlQuery> query_ptr, std::optional<std::vector<GqlRow>> incoming) {
+    // WITH continuation segments carry piped rows; planners that answer from indexes or run the
+    // pattern from scratch cannot consume them and must be skipped (they would ignore the pipe).
+    const bool has_incoming = incoming.has_value();
     if (query_ptr->no_op) {
         QueryResult query_res;
         for (size_t i = 0; i < query_ptr->returns.size(); ++i) {
-            const auto& item = query_ptr->returns[i];
-            std::string key;
-            if (item.alias) {
-                key = *item.alias;
-            } else {
-                if (item.expr->kind == ExpressionKind::PROPERTY_LOOKUP) {
-                    auto* pl = static_cast<const PropertyLookupExpr*>(item.expr.get());
-                    key = pl->variable + "." + pl->property;
-                } else if (item.expr->kind == ExpressionKind::VARIABLE) {
-                    auto* ve = static_cast<const VariableExpr*>(item.expr.get());
-                    key = ve->name;
-                } else if (item.expr->kind == ExpressionKind::AGGREGATION) {
-                    auto* ae = static_cast<const AggregateExpr*>(item.expr.get());
-                    std::string fn_name;
-                    if (ae->fn_kind == AggregateKind::COUNT) fn_name = "count";
-                    else if (ae->fn_kind == AggregateKind::SUM) fn_name = "sum";
-                    else if (ae->fn_kind == AggregateKind::AVG) fn_name = "avg";
-                    else if (ae->fn_kind == AggregateKind::MIN) fn_name = "min";
-                    else fn_name = "max";
-
-                    if (!ae->expr) {
-                        key = fn_name + "(*)";
-                    } else if (ae->expr->kind == ExpressionKind::PROPERTY_LOOKUP) {
-                        auto* pl = static_cast<const PropertyLookupExpr*>(ae->expr.get());
-                        key = fn_name + "(" + pl->variable + "." + pl->property + ")";
-                    } else if (ae->expr->kind == ExpressionKind::VARIABLE) {
-                        auto* ve = static_cast<const VariableExpr*>(ae->expr.get());
-                        key = fn_name + "(" + ve->name + ")";
-                    } else {
-                        key = fn_name + "(expr)";
-                    }
-                } else {
-                    key = "column_" + std::to_string(i);
-                }
-            }
-            query_res.column_names.push_back(key);
+            query_res.column_names.push_back(return_item_column_name(query_ptr->returns[i], i));
         }
         return seastar::make_ready_future<QueryResult>(std::move(query_res));
+    }
+
+    // WITH pipeline: execute the prefix segments (each projecting rows forward), then run the final
+    // RETURN segment on the piped rows. The final segment is this query with its with_segments removed.
+    if (!query_ptr->with_segments.empty()) {
+        return execute_with_segments(graph, query_ptr, 0, std::move(incoming))
+        .then([&graph, query_ptr](std::vector<GqlRow> piped) {
+            auto final_seg = std::make_shared<GqlQuery>(query_ptr->clone());
+            final_seg->with_segments.clear();
+            return execute_query_internal(graph, final_seg, std::optional<std::vector<GqlRow>>(std::move(piped)));
+        });
     }
 
     // 1. Handle Set Operations (UNION, UNION ALL, INTERSECT, INTERSECT ALL)
@@ -308,6 +1173,41 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
         });
     }
 
+    // Fast path: a pure COUNT over a single node pattern is answered directly from the shard count
+    // indexes, without materializing Node objects--otherwise counting a large label (e.g.
+    // count(Comment) over millions of rows) exhausts memory.
+    {
+        SimpleNodeCountPlan cplan;
+        if (!has_incoming && query_ptr->let_bindings.empty() && try_plan_simple_node_count(*query_ptr, cplan)) {
+            seastar::future<uint64_t> count_fut = cplan.has_filter
+                ? graph.shard.local().FindNodeCountPeered(cplan.label, cplan.filter_property, cplan.filter_op, cplan.filter_value)
+                : (cplan.has_label ? graph.shard.local().AllNodesCountPeered(cplan.label)
+                                   : graph.shard.local().AllNodesCountPeered());
+            return count_fut.then([cplan](uint64_t c) {
+                int64_t value = static_cast<int64_t>(c);
+                if (cplan.multiplier > 1) {
+                    value *= static_cast<int64_t>(cplan.multiplier);
+                }
+                QueryResult result;
+                result.column_names.push_back(cplan.column_name);
+                std::vector<GqlValue> row;
+                row.push_back(GqlValue(value));
+                result.rows.push_back(std::move(row));
+                return result;
+            });
+        }
+    }
+
+    // Fast path: a grouped/ungrouped aggregate over a single-edge expansion is streamed group by
+    // group (see EdgeAggPlan) instead of materialising the whole (a,b) expansion--otherwise a
+    // large expansion (e.g. count(comment) per person over millions of comments) exhausts memory.
+    {
+        EdgeAggPlan eplan;
+        if (!has_incoming && query_ptr->let_bindings.empty() && plan_streaming_edge_aggregate(*query_ptr, eplan)) {
+            return run_streaming_edge_aggregate(graph, query_ptr, std::move(eplan));
+        }
+    }
+
     // 2. Detect if the query contains aggregate functions (COUNT, SUM, AVG, MIN, MAX)
     bool query_contains_aggregates = false;
     for (const auto& item : query_ptr->returns) {
@@ -325,9 +1225,15 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
         }
     }
 
-    // Determine if we can push limit evaluation directly into the traversal
+    // Determine if we can push limit evaluation directly into the traversal. Pushing the LIMIT as
+    // the physical scan bound is only sound when every remaining predicate is applied INSIDE the
+    // scan; if any predicate is evaluated (or rows are collapsed) after the scan, scanning exactly
+    // `limit` rows under-returns. In those cases scan with the default bound and truncate. The
+    // residual conditions live in has_post_scan_residual_predicate, shared with the
+    // LimitPushdownOptimizer so the two gates cannot drift.
     size_t limit_val = 0;
-    if (query_ptr->limit.has_value() && query_ptr->order_by.empty() && !query_contains_aggregates) {
+    if (query_ptr->limit.has_value() && query_ptr->order_by.empty() &&
+        !query_contains_aggregates && !has_post_scan_residual_predicate(*query_ptr)) {
         limit_val = *query_ptr->limit;
     }
 
@@ -342,6 +1248,11 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
     // Collect properties accessed in ORDER BY specs
     for (const auto& spec : query_ptr->order_by) {
         collect_accessed_properties(spec.expr.get(), pruner.accessed_props, pruner.whole_objects);
+    }
+
+    // Collect properties accessed in ISO GQL LET binding expressions
+    for (const auto& let : query_ptr->let_bindings) {
+        collect_accessed_properties(let.expr.get(), pruner.accessed_props, pruner.whole_objects);
     }
 
     // Collect properties accessed in WHERE filter
@@ -402,6 +1313,82 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
         }
     }
 
+    // A variable used ONLY as a bare count(...) / count(DISTINCT ...) argument contributes just
+    // its identity (node comparison and dedup are by id), so its properties can be pruned: a
+    // count(DISTINCT post) over a large expansion otherwise carries every post's full property
+    // map through traversal and into the distinct set. Skipped when a path variable is bound
+    // (paths embed the nodes wholesale) or when writes are present.
+    if (query_ptr->writes.empty() &&
+        std::none_of(query_ptr->matches.begin(), query_ptr->matches.end(),
+                     [](const MatchStatement& m) { return !m.path_variable.empty(); })) {
+        std::vector<const AggregateExpr*> pruning_aggs;
+        for (const auto& item : query_ptr->returns) find_aggregates(item.expr.get(), pruning_aggs);
+        for (const auto& spec : query_ptr->order_by) find_aggregates(spec.expr.get(), pruning_aggs);
+        for (const auto* agg : pruning_aggs) {
+            if (agg->fn_kind != AggregateKind::COUNT || !agg->expr ||
+                agg->expr->kind != ExpressionKind::VARIABLE) {
+                continue;
+            }
+            const std::string& v = static_cast<const VariableExpr*>(agg->expr.get())->name;
+            bool outside = query_ptr->where_expr &&
+                is_variable_referenced_outside_count(query_ptr->where_expr.get(), v);
+            for (const auto& item : query_ptr->returns) {
+                if (outside) break;
+                outside = is_variable_referenced_outside_count(item.expr.get(), v);
+            }
+            for (const auto& spec : query_ptr->order_by) {
+                if (outside) break;
+                outside = is_variable_referenced_outside_count(spec.expr.get(), v);
+            }
+            if (!outside) {
+                pruner.whole_objects.erase(v);
+                pruner.accessed_props.try_emplace(v);
+            }
+        }
+    }
+
+    // Streaming execution (tasks 018/020): expansion-heavy shapes fold matched rows as they are
+    // produced instead of materialising the whole expansion, bounding peak memory.
+    // Streaming top-K: a single-match ORDER BY + LIMIT without aggregates folds into a bounded heap.
+    if (stream_eligible(*query_ptr) && !query_ptr->distinct &&
+        !query_ptr->order_by.empty() && query_ptr->limit.has_value() && !query_contains_aggregates) {
+        return run_streaming_topk(graph, query_ptr, std::move(incoming), pruner);
+    }
+    // Streaming grouped aggregate: one or more streamable matches (bounds the FoF -> expand ->
+    // count(DISTINCT) crash class, task 029) by folding each joined row into per-group accumulators.
+    if (stream_group_eligible(*query_ptr) && !query_ptr->distinct && query_contains_aggregates) {
+        // Mirrors the batch fold's key derivation: a bare returned variable groups by the whole
+        // entity, so property lookups on it are not separate keys.
+        std::set<std::string> group_variables;
+        for (const auto& item : query_ptr->returns) {
+            if (item.expr && !has_aggregates(item.expr.get()) && item.expr->kind == ExpressionKind::VARIABLE) {
+                group_variables.insert(static_cast<const VariableExpr*>(item.expr.get())->name);
+            }
+        }
+        std::vector<const Expression*> grouping_keys;
+        for (const auto& item : query_ptr->returns) {
+            if (has_aggregates(item.expr.get())) continue;
+            if (item.expr->kind == ExpressionKind::PROPERTY_LOOKUP &&
+                group_variables.count(static_cast<const PropertyLookupExpr*>(item.expr.get())->variable)) {
+                continue;
+            }
+            grouping_keys.push_back(item.expr.get());
+        }
+        std::vector<const AggregateExpr*> aggs;
+        for (const auto& item : query_ptr->returns) find_aggregates(item.expr.get(), aggs);
+        for (const auto& spec : query_ptr->order_by) find_aggregates(spec.expr.get(), aggs);
+        // collect_list gathers a list the streaming accumulator does not build; use the materialising
+        // group path for it.
+        bool has_collect = false;
+        for (const auto* a : aggs) {
+            if (a->fn_kind == AggregateKind::COLLECT) { has_collect = true; break; }
+        }
+        if (!aggs.empty() && !has_collect) {
+            return run_streaming_group_fold(graph, query_ptr, std::move(incoming), pruner,
+                                            std::move(grouping_keys), std::move(aggs));
+        }
+    }
+
     // 4. Optimize sorting if the order matches the start node traversal index order
     std::string sort_property = "";
     bool sort_ascending = true;
@@ -437,8 +1424,11 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
         }
     }
 
-    // 5. Execute matching patterns recursively using sharded traversal
-    IntermediateResult initial_res(std::vector<GqlRow>{ GqlRow{} });
+    // 5. Execute matching patterns recursively using sharded traversal. WITH-pipeline continuation
+    // segments start from the rows piped in from the previous segment rather than a single empty row.
+    IntermediateResult initial_res = incoming.has_value()
+        ? IntermediateResult(std::move(*incoming))
+        : IntermediateResult(std::vector<GqlRow>{ GqlRow{} });
     auto is_sorted_shared = std::make_shared<bool>(false);
 
     auto is_query_cyclic = [](const std::vector<MatchStatement>& matches) -> bool {
@@ -491,7 +1481,7 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
 
     bool use_honeycomb = false;
     bool use_lftj = false;
-    if (is_query_cyclic(query_ptr->matches) && query_ptr->count_multiplication_factor <= 1) {
+    if (!has_incoming && is_query_cyclic(query_ptr->matches) && query_ptr->count_multiplication_factor <= 1) {
         uint64_t total_rels = 0;
         for (const auto& match : query_ptr->matches) {
             if (match.is_search) continue;
@@ -610,6 +1600,18 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
             matched_rows = std::move(edge_filtered_rows);
         }
 
+        // 6b. Evaluate ISO GQL LET bindings against each matched row so the segment's WHERE/FILTER,
+        //     ORDER BY, and RETURN can reference them (LET adds computed columns to the working table).
+        if (!query.let_bindings.empty()) {
+            for (auto& row : matched_rows) {
+                for (const auto& let : query.let_bindings) {
+                    if (let.alias) {
+                        row.bindings[*let.alias] = evaluate_expression(row, let.expr.get());
+                    }
+                }
+            }
+        }
+
         // 7. Evaluate GQL WHERE clause filter expression on match results
         std::vector<GqlRow> filtered_rows;
         auto filter_start = std::chrono::steady_clock::now();
@@ -688,42 +1690,7 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
         query_res.is_sorted = *is_sorted_shared;
 
         for (size_t i = 0; i < query.returns.size(); ++i) {
-            const auto& item = query.returns[i];
-            std::string key;
-            if (item.alias) {
-                key = *item.alias;
-            } else {
-                if (item.expr->kind == ExpressionKind::PROPERTY_LOOKUP) {
-                    auto* pl = static_cast<const PropertyLookupExpr*>(item.expr.get());
-                    key = pl->variable + "." + pl->property;
-                } else if (item.expr->kind == ExpressionKind::VARIABLE) {
-                    auto* ve = static_cast<const VariableExpr*>(item.expr.get());
-                    key = ve->name;
-                } else if (item.expr->kind == ExpressionKind::AGGREGATION) {
-                    auto* ae = static_cast<const AggregateExpr*>(item.expr.get());
-                    std::string fn_name;
-                    if (ae->fn_kind == AggregateKind::COUNT) fn_name = "count";
-                    else if (ae->fn_kind == AggregateKind::SUM) fn_name = "sum";
-                    else if (ae->fn_kind == AggregateKind::AVG) fn_name = "avg";
-                    else if (ae->fn_kind == AggregateKind::MIN) fn_name = "min";
-                    else fn_name = "max";
-
-                    if (!ae->expr) {
-                        key = fn_name + "(*)";
-                    } else if (ae->expr->kind == ExpressionKind::PROPERTY_LOOKUP) {
-                        auto* pl = static_cast<const PropertyLookupExpr*>(ae->expr.get());
-                        key = fn_name + "(" + pl->variable + "." + pl->property + ")";
-                    } else if (ae->expr->kind == ExpressionKind::VARIABLE) {
-                        auto* ve = static_cast<const VariableExpr*>(ae->expr.get());
-                        key = fn_name + "(" + ve->name + ")";
-                    } else {
-                        key = fn_name + "(expr)";
-                    }
-                } else {
-                    key = "column_" + std::to_string(i);
-                }
-            }
-            query_res.column_names.push_back(key);
+            query_res.column_names.push_back(return_item_column_name(query.returns[i], i));
         }
 
         std::unordered_set<std::string> seen_distinct;
@@ -788,12 +1755,65 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
             for (const auto& [key, group] : groups) {
                 std::map<const AggregateExpr*, GqlValue> aggregate_results;
                 for (const auto* agg : aggregate_exprs) {
+                    // A DISTINCT aggregate folds over the set of distinct non-null values directly:
+                    // the values are evaluated exactly once and no rows are copied. The set is
+                    // ordered by GqlValueLess (compare_gql_values), so MIN/MAX are its endpoints.
+                    if (agg->distinct && agg->expr) {
+                        std::set<GqlValue, GqlValueLess> distinct_vals;
+                        for (const auto& r : group.rows) {
+                            GqlValue v = evaluate_expression(r, agg->expr.get());
+                            if (v.type != GqlValue::NIL) distinct_vals.insert(std::move(v));
+                        }
+                        if (agg->fn_kind == AggregateKind::COUNT) {
+                            int64_t count = static_cast<int64_t>(distinct_vals.size());
+                            if (query.count_multiplication_factor > 1) {
+                                count *= query.count_multiplication_factor;
+                            }
+                            aggregate_results[agg] = GqlValue(count);
+                        } else if (agg->fn_kind == AggregateKind::MIN) {
+                            aggregate_results[agg] = distinct_vals.empty() ? GqlValue() : *distinct_vals.begin();
+                        } else if (agg->fn_kind == AggregateKind::MAX) {
+                            aggregate_results[agg] = distinct_vals.empty() ? GqlValue() : *distinct_vals.rbegin();
+                        } else if (agg->fn_kind == AggregateKind::COLLECT) {
+                            aggregate_results[agg] = GqlValue(std::vector<GqlValue>(distinct_vals.begin(), distinct_vals.end()));
+                        } else {  // SUM / AVG with int->double promotion, mirroring the row fold below
+                            int64_t sum_int = 0;
+                            double sum_double = 0.0;
+                            bool has_double = false;
+                            int64_t count = 0;
+                            for (const auto& v : distinct_vals) {
+                                if (v.type != GqlValue::PROPERTY) continue;
+                                if (std::holds_alternative<int64_t>(v.property)) {
+                                    if (has_double) sum_double += static_cast<double>(std::get<int64_t>(v.property));
+                                    else sum_int += std::get<int64_t>(v.property);
+                                    count++;
+                                } else if (std::holds_alternative<double>(v.property)) {
+                                    if (!has_double) {
+                                        sum_double = static_cast<double>(sum_int);
+                                        has_double = true;
+                                    }
+                                    sum_double += std::get<double>(v.property);
+                                    count++;
+                                }
+                            }
+                            if (count == 0) {
+                                aggregate_results[agg] = GqlValue();
+                            } else if (agg->fn_kind == AggregateKind::SUM) {
+                                aggregate_results[agg] = has_double ? GqlValue(sum_double) : GqlValue(sum_int);
+                            } else {
+                                double total = has_double ? sum_double : static_cast<double>(sum_int);
+                                aggregate_results[agg] = GqlValue(total / static_cast<double>(count));
+                            }
+                        }
+                        continue;
+                    }
+                    const std::vector<GqlRow>& agg_rows = group.rows;
                     if (agg->fn_kind == AggregateKind::COUNT) {
                         int64_t count = 0;
                         if (!agg->expr) {
                             count = static_cast<int64_t>(group.rows.size());
                         } else {
-                            for (const auto& r : group.rows) {
+                            for (const auto& r : agg_rows) {
                                 GqlValue v = evaluate_expression(r, agg->expr.get());
                                 if (v.type != GqlValue::NIL) {
                                     count++;
@@ -810,7 +1830,7 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
                         bool has_double = false;
                         int64_t count = 0;
 
-                        for (const auto& r : group.rows) {
+                        for (const auto& r : agg_rows) {
                             GqlValue v = evaluate_expression(r, agg->expr.get());
                             if (v.type == GqlValue::PROPERTY) {
                                 if (std::holds_alternative<int64_t>(v.property)) {
@@ -830,7 +1850,9 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
 
                         if (agg->fn_kind == AggregateKind::SUM) {
                             if (count == 0) {
-                                aggregate_results[agg] = GqlValue();
+                                // A COUNT rewritten into a degree SUM keeps count semantics over
+                                // empty input: 0, not the null a genuine sum would produce.
+                                aggregate_results[agg] = agg->count_to_sum ? GqlValue(static_cast<int64_t>(0)) : GqlValue();
                             } else if (has_double) {
                                 aggregate_results[agg] = GqlValue(sum_double);
                             } else {
@@ -847,7 +1869,7 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
                         }
                     } else if (agg->fn_kind == AggregateKind::MIN) {
                         GqlValue min_val;
-                        for (const auto& r : group.rows) {
+                        for (const auto& r : agg_rows) {
                             GqlValue v = evaluate_expression(r, agg->expr.get());
                             if (v.type != GqlValue::NIL) {
                                 if (min_val.type == GqlValue::NIL || compare_gql_values(v, min_val) < 0) {
@@ -858,7 +1880,7 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
                         aggregate_results[agg] = min_val;
                     } else if (agg->fn_kind == AggregateKind::MAX) {
                         GqlValue max_val;
-                        for (const auto& r : group.rows) {
+                        for (const auto& r : agg_rows) {
                             GqlValue v = evaluate_expression(r, agg->expr.get());
                             if (v.type != GqlValue::NIL) {
                                 if (max_val.type == GqlValue::NIL || compare_gql_values(v, max_val) > 0) {
@@ -867,6 +1889,13 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
                             }
                         }
                         aggregate_results[agg] = max_val;
+                    } else if (agg->fn_kind == AggregateKind::COLLECT) {
+                        std::vector<GqlValue> items;
+                        for (const auto& r : agg_rows) {
+                            GqlValue v = evaluate_expression(r, agg->expr.get());
+                            if (v.type != GqlValue::NIL) items.push_back(std::move(v));
+                        }
+                        aggregate_results[agg] = GqlValue(std::move(items));
                     }
                 }
 
@@ -968,7 +1997,9 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
                         node->time_ms = std::chrono::duration<double, std::milli>(sort_end - sort_start).count();
                     }
                 }
-            } else if (query.limit && *query.limit < filtered_rows.size()) {
+            } else if (query.limit && !query.distinct && *query.limit < filtered_rows.size()) {
+                // DISTINCT collapses rows during projection, so the raw matched rows cannot be
+                // truncated to the LIMIT here; the post-dedup resize below enforces it instead.
                 auto limit_start = std::chrono::steady_clock::now();
                 filtered_rows.resize(*query.limit);
                 if (query_ptr->profile) {
@@ -1099,6 +2130,7 @@ seastar::future<std::string> GqlExecutor::execute(ragedb::Graph& graph, GqlQuery
         return graph.shard.invoke_on_all([](Shard&) {
             GqlQueryCache::local().clear();
             WccCache::local().clear();
+            TransitiveReachabilityCache::local().clear();
         }).then([] {
             return seastar::make_ready_future<std::string>("{\"status\": \"cache cleared\"}");
         });
@@ -1120,6 +2152,7 @@ seastar::future<std::string> GqlExecutor::execute(ragedb::Graph& graph, GqlQuery
         if (!query_ptr->writes.empty()) {
             return graph.shard.invoke_on_all([](Shard&) {
                 WccCache::local().clear();
+                TransitiveReachabilityCache::local().clear();
             }).then([&graph]() {
                 return validate_constraints(graph);
             }).then([result = std::move(result)]() mutable {

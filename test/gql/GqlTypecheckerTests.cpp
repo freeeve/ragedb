@@ -203,3 +203,54 @@ TEST_CASE("GQL Static Typechecker Tests", "[gql_typechecker]") {
 
     graph.Stop().get();
 }
+
+TEST_CASE("Typechecker is linear-query (NEXT) aware (task 022)", "[gql_typechecker][task022]") {
+    auto graph = Graph("gql_typechecker_with_test");
+    graph.Start().get();
+    graph.Clear();
+    graph.shard.local().NodeTypeInsertPeered("Person").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "name", "string").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "age", "integer").get();
+    graph.shard.local().RelationshipTypeInsertPeered("FRIEND_OF").get();
+
+    SECTION("piped variables are visible in later segments") {
+        auto query = GqlParser::parse("MATCH (p:Person) RETURN p NEXT RETURN p.name");
+        REQUIRE_NOTHROW(GqlTypechecker::typecheck(graph, query));
+
+        auto staged = GqlParser::parse(
+            "MATCH (p:Person) RETURN p NEXT MATCH (p)-[:FRIEND_OF]->(f:Person) RETURN f.name");
+        REQUIRE_NOTHROW(GqlTypechecker::typecheck(graph, staged));
+
+        auto aliased = GqlParser::parse("MATCH (p:Person) RETURN p.age AS a NEXT RETURN a");
+        REQUIRE_NOTHROW(GqlTypechecker::typecheck(graph, aliased));
+    }
+
+    SECTION("an unbound variable after NEXT throws instead of returning nulls") {
+        auto query = GqlParser::parse("MATCH (p:Person) RETURN p NEXT RETURN q.name");
+        REQUIRE_THROWS_WITH(GqlTypechecker::typecheck(graph, query), Catch::Contains("q"));
+    }
+
+    SECTION("a type error inside the first segment is still caught") {
+        auto query = GqlParser::parse("MATCH (p:Person) WHERE p.salary > 1 RETURN p NEXT RETURN p.name");
+        REQUIRE_THROWS_WITH(GqlTypechecker::typecheck(graph, query),
+            Catch::Contains("Property 'salary' does not exist"));
+    }
+
+    SECTION("variables not projected before NEXT are out of scope downstream") {
+        auto query = GqlParser::parse(
+            "MATCH (p:Person)-[:FRIEND_OF]->(r:Person) RETURN p NEXT RETURN r.name");
+        REQUIRE_THROWS_WITH(GqlTypechecker::typecheck(graph, query), Catch::Contains("r"));
+    }
+
+    SECTION("COUNT { } degree-rewrite virtual property passes typecheck (task 032)") {
+        // The optimizer rewrites the simple-pattern COUNT{} into a synthetic `_deg_p_..._OUT` degree
+        // property; the typechecker must accept it (it is populated at execution time, not declared in
+        // the schema). Without the fix this throws "Property '_deg_p_FRIEND_OF_OUT' does not exist".
+        auto query = GqlParser::parse(
+            "MATCH (p:Person) RETURN COUNT { (p)-[:FRIEND_OF]->(f:Person) } AS c");
+        GqlOptimizer::optimize(graph, query);
+        REQUIRE_NOTHROW(GqlTypechecker::typecheck(graph, query));
+    }
+
+    graph.Stop().get();
+}

@@ -78,6 +78,44 @@ TEST_CASE("GQL Optimizer Phase 23: Transitive Path Pruning", "[gql_optimizer][al
     }
 }
 
+// Guards (task 003): the transitive-reachability rewrite must NOT fire for patterns the fast path
+// gets wrong, and shortcut pruning must not drop constrained/bound matches.
+TEST_CASE("GQL Optimizer Phase 23: transitive rewrite guards", "[gql_optimizer][alglib][task003]") {
+    GqlVirtualCatalog::local().clear();
+    GqlVirtualCatalog::local().set_relationship_algebraic_properties("ancestor_of", {"transitive"});
+
+    SECTION("bounded hops *2..2 are not rewritten") {
+        auto q = GqlParser::parse("MATCH (a)-[:ancestor_of*2..2]->(b) RETURN a, b");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.matches[0].transitive_reachability_lookup == false);
+    }
+    SECTION("zero-lower-bound *0.. is not rewritten") {
+        auto q = GqlParser::parse("MATCH (a)-[:ancestor_of*0..]->(b) RETURN a, b");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.matches[0].transitive_reachability_lookup == false);
+    }
+    SECTION("LEFT direction is not rewritten") {
+        auto q = GqlParser::parse("MATCH (a)<-[:ancestor_of*]-(b) RETURN a, b");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.matches[0].transitive_reachability_lookup == false);
+    }
+    SECTION("a bound edge variable is not rewritten") {
+        auto q = GqlParser::parse("MATCH (a)-[r:ancestor_of*]->(b) RETURN r");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.matches[0].transitive_reachability_lookup == false);
+    }
+    SECTION("the safe *1.. case is still rewritten") {
+        auto q = GqlParser::parse("MATCH (a)-[:ancestor_of*]->(b) RETURN a, b");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.matches[0].transitive_reachability_lookup == true);
+    }
+    SECTION("a shortcut carrying an edge variable is not pruned") {
+        auto q = GqlParser::parse("MATCH (x)-[:ancestor_of]->(y) MATCH (y)-[:ancestor_of]->(z) MATCH (x)-[e:ancestor_of]->(z) RETURN x, y, z, e");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.matches.size() == 3);
+    }
+}
+
 TEST_CASE("GQL Optimizer Phase 24: Irreflexive Contradiction Pruner", "[gql_optimizer][alglib]") {
     GqlVirtualCatalog::local().clear();
     GqlVirtualCatalog::local().set_relationship_algebraic_properties("parent_of", {"irreflexive"});
@@ -95,6 +133,36 @@ TEST_CASE("GQL Optimizer Phase 24: Irreflexive Contradiction Pruner", "[gql_opti
         auto query = GqlParser::parse(query_str);
         GqlOptimizer::optimize(query);
 
+        REQUIRE(query.no_op == true);
+    }
+}
+
+// Negative controls (task 005): the irreflexive pruner must NOT no_op these--each is satisfiable.
+TEST_CASE("GQL Optimizer Phase 24: Irreflexive pruner negative controls", "[gql_optimizer][alglib][task005]") {
+    GqlVirtualCatalog::local().clear();
+    GqlVirtualCatalog::local().set_relationship_algebraic_properties("parent_of", {"irreflexive"});
+
+    SECTION("Anonymous endpoints are distinct nodes, not a self-loop") {
+        auto query = GqlParser::parse("MATCH ()-[:parent_of]->() RETURN count(*)");
+        GqlOptimizer::optimize(query);
+        REQUIRE(query.no_op == false);
+    }
+
+    SECTION("Variable-length edge can form a longer cycle a->b->a (satisfiable)") {
+        auto query = GqlParser::parse("MATCH (a)-[:parent_of*2..2]->(a) RETURN a");
+        GqlOptimizer::optimize(query);
+        REQUIRE(query.no_op == false);
+    }
+
+    SECTION("Equality inside a disjunction must not force a contradiction") {
+        auto query = GqlParser::parse("MATCH (a)-[:parent_of]->(b) WHERE a = b OR a.x = 1 RETURN a");
+        GqlOptimizer::optimize(query);
+        REQUIRE(query.no_op == false);
+    }
+
+    SECTION("Positive control still fires: a genuine direct self-loop is a contradiction") {
+        auto query = GqlParser::parse("MATCH (a)-[:parent_of]->(a) RETURN a");
+        GqlOptimizer::optimize(query);
         REQUIRE(query.no_op == true);
     }
 }
@@ -146,4 +214,75 @@ TEST_CASE("GQL Optimizer Phase 26: Equivalence Class Coalescing", "[gql_optimize
     REQUIRE(match.pattern.edges[0].is_variable_length == false);
     REQUIRE(match.pattern.edges[0].min_hops == 1);
     REQUIRE(match.pattern.edges[0].max_hops == 1);
+}
+
+// Guards (task 004): the equivalence-partition rewrite must NOT fire for patterns the fast path
+// gets wrong (bounded hops, direction, bound edge variable, predicates, path var, shortest).
+TEST_CASE("GQL Optimizer Phase 26: equivalence rewrite guards", "[gql_optimizer][alglib][task004]") {
+    GqlVirtualCatalog::local().clear();
+    GqlVirtualCatalog::local().set_relationship_algebraic_properties("same_group", {"reflexive", "symmetric", "transitive"});
+
+    SECTION("bounded hops *2..3 are not rewritten") {
+        auto q = GqlParser::parse("MATCH (a)-[:same_group*2..3]->(b) RETURN a, b");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.matches[0].equivalence_partition_lookup == false);
+    }
+    SECTION("LEFT direction is not rewritten") {
+        auto q = GqlParser::parse("MATCH (a)<-[:same_group*]-(b) RETURN a, b");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.matches[0].equivalence_partition_lookup == false);
+    }
+    SECTION("a bound edge variable is not rewritten") {
+        auto q = GqlParser::parse("MATCH (a)-[r:same_group*]->(b) RETURN r");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.matches[0].equivalence_partition_lookup == false);
+    }
+    SECTION("the safe *1.. case is still rewritten") {
+        auto q = GqlParser::parse("MATCH (a)-[:same_group*]->(b) RETURN a, b");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.matches[0].equivalence_partition_lookup == true);
+    }
+}
+
+// Task 001: the antisymmetric collapser must preserve labels/constraints/bound edge variables and
+// detect the irreflexive contradiction, while still collapsing the unconstrained case.
+TEST_CASE("GQL Optimizer Phase 25: collapser preserves constraints", "[gql_optimizer][alglib][task001]") {
+    GqlVirtualCatalog::local().clear();
+
+    SECTION("a labeled single-node match is not pruned away") {
+        auto q = GqlParser::parse("MATCH (x:Person) MATCH (x)-[:KNOWS]->(y) RETURN x, y");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.matches.size() == 2);
+    }
+
+    SECTION("labels survive an antisymmetric+reflexive collapse (AND, not dropped)") {
+        GqlVirtualCatalog::local().set_relationship_algebraic_properties("po", {"antisymmetric", "reflexive"});
+        auto q = GqlParser::parse("MATCH (a:A)-[:po]->(b:B)-[:po]->(a) RETURN a");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.matches.size() == 1);
+        REQUIRE(q.matches[0].pattern.nodes[0].label_expr != nullptr);
+        REQUIRE(q.matches[0].pattern.nodes[0].label_expr->kind == LabelExprKind::AND);
+    }
+
+    SECTION("a collapse that would drop a bound edge variable is refused") {
+        GqlVirtualCatalog::local().set_relationship_algebraic_properties("po", {"antisymmetric"});
+        auto q = GqlParser::parse("MATCH (a)-[r:po]->(b)-[r2:po]->(a) RETURN a, r, r2");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.matches[0].pattern.edges.size() == 2);
+    }
+
+    SECTION("an antisymmetric + irreflexive 2-cycle is a contradiction (no_op)") {
+        GqlVirtualCatalog::local().set_relationship_algebraic_properties("po", {"antisymmetric", "irreflexive"});
+        auto q = GqlParser::parse("MATCH (a)-[:po]->(b)-[:po]->(a) RETURN a");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.no_op == true);
+    }
+
+    SECTION("positive control: an unconstrained antisymmetric 2-cycle still collapses") {
+        GqlVirtualCatalog::local().set_relationship_algebraic_properties("po", {"antisymmetric"});
+        auto q = GqlParser::parse("MATCH (a)-[:po]->(b)-[:po]->(a) RETURN a, b");
+        GqlOptimizer::optimize(q);
+        REQUIRE(q.matches.size() == 1);
+        REQUIRE(q.matches[0].pattern.edges.size() == 1);
+    }
 }

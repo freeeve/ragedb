@@ -60,8 +60,11 @@ void AlgebraicRewriter::algebraic_rewriter_pass(GqlQuery& query) {
                 if (num_edges == num_nodes - 1) {
                     const auto& start_node = match.pattern.nodes[0];
                     const auto& end_node = match.pattern.nodes[num_nodes - 1];
-                    
-                    if (!start_node.variable.empty() && !end_node.variable.empty()) {
+
+                    // A cyclic chain (endpoints share one variable) carries a start==end join the
+                    // from-scratch path count would drop.
+                    if (!start_node.variable.empty() && !end_node.variable.empty() &&
+                        start_node.variable != end_node.variable) {
                         // Check intermediate nodes
                         bool valid = true;
                         for (size_t i = 1; i < num_nodes - 1; ++i) {
@@ -154,7 +157,10 @@ void AlgebraicRewriter::algebraic_rewriter_pass(GqlQuery& query) {
                     if (referenced_outside) break;
                 }
 
-                if (!referenced_outside) {
+                // DISTINCT aggregates count distinct values, not paths; the algebraic path-count
+                // rewrite (and the pattern truncation it triggers) would corrupt them. Piped-row
+                // parts must count relative to their input rows, not from-scratch path counts.
+                if (!referenced_outside && !query_has_distinct_aggregate(query) && !query.consumes_piped_rows) {
                     // Rewrite aggregate COUNT functions to the target variable directly.
                     for (auto& item : query.returns) {
                         if (!item.alias.has_value() && item.expr) {
@@ -231,7 +237,8 @@ void AlgebraicRewriter::algebraic_rewriter_pass(GqlQuery& query) {
     for (auto& item : query.returns) {
         if (item.expr && item.expr->kind == ExpressionKind::AGGREGATION) {
             auto* agg = static_cast<AggregateExpr*>(item.expr.get());
-            if (agg->fn_kind == AggregateKind::SUM && agg->expr && agg->expr->kind == ExpressionKind::BINARY_OP) {
+            // sum(DISTINCT a*b) dedups the products; factoring one side out changes what is deduped.
+            if (agg->fn_kind == AggregateKind::SUM && !agg->distinct && agg->expr && agg->expr->kind == ExpressionKind::BINARY_OP) {
                 auto* bin = static_cast<BinaryOpExpr*>(agg->expr.get());
                 if (bin->op == BinaryOpKind::MUL) {
                     if (only_references_grouping(bin->left.get())) {

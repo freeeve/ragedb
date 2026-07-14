@@ -15,9 +15,11 @@
  */
 
 #include "TransitivePathOptimizer.h"
+#include "OptimizerUtils.h"
 #include "../GqlVirtualCatalog.h"
 #include <unordered_map>
 #include <unordered_set>
+#include <limits>
 
 namespace ragedb::gql {
 
@@ -46,6 +48,9 @@ bool is_reachable_min_depth_2(const std::string& start, const std::string& targe
 
 void TransitivePathOptimizer::transitive_path_pass(GqlQuery& query) {
     if (query.skip_semantic || query.kind != QueryKind::SINGLE) return;
+    // Every rewrite here is keyed on registered algebraic traits; with none registered
+    // the pass cannot fire, so skip the per-match scanning entirely.
+    if (GqlVirtualCatalog::local().get_relationship_algebraic_properties().empty()) return;
 
     // 1. Simplify variable-length paths of transitive relations to single hops
     for (auto& match : query.matches) {
@@ -60,7 +65,11 @@ void TransitivePathOptimizer::transitive_path_pass(GqlQuery& query) {
                     GqlVirtualCatalog::local().has_relationship_algebraic_property(rel_type, "symmetric") &&
                     GqlVirtualCatalog::local().has_relationship_algebraic_property(rel_type, "transitive");
 
-                if (is_transitive && !is_equivalence) {
+                // The transitive-reachability fast path (Case 0.6) only reproduces the original
+                // traversal for the one safe shape encoded in is_simple_unbounded_right_hop.
+                bool safe_to_rewrite = is_simple_unbounded_right_hop(match, edge);
+
+                if (is_transitive && !is_equivalence && safe_to_rewrite) {
                     match.transitive_reachability_lookup = true;
                     edge.is_variable_length = false;
                     edge.min_hops = 1;
@@ -121,8 +130,18 @@ void TransitivePathOptimizer::transitive_path_pass(GqlQuery& query) {
                         dst = match.pattern.nodes[0].variable;
                     }
                     if (!src.empty() && !dst.empty()) {
+                        // Only prune a shortcut edge that carries no constraints and binds nothing --
+                        // otherwise pruning would silently drop labels/properties/filters or leave an
+                        // edge/path variable unbound.
+                        const auto& n0 = match.pattern.nodes[0];
+                        const auto& n1 = match.pattern.nodes[1];
+                        bool unconstrained =
+                            !n0.label_expr && n0.properties.empty() && n0.property_filters.empty() && !n0.where_expr &&
+                            !n1.label_expr && n1.properties.empty() && n1.property_filters.empty() && !n1.where_expr &&
+                            edge.properties.empty() && edge.property_filters.empty() && !edge.where_expr &&
+                            edge.variable.empty() && match.path_variable.empty();
                         std::unordered_set<std::string> visited;
-                        if (is_reachable_min_depth_2(src, dst, rel_adj[rel_type], visited, 0)) {
+                        if (unconstrained && is_reachable_min_depth_2(src, dst, rel_adj[rel_type], visited, 0)) {
                             prune = true;
                         }
                     }

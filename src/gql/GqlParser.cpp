@@ -985,16 +985,27 @@ GqlQuery GqlParser::parse_query() {
 }
 
 GqlQuery GqlParser::parse_union() {
+    // UNION and EXCEPT share precedence (both bind looser than INTERSECT), so a single left-to-right loop
+    // handles them. Each accepts the ISO GQL set quantifier ALL | DISTINCT; DISTINCT is the default, so a
+    // bare UNION and UNION DISTINCT mean the same thing.
     GqlQuery query = parse_intersect();
-    while (match(TokenType::UNION)) {
+    while (check(TokenType::UNION) || check(TokenType::EXCEPT)) {
+        const bool is_except = check(TokenType::EXCEPT);
+        advance();
         bool all = false;
         if (match(TokenType::ALL_KW)) {
             all = true;
+        } else {
+            match(TokenType::DISTINCT);   // optional explicit DISTINCT, the default
         }
         GqlQuery right = parse_intersect();
 
         GqlQuery combined;
-        combined.kind = all ? QueryKind::UNION_ALL : QueryKind::UNION;
+        if (is_except) {
+            combined.kind = all ? QueryKind::EXCEPT_ALL : QueryKind::EXCEPT;
+        } else {
+            combined.kind = all ? QueryKind::UNION_ALL : QueryKind::UNION;
+        }
         combined.left = std::make_unique<GqlQuery>(std::move(query));
         combined.right = std::make_unique<GqlQuery>(std::move(right));
         query = std::move(combined);
@@ -1008,6 +1019,8 @@ GqlQuery GqlParser::parse_intersect() {
         bool all = false;
         if (match(TokenType::ALL_KW)) {
             all = true;
+        } else {
+            match(TokenType::DISTINCT);   // optional explicit DISTINCT, the default
         }
         GqlQuery right = parse_single_query();
 

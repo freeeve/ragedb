@@ -1130,7 +1130,7 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
         });
     }
 
-    // 1. Handle Set Operations (UNION, UNION ALL, INTERSECT, INTERSECT ALL)
+    // 1. Handle Set Operations (UNION, INTERSECT, EXCEPT, each with an optional ALL)
     if (query_ptr->kind != QueryKind::SINGLE) {
         // Release ownership of subqueries to execute them separately
         auto left_ptr = std::shared_ptr<GqlQuery>(query_ptr->left.release());
@@ -1222,6 +1222,33 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
                             combined_res.rows.push_back(std::move(r));
                             it->second--;
                         }
+                    }
+                } else if (query_ptr->kind == QueryKind::EXCEPT) {
+                    // EXCEPT: distinct rows of the left that do not appear in the right.
+                    std::set<std::vector<GqlValue>, GqlValueVectorLess> right_set;
+                    for (const auto& r : right_res.rows) {
+                        right_set.insert(r);
+                    }
+                    std::set<std::vector<GqlValue>, GqlValueVectorLess> emitted;
+                    for (auto& r : left_res.rows) {
+                        if (right_set.count(r)) continue;
+                        if (emitted.insert(r).second) {
+                            combined_res.rows.push_back(std::move(r));
+                        }
+                    }
+                } else if (query_ptr->kind == QueryKind::EXCEPT_ALL) {
+                    // EXCEPT ALL: multiset difference -- each right occurrence cancels one left occurrence.
+                    std::map<std::vector<GqlValue>, int64_t, GqlValueVectorLess> right_counts;
+                    for (const auto& r : right_res.rows) {
+                        right_counts[r]++;
+                    }
+                    for (auto& r : left_res.rows) {
+                        auto it = right_counts.find(r);
+                        if (it != right_counts.end() && it->second > 0) {
+                            it->second--;   // this left row is cancelled by a right occurrence
+                            continue;
+                        }
+                        combined_res.rows.push_back(std::move(r));
                     }
                 }
 

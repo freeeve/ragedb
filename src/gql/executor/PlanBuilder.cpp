@@ -585,6 +585,8 @@ std::shared_ptr<PlanNode> build_query_plan(ragedb::Graph& graph, const GqlQuery&
         else if (query.kind == QueryKind::UNION_ALL) node->operator_name = "UnionAll";
         else if (query.kind == QueryKind::INTERSECT) node->operator_name = "Intersect";
         else if (query.kind == QueryKind::INTERSECT_ALL) node->operator_name = "IntersectAll";
+        else if (query.kind == QueryKind::EXCEPT) node->operator_name = "Except";
+        else if (query.kind == QueryKind::EXCEPT_ALL) node->operator_name = "ExceptAll";
         
         node->key = "set_operation";
         if (query.left) {

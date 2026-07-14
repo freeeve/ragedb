@@ -639,7 +639,9 @@ enum class QueryKind {
     UNION,
     UNION_ALL,
     INTERSECT,
-    INTERSECT_ALL
+    INTERSECT_ALL,
+    EXCEPT,
+    EXCEPT_ALL
 };
 
 /**

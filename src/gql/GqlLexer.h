@@ -66,6 +66,7 @@ enum class TokenType {
     DETACH,
     UNION,
     INTERSECT,
+    EXCEPT,
     ALL_KW,
     SHORTEST_KW,
     ANY_KW,

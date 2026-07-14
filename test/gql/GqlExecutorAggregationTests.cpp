@@ -150,6 +150,44 @@ TEST_CASE("GQL Execution Aggregation and Set Tests", "[gql_executor_aggregation]
         }
     }
 
+    SECTION("Set Operations: EXCEPT") {
+        SECTION("EXCEPT removes the right side's rows") {
+            // All people except Alice -> Bob (the graph has Alice and Bob).
+            std::string query = "MATCH (p:Person) RETURN p.name EXCEPT MATCH (p:Person) WHERE p.name = 'Alice' RETURN p.name";
+            std::string res = GqlExecutor::execute(graph, GqlParser::parse(query)).get();
+            REQUIRE(res == "[{\"p.name\": \"Bob\"}]");
+        }
+
+        SECTION("EXCEPT of a superset is empty") {
+            std::string query = "MATCH (p:Person) WHERE p.name = 'Alice' RETURN p.name EXCEPT MATCH (p:Person) RETURN p.name";
+            std::string res = GqlExecutor::execute(graph, GqlParser::parse(query)).get();
+            REQUIRE(res == "[]");
+        }
+
+        SECTION("EXCEPT is distinct: duplicate left rows collapse") {
+            // UNION ALL duplicates Alice, then EXCEPT Bob leaves a single distinct Alice.
+            std::string query =
+                "MATCH (p:Person) WHERE p.name = 'Alice' RETURN p.name "
+                "UNION ALL MATCH (p:Person) WHERE p.name = 'Alice' RETURN p.name "
+                "EXCEPT MATCH (p:Person) WHERE p.name = 'Bob' RETURN p.name";
+            std::string res = GqlExecutor::execute(graph, GqlParser::parse(query)).get();
+            REQUIRE(res == "[{\"p.name\": \"Alice\"}]");
+        }
+    }
+
+    SECTION("Set Operations: explicit DISTINCT quantifier parses") {
+        // UNION DISTINCT and INTERSECT DISTINCT mean the same as the bare forms (DISTINCT is the default).
+        std::string u = GqlExecutor::execute(graph, GqlParser::parse(
+            "MATCH (p:Person) WHERE p.name = 'Alice' RETURN p.name "
+            "UNION DISTINCT MATCH (p:Person) WHERE p.name = 'Alice' RETURN p.name")).get();
+        REQUIRE(u == "[{\"p.name\": \"Alice\"}]");
+
+        std::string i = GqlExecutor::execute(graph, GqlParser::parse(
+            "MATCH (p:Person) RETURN p.name "
+            "INTERSECT DISTINCT MATCH (p:Person) WHERE p.name = 'Alice' RETURN p.name")).get();
+        REQUIRE(i == "[{\"p.name\": \"Alice\"}]");
+    }
+
     SECTION("Set Operations: Top-level ORDER BY and LIMIT") {
         std::string query = "MATCH (p:Person) RETURN p.name UNION MATCH (p:Person) RETURN p.name ORDER BY p.name DESC LIMIT 1";
         std::string res = GqlExecutor::execute(graph, GqlParser::parse(query)).get();

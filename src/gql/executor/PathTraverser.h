@@ -75,6 +75,16 @@ inline size_t gql_stream_inner_concurrency = 8;
 // Bounding the in-flight searches keeps it O(concurrency).
 inline size_t gql_shortest_path_concurrency = 8;
 
+// Max relationship branches expanded concurrently at a single node of a var-length traversal. Every
+// branch carries its own copy of the path built so far (the nodes and relationships along it, with
+// their property maps), so expanding all of a high-degree node's branches at once made live memory the
+// product of that degree and the path length.
+inline size_t gql_var_len_branch_concurrency = 16;
+
+// Completed var-length paths handed to a streaming consumer per batch. Bounds how many finished paths
+// are held before the consumer folds them away.
+inline size_t gql_var_len_hop_batch = 1024;
+
 /**
  * @brief Consumer for streamed traversal output: when passed to traverse_path_pattern, matched
  *        rows are handed to consume() in bounded batches instead of being collected and returned

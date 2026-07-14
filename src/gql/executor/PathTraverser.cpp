@@ -233,6 +233,36 @@ struct PathHop {
     std::vector<Node> nodes;
 };
 
+/**
+ * @brief Streaming consumer for completed var-length paths. When a traversal is given one, each finished
+ *        path is handed over in batches and nothing is retained, so peak memory is the in-flight branches
+ *        plus one batch instead of every path in the expansion. Without one, the traversal accumulates
+ *        and returns the whole path set, which one person's KNOWS{1,3} neighbourhood at SF1 (over a
+ *        million paths, each carrying the nodes and relationships along it) cannot fit in.
+ */
+struct PathHopSink {
+    std::function<seastar::future<>(std::vector<PathHop>)> consume;
+    std::vector<PathHop> buffer;
+    size_t batch = 1024;
+
+    seastar::future<> add(PathHop hop) {
+        buffer.push_back(std::move(hop));
+        if (buffer.size() < batch) {
+            return seastar::make_ready_future<>();
+        }
+        return flush();
+    }
+
+    seastar::future<> flush() {
+        if (buffer.empty()) {
+            return seastar::make_ready_future<>();
+        }
+        auto pending = std::move(buffer);
+        buffer.clear();
+        return consume(std::move(pending));
+    }
+};
+
 bool satisfies_match_path_modes(const GqlRow& row, MatchMode match_mode, PathMode path_mode, const PathPattern& pattern) {
     // 1. Path Mode constraints
     std::vector<uint64_t> node_ids;
@@ -332,22 +362,31 @@ static seastar::future<std::vector<PathHop>> traverse_var_len_async(
     std::vector<Node> current_path_nodes,
     size_t limit,
     const ProjectionPruner& pruner,
-    PathMode path_mode
+    PathMode path_mode,
+    PathHopSink* hop_sink = nullptr
 ) {
     // Base Case 1: Exceeded maximum hops allowed
     if (current_depth > edge.max_hops) {
         return seastar::make_ready_future<std::vector<PathHop>>();
     }
 
+    // Base Case 2: Within allowed hop range, record the current path. With a sink the finished path is
+    // handed over immediately and nothing accumulates here.
     std::vector<PathHop> local_results;
-    // Base Case 2: Within allowed hop range, record the current path
+    seastar::future<> recorded = seastar::make_ready_future<>();
     if (current_depth >= edge.min_hops) {
-        local_results.push_back({current_path_rels, current_path_nodes});
+        if (hop_sink) {
+            recorded = hop_sink->add(PathHop{current_path_rels, current_path_nodes});
+        } else {
+            local_results.push_back({current_path_rels, current_path_nodes});
+        }
     }
 
     // Base Case 3: Reached maximum hops allowed, stop traversing further
     if (current_depth == edge.max_hops) {
-        return seastar::make_ready_future<std::vector<PathHop>>(std::move(local_results));
+        return recorded.then([local_results = std::move(local_results)]() mutable {
+            return std::move(local_results);
+        });
     }
 
     // Determine traversal direction
@@ -363,7 +402,7 @@ static seastar::future<std::vector<PathHop>> traverse_var_len_async(
     // Callback to process retrieved relationships on the current node
     auto handle_rels = [&graph, edge, next_node, current_node_id, current_depth, visited_rel_ids = std::move(visited_rel_ids),
            current_path_rels = std::move(current_path_rels), current_path_nodes = std::move(current_path_nodes),
-           local_results = std::move(local_results), limit, pruner, path_mode](std::vector<Relationship> rels) mutable {
+           local_results = std::move(local_results), limit, pruner, path_mode, hop_sink](std::vector<Relationship> rels) mutable {
 
         if (pruner.should_prune(edge.variable)) {
             auto keys = pruner.get_keys(edge.variable);
@@ -379,8 +418,10 @@ static seastar::future<std::vector<PathHop>> traverse_var_len_async(
             }
         }
 
-        std::vector<seastar::future<std::vector<PathHop>>> branch_futs;
-        for (const auto& rel : rels) {
+        // Select the relationships this node actually branches on, so the expansion below can be bounded
+        // over exactly those.
+        auto branches = std::make_shared<std::vector<Relationship>>();
+        for (auto& rel : rels) {
             uint64_t target_id = (rel.getStartingNodeId() == current_node_id) ? rel.getEndingNodeId() : rel.getStartingNodeId();
 
             if (path_mode == PathMode::TRAIL) {
@@ -423,78 +464,140 @@ static seastar::future<std::vector<PathHop>> traverse_var_len_async(
                 }
             }
 
-            branch_futs.push_back(
-                graph.shard.local().NodeGetPeered(target_id)
-                .then([&graph, rel, edge, next_node, current_depth, visited_rel_ids, current_path_rels, current_path_nodes, target_id, limit, pruner, path_mode](Node target_node) mutable {
-                    if (pruner.should_prune(next_node.variable)) {
-                        target_node.pruneProperties(pruner.get_keys(next_node.variable));
-                    }
-                    visited_rel_ids.push_back(rel.getId());
-                    current_path_rels.push_back(rel);
-                    current_path_nodes.push_back(target_node);
-
-                    uint64_t next_depth = current_depth + 1;
-                    if (next_depth % 5 == 0) {
-                        return seastar::yield().then([&graph, target_id, edge, next_node, next_depth,
-                                                      visited_rel_ids = std::move(visited_rel_ids),
-                                                      current_path_rels = std::move(current_path_rels),
-                                                      current_path_nodes = std::move(current_path_nodes),
-                                                      limit, pruner, path_mode]() mutable {
-                            return traverse_var_len_async(
-                                graph,
-                                target_id,
-                                edge,
-                                next_node,
-                                next_depth,
-                                std::move(visited_rel_ids),
-                                std::move(current_path_rels),
-                                std::move(current_path_nodes),
-                                limit,
-                                pruner,
-                                path_mode
-                            );
-                        });
-                    } else {
-                        return traverse_var_len_async(
-                            graph,
-                            target_id,
-                            edge,
-                            next_node,
-                            next_depth,
-                            std::move(visited_rel_ids),
-                            std::move(current_path_rels),
-                            std::move(current_path_nodes),
-                            limit,
-                            pruner,
-                            path_mode
-                        );
-                    }
-                })
-            );
+            branches->push_back(std::move(rel));
         }
 
-        if (branch_futs.empty()) {
+        if (branches->empty()) {
             return seastar::make_ready_future<std::vector<PathHop>>(std::move(local_results));
         }
 
-        return seastar::when_all_succeed(branch_futs.begin(), branch_futs.end())
-        .then([local_results = std::move(local_results), limit](std::vector<std::vector<PathHop>> nested_branches) mutable {
-            for (auto& branch_res : nested_branches) {
-                local_results.insert(local_results.end(), branch_res.begin(), branch_res.end());
+        // Expand the branches with a bounded number in flight. Each branch carries its own copy of the
+        // path built so far, so expanding every branch of a high-degree node at once made live memory
+        // the product of that degree and the path length. Results land in per-branch slots, keeping the
+        // accumulated order identical to the order the relationships came back in.
+        auto branch_results = std::make_shared<std::vector<std::vector<PathHop>>>(branches->size());
+        auto indices = std::make_shared<std::vector<size_t>>(branches->size());
+        std::iota(indices->begin(), indices->end(), 0);
+
+        const size_t branch_concurrency = gql_var_len_branch_concurrency > 0 ? gql_var_len_branch_concurrency : 1;
+
+        return seastar::max_concurrent_for_each(indices->begin(), indices->end(), branch_concurrency,
+        [&graph, branches, branch_results, edge, next_node, current_node_id, current_depth, visited_rel_ids,
+         current_path_rels, current_path_nodes, limit, pruner, path_mode, hop_sink](size_t branch_idx) {
+            const Relationship& rel = (*branches)[branch_idx];
+            uint64_t target_id = (rel.getStartingNodeId() == current_node_id) ? rel.getEndingNodeId() : rel.getStartingNodeId();
+
+            return graph.shard.local().NodeGetPeered(target_id)
+            .then([&graph, branch_idx, branch_results, rel, edge, next_node, current_depth, visited_rel_ids,
+                   current_path_rels, current_path_nodes, target_id, limit, pruner, path_mode, hop_sink](Node target_node) mutable {
+                if (pruner.should_prune(next_node.variable)) {
+                    target_node.pruneProperties(pruner.get_keys(next_node.variable));
+                }
+                visited_rel_ids.push_back(rel.getId());
+                current_path_rels.push_back(rel);
+                current_path_nodes.push_back(target_node);
+
+                uint64_t next_depth = current_depth + 1;
+                auto descend = [&graph, target_id, edge, next_node, next_depth,
+                                visited_rel_ids = std::move(visited_rel_ids),
+                                current_path_rels = std::move(current_path_rels),
+                                current_path_nodes = std::move(current_path_nodes),
+                                limit, pruner, path_mode, hop_sink]() mutable {
+                    return traverse_var_len_async(
+                        graph,
+                        target_id,
+                        edge,
+                        next_node,
+                        next_depth,
+                        std::move(visited_rel_ids),
+                        std::move(current_path_rels),
+                        std::move(current_path_nodes),
+                        limit,
+                        pruner,
+                        path_mode,
+                        hop_sink
+                    );
+                };
+
+                seastar::future<std::vector<PathHop>> descended = (next_depth % 5 == 0)
+                    ? seastar::yield().then(std::move(descend))
+                    : descend();
+
+                return descended.then([branch_idx, branch_results](std::vector<PathHop> hops) {
+                    (*branch_results)[branch_idx] = std::move(hops);
+                });
+            });
+        }).then([local_results = std::move(local_results), branches, indices, branch_results, limit]() mutable {
+            for (auto& branch_res : *branch_results) {
+                local_results.insert(local_results.end(),
+                                     std::make_move_iterator(branch_res.begin()),
+                                     std::make_move_iterator(branch_res.end()));
                 if (limit > 0 && local_results.size() >= limit) {
                     local_results.resize(limit);
                     break;
                 }
             }
-            return local_results;
+            return std::move(local_results);
         });
     };
 
-    if (edge_type.empty()) {
-        return graph.shard.local().NodeGetRelationshipsPeered(current_node_id, dir).then(std::move(handle_rels));
-    } else {
+    return recorded.then([&graph, current_node_id, dir, edge_type, handle_rels = std::move(handle_rels)]() mutable {
+        if (edge_type.empty()) {
+            return graph.shard.local().NodeGetRelationshipsPeered(current_node_id, dir).then(std::move(handle_rels));
+        }
         return graph.shard.local().NodeGetRelationshipsPeered(current_node_id, dir, edge_type).then(std::move(handle_rels));
+    });
+}
+
+/**
+ * @brief Turns completed var-length paths into rows, applying the far node's label and property
+ *        constraints and any binding it already carries. Shared by the materialising var-length step and
+ *        the streamed one so the two cannot drift apart.
+ */
+static std::vector<GqlRow> var_len_hops_to_rows(const GqlRow& row, const PatternEdge& edge,
+                                                const PatternNode& next_node, size_t node_idx,
+                                                const std::vector<PathHop>& hops) {
+    std::vector<GqlRow> out;
+    for (const auto& hop : hops) {
+        Node final_node;
+        if (hop.nodes.empty()) {
+            if (edge.min_hops == 0) {
+                // 0-hop transition: final node is the start node itself
+                auto start_it = row.bindings.find("_n_" + std::to_string(node_idx));
+                if (start_it != row.bindings.end() && start_it->second.type == GqlValue::NODE) {
+                    final_node = *start_it->second.node;
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+        } else {
+            final_node = hop.nodes.back();
+        }
+
+        if (next_node.label_expr && !matches_label_expr(final_node.getType(), next_node.label_expr)) {
+            continue;
+        }
+        if (!matches_properties(final_node.getProperties(), next_node.properties) || !matches_filters(final_node.getProperties(), next_node.property_filters)) {
+            continue;
+        }
+
+        auto bound_it = row.bindings.find(next_node.variable);
+        if (bound_it != row.bindings.end() && bound_it->second.type == GqlValue::NODE) {
+            if (bound_it->second.node->getId() != final_node.getId()) {
+                continue;
+            }
+        }
+
+        GqlRow new_row = row;
+        new_row.bindings[edge.variable] = GqlValue(hop.rels);
+        new_row.bindings["_e_" + std::to_string(node_idx)] = GqlValue(hop.rels);
+        new_row.bindings[next_node.variable] = GqlValue(final_node);
+        new_row.bindings["_n_" + std::to_string(node_idx + 1)] = GqlValue(final_node);
+        out.push_back(std::move(new_row));
     }
+    return out;
 }
 
 static seastar::future<std::vector<GqlRow>> traverse_step(ragedb::Graph& graph, const GqlRow& row, const PatternEdge& edge, const PatternNode& next_node, size_t node_idx, size_t limit, const ProjectionPruner& pruner, PathMode path_mode) {
@@ -507,47 +610,7 @@ static seastar::future<std::vector<GqlRow>> traverse_step(ragedb::Graph& graph, 
     if (edge.is_variable_length) {
         return traverse_var_len_async(graph, src_id, edge, next_node, 0, {}, {}, {}, limit, pruner, path_mode)
         .then([row, edge, next_node, node_idx](std::vector<PathHop> hops) {
-            std::vector<GqlRow> out;
-            for (const auto& hop : hops) {
-                Node final_node;
-                if (hop.nodes.empty()) {
-                    if (edge.min_hops == 0) {
-                        // 0-hop transition: final node is the start node itself
-                        auto start_it = row.bindings.find("_n_" + std::to_string(node_idx));
-                        if (start_it != row.bindings.end() && start_it->second.type == GqlValue::NODE) {
-                            final_node = *start_it->second.node;
-                        } else {
-                            continue;
-                        }
-                    } else {
-                        continue;
-                    }
-                } else {
-                    final_node = hop.nodes.back();
-                }
-
-                    if (next_node.label_expr && !matches_label_expr(final_node.getType(), next_node.label_expr)) {
-                    continue;
-                }
-                if (!matches_properties(final_node.getProperties(), next_node.properties) || !matches_filters(final_node.getProperties(), next_node.property_filters)) {
-                    continue;
-                }
-
-                auto bound_it = row.bindings.find(next_node.variable);
-                if (bound_it != row.bindings.end() && bound_it->second.type == GqlValue::NODE) {
-                    if (bound_it->second.node->getId() != final_node.getId()) {
-                        continue;
-                    }
-                }
-
-                GqlRow new_row = row;
-                new_row.bindings[edge.variable] = GqlValue(hop.rels);
-                new_row.bindings["_e_" + std::to_string(node_idx)] = GqlValue(hop.rels);
-                new_row.bindings[next_node.variable] = GqlValue(final_node);
-                new_row.bindings["_n_" + std::to_string(node_idx + 1)] = GqlValue(final_node);
-                out.push_back(new_row);
-            }
-            return out;
+            return var_len_hops_to_rows(row, edge, next_node, node_idx, hops);
         });
     }
 
@@ -746,6 +809,39 @@ static seastar::future<std::vector<GqlRow>> traverse_step(ragedb::Graph& graph, 
     }
 }
 
+/**
+ * @brief Drains one row's var-length expansion straight into the row sink: completed paths are converted
+ *        and handed over in batches as the traversal finds them, so a single high-fanout row never
+ *        materialises its whole path set. This is the shape that exhausted the heap -- one person's
+ *        KNOWS{1,3} neighbourhood at SF1 is over a million paths, each holding the nodes and
+ *        relationships along it, and a bare count(*) needed none of their contents.
+ */
+static seastar::future<> traverse_var_len_step_to_sink(ragedb::Graph& graph, const GqlRow& row,
+                                                       const PatternEdge& edge, const PatternNode& next_node,
+                                                       size_t node_idx, const ProjectionPruner& pruner,
+                                                       PathMode path_mode, GqlRowSink* sink) {
+    auto it = row.bindings.find("_n_" + std::to_string(node_idx));
+    if (it == row.bindings.end()) {
+        return seastar::make_ready_future<>();
+    }
+    uint64_t src_id = it->second.node->getId();
+
+    auto hop_sink = std::make_shared<PathHopSink>();
+    hop_sink->batch = gql_var_len_hop_batch > 0 ? gql_var_len_hop_batch : 1;
+    hop_sink->consume = [row, edge, next_node, node_idx, sink](std::vector<PathHop> hops) {
+        auto rows = var_len_hops_to_rows(row, edge, next_node, node_idx, hops);
+        if (rows.empty()) {
+            return seastar::make_ready_future<>();
+        }
+        return sink->consume(std::move(rows));
+    };
+
+    return traverse_var_len_async(graph, src_id, edge, next_node, 0, {}, {}, {}, 0, pruner, path_mode, hop_sink.get())
+    .then([hop_sink](std::vector<PathHop>) {
+        return hop_sink->flush();
+    });
+}
+
 static seastar::future<std::vector<GqlRow>> traverse_path_pattern_iterative(ragedb::Graph& graph, const PathPattern& prep_pattern, size_t step_idx, std::vector<GqlRow> current_step_rows, size_t limit, const ProjectionPruner& pruner, PathMode path_mode, GqlRowSink* sink = nullptr) {
     if (step_idx >= prep_pattern.edges.size()) {
         if (sink) {
@@ -770,7 +866,18 @@ static seastar::future<std::vector<GqlRow>> traverse_path_pattern_iterative(rage
                 return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::yes);
             }
             const GqlRow& row = st->rows[st->idx++];
-            return traverse_step(graph, row, prep_pattern.edges[step_idx], prep_pattern.nodes[step_idx + 1], step_idx, 0, pruner, path_mode)
+            const auto& step_edge = prep_pattern.edges[step_idx];
+
+            // A var-length final step is the one expansion the row-by-row drive does not bound: the row's
+            // whole {min,max}-hop neighbourhood would be materialised before any of it reached the sink.
+            // Stream it instead.
+            if (step_edge.is_variable_length && step_idx + 1 == prep_pattern.edges.size()) {
+                return traverse_var_len_step_to_sink(graph, row, step_edge, prep_pattern.nodes[step_idx + 1],
+                                                     step_idx, pruner, path_mode, sink)
+                    .then([] { return seastar::stop_iteration::no; });
+            }
+
+            return traverse_step(graph, row, step_edge, prep_pattern.nodes[step_idx + 1], step_idx, 0, pruner, path_mode)
             .then([st, &graph, prep_pattern, step_idx, limit, pruner, path_mode, sink](std::vector<GqlRow> step_rows) {
                 if (step_rows.empty()) {
                     return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::no);

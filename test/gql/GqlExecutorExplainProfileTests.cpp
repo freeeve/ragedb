@@ -111,5 +111,29 @@ TEST_CASE("GQL Execution EXPLAIN and PROFILE Tests", "[gql_explain_profile]") {
         REQUIRE(results_json.find("Student") != std::string::npos);
     }
 
+    SECTION("EXPLAIN surfaces the constraint that filters a scan, wherever it lives") {
+        // An inline property map is bound to the anchor, so it shows on the Scan node; a FILTER stays a
+        // residual predicate on a Filter node. Both used to be invisible -- the map rendered as a bare
+        // `(p:Person)` and the Filter node said only "WHERE expression" -- so a constrained scan looked
+        // identical to a full one. Both now show the actual constraint.
+        std::string map_plan = GqlExecutor::execute(graph, GqlParser::parse(
+            "EXPLAIN MATCH (p:Person {age: 30}) RETURN p.name")).get();
+        INFO("map plan: " << map_plan);
+        REQUIRE(map_plan.find("age = 30") != std::string::npos);
+
+        std::string filter_plan = GqlExecutor::execute(graph, GqlParser::parse(
+            "EXPLAIN MATCH (p:Person) FILTER p.age > 30 RETURN p.name")).get();
+        INFO("filter plan: " << filter_plan);
+        REQUIRE(filter_plan.find("p.age > 30") != std::string::npos);
+        // No longer the useless generic label.
+        REQUIRE(filter_plan.find("WHERE expression") == std::string::npos);
+
+        // An unconstrained scan shows neither, so it is distinguishable from a constrained one.
+        std::string scan_plan = GqlExecutor::execute(graph, GqlParser::parse(
+            "EXPLAIN MATCH (p:Person) RETURN p.name")).get();
+        INFO("scan plan: " << scan_plan);
+        REQUIRE(scan_plan.find("age") == std::string::npos);
+    }
+
     guard.stop();
 }

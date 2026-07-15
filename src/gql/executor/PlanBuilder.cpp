@@ -51,6 +51,98 @@ static std::string describe_label_expr(const std::shared_ptr<LabelExpression>& e
  * 
  * E.g., translates internal nodes and edges into "(a:Person)-[e:KNOWS]->(b:Person)".
  */
+/// Renders a literal property value for a plan detail. Only the scalar alternatives appear in a pattern
+/// constraint; anything else is shown as "?".
+static std::string describe_property_value(const property_type_t& v) {
+    if (std::holds_alternative<std::string>(v)) return "'" + std::get<std::string>(v) + "'";
+    if (std::holds_alternative<int64_t>(v)) return std::to_string(std::get<int64_t>(v));
+    if (std::holds_alternative<double>(v)) {
+        std::ostringstream oss; oss << std::get<double>(v); return oss.str();
+    }
+    if (std::holds_alternative<bool>(v)) return std::get<bool>(v) ? "true" : "false";
+    return "?";
+}
+
+static std::string describe_op(Operation op) {
+    switch (op) {
+        case Operation::EQ:  return "=";
+        case Operation::NEQ: return "<>";
+        case Operation::GT:  return ">";
+        case Operation::GTE: return ">=";
+        case Operation::LT:  return "<";
+        case Operation::LTE: return "<=";
+        case Operation::STARTS_WITH: return " STARTS WITH ";
+        case Operation::CONTAINS:    return " CONTAINS ";
+        case Operation::ENDS_WITH:   return " ENDS WITH ";
+        default: return " ? ";
+    }
+}
+
+/// Renders the property constraints on a node or edge -- both an inline literal map and the filters the
+/// optimizer pushed into the scan -- as a `{...}` suffix. Without this a bound anchor
+/// (`(a:Person {id: 1})` or `(a:Person) FILTER a.id = 1`, both pushed to property_filters) rendered
+/// identically to an unbound full scan, hiding the single fact that decides whether a query seeks or scans.
+static std::string describe_property_constraints(const std::map<std::string, property_type_t>& properties,
+                                                 const std::vector<PropertyFilter>& filters) {
+    std::vector<std::string> parts;
+    for (const auto& [prop, val] : properties) {
+        parts.push_back(prop + " = " + describe_property_value(val));
+    }
+    for (const auto& f : filters) {
+        parts.push_back(f.property + describe_op(f.op) + describe_property_value(f.value));
+    }
+    if (parts.empty()) return "";
+    std::string out = " {";
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (i > 0) out += ", ";
+        out += parts[i];
+    }
+    return out + "}";
+}
+
+/// Renders the common predicate shapes for a plan detail, so a Filter operator shows the actual condition
+/// (`p.age > 30`) rather than a generic "WHERE expression". Shapes it does not know fall back to a short
+/// label so the plan stays readable rather than dumping a whole AST.
+static std::string describe_expression(const Expression* expr) {
+    if (!expr) return "";
+    switch (expr->kind) {
+        case ExpressionKind::LITERAL:
+            return describe_property_value(static_cast<const LiteralExpr*>(expr)->value);
+        case ExpressionKind::VARIABLE:
+            return static_cast<const VariableExpr*>(expr)->name;
+        case ExpressionKind::PROPERTY_LOOKUP: {
+            auto* p = static_cast<const PropertyLookupExpr*>(expr);
+            return p->variable + "." + p->property;
+        }
+        case ExpressionKind::BINARY_OP: {
+            auto* b = static_cast<const BinaryOpExpr*>(expr);
+            std::string op;
+            switch (b->op) {
+                case BinaryOpKind::AND: op = " AND "; break;
+                case BinaryOpKind::OR:  op = " OR ";  break;
+                case BinaryOpKind::ADD: op = " + ";   break;
+                case BinaryOpKind::SUB: op = " - ";   break;
+                case BinaryOpKind::MUL: op = " * ";   break;
+                case BinaryOpKind::DIV: op = " / ";   break;
+                case BinaryOpKind::CONCAT: op = " || "; break;
+                case BinaryOpKind::EQ: op = " = ";  break;
+                case BinaryOpKind::NE: op = " <> "; break;
+                case BinaryOpKind::LT: op = " < ";  break;
+                case BinaryOpKind::LE: op = " <= "; break;
+                case BinaryOpKind::GT: op = " > ";  break;
+                case BinaryOpKind::GE: op = " >= "; break;
+                default: op = " ? "; break;
+            }
+            return describe_expression(b->left.get()) + op + describe_expression(b->right.get());
+        }
+        case ExpressionKind::CAST:      return "CAST(...)";
+        case ExpressionKind::IS_LABELED: return "IS LABELED";
+        case ExpressionKind::AGGREGATION: return "<aggregate>";
+        default:
+            return "<expr>";
+    }
+}
+
 static std::string describe_pattern(const PathPattern& pattern) {
     std::string res;
     for (size_t i = 0; i < pattern.nodes.size(); ++i) {
@@ -70,6 +162,7 @@ static std::string describe_pattern(const PathPattern& pattern) {
                     edge_str += std::to_string(edge.min_hops) + ".." + (edge.max_hops == std::numeric_limits<uint64_t>::max() ? "" : std::to_string(edge.max_hops));
                 }
             }
+            edge_str += describe_property_constraints(edge.properties, edge.property_filters);
             edge_str += "]";
             
             if (edge.direction == EdgeDirection::RIGHT) edge_str += "->";
@@ -84,6 +177,7 @@ static std::string describe_pattern(const PathPattern& pattern) {
         if (node.label_expr) {
             node_str += ":" + describe_label_expr(node.label_expr);
         }
+        node_str += describe_property_constraints(node.properties, node.property_filters);
         node_str += ")";
         res += node_str;
     }
@@ -479,7 +573,7 @@ static std::shared_ptr<PlanNode> build_single_query_plan(ragedb::Graph& graph, c
         auto filter_node = std::make_shared<PlanNode>();
         filter_node->operator_name = "Filter";
         filter_node->key = "filter";
-        filter_node->detail = "WHERE expression";
+        filter_node->detail = describe_expression(query.where_expr.get());
         filter_node->variables = join_strings(incoming_vars, ", ");
         if (current) filter_node->children.push_back(current);
         current = filter_node;

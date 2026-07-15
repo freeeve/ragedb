@@ -548,14 +548,19 @@ struct ExistsExpr : public Expression {
 struct SizeExpr : public Expression {
     std::vector<MatchStatement> matches;
     std::unique_ptr<Expression> where_expr;
-    
+    /// Set before execution when the count is computed by the correlated precompute rather than the degree
+    /// rewrite; the per-row count is bound under "_count_<subquery_id>" and the evaluator reads it back.
+    int64_t subquery_id = -1;
+
     SizeExpr(std::vector<MatchStatement> m, std::unique_ptr<Expression> w) {
         kind = ExpressionKind::SIZE_OP;
         matches = std::move(m);
         where_expr = std::move(w);
     }
     std::unique_ptr<Expression> clone() const override {
-        return std::make_unique<SizeExpr>(matches, where_expr ? where_expr->clone() : nullptr);
+        auto c = std::make_unique<SizeExpr>(matches, where_expr ? where_expr->clone() : nullptr);
+        c->subquery_id = subquery_id;
+        return c;
     }
 };
 

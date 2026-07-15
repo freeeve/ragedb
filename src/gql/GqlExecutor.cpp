@@ -256,6 +256,131 @@ static std::vector<const Expression*> derive_grouping_keys(const GqlQuery& q, st
     return grouping_keys;
 }
 
+/// True if the expression contains a nested braced subquery (COUNT{} or EXISTS{}). Such a subquery WHERE
+/// needs the full correlated executor and is not yet handled by the pattern-count precompute below.
+static bool expr_contains_subquery(const Expression* expr) {
+    if (!expr) return false;
+    if (expr->kind == ExpressionKind::SIZE_OP || expr->kind == ExpressionKind::EXISTS) return true;
+    switch (expr->kind) {
+        case ExpressionKind::UNARY_OP: return expr_contains_subquery(static_cast<const UnaryOpExpr*>(expr)->expr.get());
+        case ExpressionKind::IS_NULL_CHECK: return expr_contains_subquery(static_cast<const IsNullExpr*>(expr)->expr.get());
+        case ExpressionKind::BINARY_OP: {
+            auto* b = static_cast<const BinaryOpExpr*>(expr);
+            return expr_contains_subquery(b->left.get()) || expr_contains_subquery(b->right.get());
+        }
+        case ExpressionKind::AGGREGATION: return expr_contains_subquery(static_cast<const AggregateExpr*>(expr)->expr.get());
+        case ExpressionKind::CASE_WHEN: {
+            auto* ce = static_cast<const CaseExpr*>(expr);
+            for (const auto& br : ce->branches) {
+                if (expr_contains_subquery(br.first.get()) || expr_contains_subquery(br.second.get())) return true;
+            }
+            return expr_contains_subquery(ce->else_expr.get());
+        }
+        case ExpressionKind::IN_LIST: {
+            auto* in = static_cast<const InExpr*>(expr);
+            return expr_contains_subquery(in->value.get()) || expr_contains_subquery(in->list.get());
+        }
+        case ExpressionKind::CAST: return expr_contains_subquery(static_cast<const CastExpr*>(expr)->value.get());
+        case ExpressionKind::LIST_LITERAL: {
+            auto* le = static_cast<const ListExpr*>(expr);
+            for (const auto& e : le->elements) if (expr_contains_subquery(e.get())) return true;
+            return false;
+        }
+        default: return false;
+    }
+}
+
+/// Walks an expression collecting the COUNT{} subqueries the precompute will evaluate, assigning each a
+/// stable id. Degree-rewritten counts are already PropertyLookupExprs, so only the constrained/correlated
+/// ones remain as SizeExprs here. Does not recurse into a subquery's own body.
+static void collect_count_subqueries(Expression* expr, std::vector<SizeExpr*>& out, int64_t& next_id) {
+    if (!expr) return;
+    if (expr->kind == ExpressionKind::SIZE_OP) {
+        auto* se = static_cast<SizeExpr*>(expr);
+        se->subquery_id = next_id++;   // deterministic by walk order; reassigned each execution
+        out.push_back(se);
+        return;
+    }
+    switch (expr->kind) {
+        case ExpressionKind::UNARY_OP: collect_count_subqueries(static_cast<UnaryOpExpr*>(expr)->expr.get(), out, next_id); break;
+        case ExpressionKind::IS_NULL_CHECK: collect_count_subqueries(static_cast<IsNullExpr*>(expr)->expr.get(), out, next_id); break;
+        case ExpressionKind::BINARY_OP: {
+            auto* b = static_cast<BinaryOpExpr*>(expr);
+            collect_count_subqueries(b->left.get(), out, next_id);
+            collect_count_subqueries(b->right.get(), out, next_id);
+            break;
+        }
+        case ExpressionKind::AGGREGATION: collect_count_subqueries(static_cast<AggregateExpr*>(expr)->expr.get(), out, next_id); break;
+        case ExpressionKind::CASE_WHEN: {
+            auto* ce = static_cast<CaseExpr*>(expr);
+            for (auto& br : ce->branches) {
+                collect_count_subqueries(br.first.get(), out, next_id);
+                collect_count_subqueries(br.second.get(), out, next_id);
+            }
+            collect_count_subqueries(ce->else_expr.get(), out, next_id);
+            break;
+        }
+        case ExpressionKind::IN_LIST: {
+            auto* in = static_cast<InExpr*>(expr);
+            collect_count_subqueries(in->value.get(), out, next_id);
+            collect_count_subqueries(in->list.get(), out, next_id);
+            break;
+        }
+        case ExpressionKind::CAST: collect_count_subqueries(static_cast<CastExpr*>(expr)->value.get(), out, next_id); break;
+        case ExpressionKind::LIST_LITERAL: {
+            auto* le = static_cast<ListExpr*>(expr);
+            for (auto& e : le->elements) collect_count_subqueries(e.get(), out, next_id);
+            break;
+        }
+        default: break;
+    }
+}
+
+/// Correlated COUNT{} precompute. For each row, runs each supported COUNT{} subquery's pattern anchored on
+/// the row's bindings, applies the subquery WHERE, and binds the match count under "_count_<id>" so the
+/// synchronous expression evaluator can read it back. Handles far-node label/property filters, LET, and
+/// piped nodes -- everything the far-node-blind degree rewrite cannot. A subquery whose WHERE nests another
+/// subquery (e.g. an inner EXISTS) is left unbound (evaluates to null) pending the full correlated executor.
+static seastar::future<std::vector<GqlRow>> precompute_count_subqueries(
+    ragedb::Graph& graph, std::shared_ptr<GqlQuery> query_ptr, std::vector<GqlRow> rows) {
+    std::vector<SizeExpr*> subqueries;
+    int64_t next_id = 0;
+    for (auto& let : query_ptr->let_bindings) collect_count_subqueries(let.expr.get(), subqueries, next_id);
+    for (auto& item : query_ptr->returns) collect_count_subqueries(item.expr.get(), subqueries, next_id);
+    if (query_ptr->where_expr) collect_count_subqueries(query_ptr->where_expr.get(), subqueries, next_id);
+    for (auto& spec : query_ptr->order_by) collect_count_subqueries(spec.expr.get(), subqueries, next_id);
+
+    if (subqueries.empty() || rows.empty()) {
+        return seastar::make_ready_future<std::vector<GqlRow>>(std::move(rows));
+    }
+
+    auto shared_rows = std::make_shared<std::vector<GqlRow>>(std::move(rows));
+    std::vector<seastar::future<>> futs;
+    for (size_t ri = 0; ri < shared_rows->size(); ++ri) {
+        for (auto* se : subqueries) {
+            if (se->matches.size() != 1) continue;                       // multi-match not yet supported
+            if (se->where_expr && expr_contains_subquery(se->where_expr.get())) continue;  // nested subquery
+            ProjectionPruner pruner;   // keep every subquery variable so the WHERE can read properties
+            for (const auto& n : se->matches[0].pattern.nodes) if (!n.variable.empty()) pruner.whole_objects.insert(n.variable);
+            for (const auto& e : se->matches[0].pattern.edges) if (!e.variable.empty()) pruner.whole_objects.insert(e.variable);
+            int64_t sid = se->subquery_id;
+            const Expression* where = se->where_expr.get();
+            futs.push_back(
+                traverse_path_pattern(graph, se->matches[0].pattern, (*shared_rows)[ri], 0, pruner)
+                .then([shared_rows, ri, sid, where, query_ptr](std::vector<GqlRow> sub_rows) {
+                    int64_t cnt = 0;
+                    for (auto& sr : sub_rows) {
+                        if (!where || evaluate_expression(sr, where).is_truthy()) cnt++;
+                    }
+                    (*shared_rows)[ri].bindings["_count_" + std::to_string(sid)] = GqlValue(property_type_t(cnt));
+                })
+            );
+        }
+    }
+    return seastar::when_all_succeed(futs.begin(), futs.end())
+        .then([shared_rows]() { return std::move(*shared_rows); });
+}
+
 static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph, std::shared_ptr<GqlQuery> query_ptr, std::optional<std::vector<GqlRow>> incoming) {
     // WITH continuation segments carry piped rows; planners that answer from indexes or run the
     // pattern from scratch cannot consume them and must be skipped (they would ignore the pipe).
@@ -850,6 +975,12 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
             matched_rows = std::move(edge_filtered_rows);
         }
 
+        // Resolve correlated COUNT{} subqueries (async) before LET / WHERE / RETURN read their per-row
+        // counts. No-op and cost-free when the segment contains none.
+        return precompute_count_subqueries(graph, query_ptr, std::move(matched_rows))
+        .then([&graph, query_ptr](std::vector<GqlRow> matched_rows) {
+        const auto& query = *query_ptr;
+
         // 6a. Expand ISO GQL FOR (the standard's UNWIND) before anything else reads the working table:
         //     unlike LET, which adds a column to each row, FOR multiplies the rows -- one per element of
         //     the list. A pattern-less query (FOR x IN [1, 2, 3] RETURN x) still has a row to expand,
@@ -940,6 +1071,7 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
                 }
             }
             return written_rows;
+        });
         });
     })
     .then([query_ptr, is_sorted_shared](std::vector<GqlRow> written_rows) {

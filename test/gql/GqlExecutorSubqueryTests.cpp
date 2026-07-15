@@ -94,3 +94,57 @@ TEST_CASE("GQL Execution Correlated Subquery Tests", "[gql_executor_subquery]") 
 
     guard.stop();
 }
+
+// A COUNT{} subquery whose far node carries a label/property filter cannot be answered by the far-node-blind
+// degree rewrite -- it must count actual matching pattern rows. Here a person created 2 Posts and 3 Comments;
+// COUNT { (p)<-[:HAS_CREATOR]-(:Post) } must be 2, not 5 (all HAS_CREATOR edges). Also covers COUNT{} in a
+// LET (which the degree rewrite never populated -> was null) and the bare unconstrained fast path.
+TEST_CASE("GQL COUNT subquery applies far-node filter and works in LET", "[gql_executor_count_subquery]") {
+    auto graph = Graph("gql_test_count_subquery");
+    graph.Start().get();
+    graph.Clear();
+    GraphStopGuard guard(graph);
+
+    graph.shard.local().NodeTypeInsertPeered("Person").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "id", "integer").get();
+    graph.shard.local().NodeTypeInsertPeered("Post").get();
+    graph.shard.local().NodeTypeInsertPeered("Comment").get();
+    graph.shard.local().RelationshipTypeInsertPeered("HAS_CREATOR").get();
+
+    uint64_t p = graph.shard.local().NodeAddPeered("Person", "p1", "{\"id\": 1}").get();
+    for (int i = 0; i < 2; ++i) {
+        uint64_t post = graph.shard.local().NodeAddPeered("Post", "post" + std::to_string(i), "{}").get();
+        graph.shard.local().RelationshipAddPeered("HAS_CREATOR", post, p, "{}").get();
+    }
+    for (int i = 0; i < 3; ++i) {
+        uint64_t c = graph.shard.local().NodeAddPeered("Comment", "c" + std::to_string(i), "{}").get();
+        graph.shard.local().RelationshipAddPeered("HAS_CREATOR", c, p, "{}").get();
+    }
+
+    auto run = [&graph](const std::string& q) {
+        auto query = GqlParser::parse(q);
+        GqlOptimizer::optimize(query);
+        return GqlExecutor::execute(graph, std::move(query)).get();
+    };
+
+    SECTION("far-node label filter is applied (2 Posts, not 5 HAS_CREATOR edges)") {
+        std::string r = run("MATCH (p:Person {id: 1}) RETURN COUNT { (p)<-[:HAS_CREATOR]-(:Post) } AS c");
+        INFO("posts count: " << r);
+        REQUIRE(r.find("\"c\": 2") != std::string::npos);
+    }
+
+    SECTION("COUNT{} bound in a LET is evaluated, not null") {
+        std::string r = run("MATCH (p:Person {id: 1}) LET total = COUNT { (p)<-[:HAS_CREATOR]-(:Post) } RETURN total");
+        INFO("let total: " << r);
+        REQUIRE(r.find("\"total\": 2") != std::string::npos);
+        REQUIRE(r.find("null") == std::string::npos);
+    }
+
+    SECTION("bare unconstrained COUNT{} still counts all edges (degree fast path)") {
+        std::string r = run("MATCH (p:Person {id: 1}) RETURN COUNT { (p)<-[:HAS_CREATOR]-() } AS c");
+        INFO("all edges: " << r);
+        REQUIRE(r.find("\"c\": 5") != std::string::npos);
+    }
+
+    guard.stop();
+}

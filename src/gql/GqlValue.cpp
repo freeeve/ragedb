@@ -715,7 +715,18 @@ GqlValue evaluate_expression(const GqlRow& row, const Expression* expr) {
             return GqlValue(is_null_expr->is_not ? !is_nil : is_nil);
         }
         case ExpressionKind::SIZE_OP: {
-            return GqlValue(); // Evaluated via rewritten degree properties or subquery paths.
+            // A pure `COUNT { (v)-[:R]->() }` is rewritten to a degree property by DegreeConstraintPruner and
+            // never reaches here. A constrained/correlated COUNT{} is computed per row by the precompute pass
+            // and bound under "_count_<subquery_id>"; read it back. Null if it was not precomputed (an as-yet
+            // unsupported subquery shape) -- never a silent wrong count.
+            auto* se = static_cast<const SizeExpr*>(expr);
+            if (se->subquery_id >= 0) {
+                auto it = row.bindings.find("_count_" + std::to_string(se->subquery_id));
+                if (it != row.bindings.end()) {
+                    return it->second;
+                }
+            }
+            return GqlValue();
         }
         case ExpressionKind::AGGREGATION: {
             return GqlValue(); // Aggregations are not evaluated on single rows

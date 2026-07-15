@@ -544,6 +544,14 @@ bool is_variable_referenced_outside_count(const Expression* expr, const std::str
         case ExpressionKind::IS_LABELED: {
             return is_variable_referenced_outside_count(static_cast<const IsLabeledExpr*>(expr)->value.get(), var_name);
         }
+        case ExpressionKind::IS_DIRECTED: {
+            return is_variable_referenced_outside_count(static_cast<const IsDirectedExpr*>(expr)->value.get(), var_name);
+        }
+        case ExpressionKind::IS_SOURCE_DEST: {
+            auto* s = static_cast<const IsSourceDestExpr*>(expr);
+            return is_variable_referenced_outside_count(s->value.get(), var_name) ||
+                   is_variable_referenced_outside_count(s->edge.get(), var_name);
+        }
         case ExpressionKind::LIST_LITERAL: {
             for (const auto& element : static_cast<const ListExpr*>(expr)->elements) {
                 if (is_variable_referenced_outside_count(element.get(), var_name)) return true;

@@ -547,6 +547,17 @@ GqlType GqlTypechecker::check_expression(const Expression& expr) {
             check_expression(*l.value);
             return GqlType::BOOLEAN;
         }
+        case ExpressionKind::IS_DIRECTED: {
+            const auto& d = static_cast<const IsDirectedExpr&>(expr);
+            check_expression(*d.value);
+            return GqlType::BOOLEAN;
+        }
+        case ExpressionKind::IS_SOURCE_DEST: {
+            const auto& s = static_cast<const IsSourceDestExpr&>(expr);
+            check_expression(*s.value);
+            check_expression(*s.edge);
+            return GqlType::BOOLEAN;
+        }
         case ExpressionKind::LIST_LITERAL: {
             const auto& le = static_cast<const ListExpr&>(expr);
             for (const auto& element : le.elements) {

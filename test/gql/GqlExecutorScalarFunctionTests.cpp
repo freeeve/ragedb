@@ -107,6 +107,25 @@ TEST_CASE("scalar function library", "[gql_executor_functions]") {
         REQUIRE(eid.find("null") == std::string::npos);
     }
 
+    SECTION("edge orientation predicates: IS DIRECTED, IS SOURCE/DESTINATION OF") {
+        // The graph has one KNOWS edge from Alice (a, the source) to Bob (b, the destination).
+        std::string res = run(
+            "MATCH (p:Person)-[r:KNOWS]->(q:Person) "
+            "RETURN r IS DIRECTED AS d, p IS SOURCE OF r AS psrc, q IS DESTINATION OF r AS qdst, "
+            "q IS SOURCE OF r AS qsrc, p IS NOT SOURCE OF r AS pnsrc");
+        INFO("orientation: " << res);
+        REQUIRE(res.find("\"d\": true") != std::string::npos);       // ragedb edges are directed
+        REQUIRE(res.find("\"psrc\": true") != std::string::npos);    // Alice is the source
+        REQUIRE(res.find("\"qdst\": true") != std::string::npos);    // Bob is the destination
+        REQUIRE(res.find("\"qsrc\": false") != std::string::npos);   // Bob is not the source
+        REQUIRE(res.find("\"pnsrc\": false") != std::string::npos);  // Alice IS the source, so NOT is false
+
+        // Usable as a filter: only the row where the endpoint matches survives.
+        std::string filt = run("MATCH (p:Person)-[r:KNOWS]->(q:Person) WHERE q IS DESTINATION OF r RETURN q.name AS n");
+        INFO("filter: " << filt);
+        REQUIRE(filt.find("Bob") != std::string::npos);
+    }
+
     SECTION("char_length and cardinality") {
         std::string res = run("MATCH (p:Person) FILTER p.name = 'Bob' RETURN char_length(p.name) AS n");
         REQUIRE(res.find("\"n\": 3") != std::string::npos);

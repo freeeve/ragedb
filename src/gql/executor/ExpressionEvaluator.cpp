@@ -74,6 +74,13 @@ bool has_aggregates(const Expression* expr) {
     if (expr->kind == ExpressionKind::IS_LABELED) {
         return has_aggregates(static_cast<const IsLabeledExpr*>(expr)->value.get());
     }
+    if (expr->kind == ExpressionKind::IS_DIRECTED) {
+        return has_aggregates(static_cast<const IsDirectedExpr*>(expr)->value.get());
+    }
+    if (expr->kind == ExpressionKind::IS_SOURCE_DEST) {
+        auto* s = static_cast<const IsSourceDestExpr*>(expr);
+        return has_aggregates(s->value.get()) || has_aggregates(s->edge.get());
+    }
     if (expr->kind == ExpressionKind::LIST_LITERAL) {
         for (const auto& element : static_cast<const ListExpr*>(expr)->elements) {
             if (has_aggregates(element.get())) return true;
@@ -123,6 +130,12 @@ void find_aggregates(const Expression* expr, std::vector<const AggregateExpr*>& 
         find_aggregates(static_cast<const CastExpr*>(expr)->value.get(), aggregates);
     } else if (expr->kind == ExpressionKind::IS_LABELED) {
         find_aggregates(static_cast<const IsLabeledExpr*>(expr)->value.get(), aggregates);
+    } else if (expr->kind == ExpressionKind::IS_DIRECTED) {
+        find_aggregates(static_cast<const IsDirectedExpr*>(expr)->value.get(), aggregates);
+    } else if (expr->kind == ExpressionKind::IS_SOURCE_DEST) {
+        auto* s = static_cast<const IsSourceDestExpr*>(expr);
+        find_aggregates(s->value.get(), aggregates);
+        find_aggregates(s->edge.get(), aggregates);
     } else if (expr->kind == ExpressionKind::LIST_LITERAL) {
         for (const auto& element : static_cast<const ListExpr*>(expr)->elements) {
             find_aggregates(element.get(), aggregates);
@@ -202,6 +215,22 @@ GqlValue evaluate_group_expression(const GqlRow& representative, const std::map<
             auto* l = static_cast<const IsLabeledExpr*>(expr);
             return apply_is_labeled(evaluate_group_expression(representative, aggregate_results, l->value.get()),
                                     l->label_expr, l->negated);
+        }
+        case ExpressionKind::IS_DIRECTED: {
+            auto* d = static_cast<const IsDirectedExpr*>(expr);
+            GqlValue v = evaluate_group_expression(representative, aggregate_results, d->value.get());
+            if (v.type != GqlValue::RELATIONSHIP) return GqlValue();
+            return GqlValue(d->negated ? false : true);
+        }
+        case ExpressionKind::IS_SOURCE_DEST: {
+            auto* s = static_cast<const IsSourceDestExpr*>(expr);
+            GqlValue node = evaluate_group_expression(representative, aggregate_results, s->value.get());
+            GqlValue edge = evaluate_group_expression(representative, aggregate_results, s->edge.get());
+            if (node.type != GqlValue::NODE || edge.type != GqlValue::RELATIONSHIP) return GqlValue();
+            uint64_t endpoint = s->is_source ? edge.relationship->getStartingNodeId()
+                                             : edge.relationship->getEndingNodeId();
+            bool result = (node.node->getId() == endpoint);
+            return GqlValue(s->negated ? !result : result);
         }
         case ExpressionKind::IN_LIST: {
             auto* in = static_cast<const InExpr*>(expr);

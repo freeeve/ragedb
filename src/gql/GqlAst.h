@@ -61,6 +61,8 @@ enum class ExpressionKind {
     IN_LIST,          ///< Membership test against a list value: x IN <listExpr>
     CAST,             ///< Type conversion: CAST(x AS STRING | INTEGER | FLOAT | BOOLEAN)
     IS_LABELED,       ///< Label predicate: x IS [NOT] LABELED <labelExpression>
+    IS_DIRECTED,      ///< Edge orientation predicate: e IS [NOT] DIRECTED
+    IS_SOURCE_DEST,   ///< Endpoint predicate: n IS [NOT] (SOURCE | DESTINATION) OF e
     LIST_LITERAL      ///< A list value written out: [a, b, c]
 };
 
@@ -336,6 +338,45 @@ struct IsLabeledExpr : public Expression {
     }
     std::unique_ptr<Expression> clone() const override {
         return std::make_unique<IsLabeledExpr>(value ? value->clone() : nullptr, label_expr, negated);
+    }
+};
+
+/**
+ * @brief `<expr> IS [NOT] DIRECTED`: whether a relationship is directed. ragedb relationships are
+ *        always directed, so this is true (false when negated) for a relationship, null otherwise.
+ */
+struct IsDirectedExpr : public Expression {
+    std::unique_ptr<Expression> value;  ///< The relationship being tested.
+    bool negated = false;               ///< True for IS NOT DIRECTED.
+    IsDirectedExpr(std::unique_ptr<Expression> v, bool n) {
+        kind = ExpressionKind::IS_DIRECTED;
+        value = std::move(v);
+        negated = n;
+    }
+    std::unique_ptr<Expression> clone() const override {
+        return std::make_unique<IsDirectedExpr>(value ? value->clone() : nullptr, negated);
+    }
+};
+
+/**
+ * @brief `<node> IS [NOT] (SOURCE | DESTINATION) OF <edge>`: whether the node is the start (source)
+ *        or end (destination) node of the relationship.
+ */
+struct IsSourceDestExpr : public Expression {
+    std::unique_ptr<Expression> value;  ///< The node being tested.
+    std::unique_ptr<Expression> edge;   ///< The relationship whose endpoint is checked.
+    bool is_source = true;              ///< True for SOURCE OF, false for DESTINATION OF.
+    bool negated = false;               ///< True for IS NOT ... OF.
+    IsSourceDestExpr(std::unique_ptr<Expression> v, std::unique_ptr<Expression> e, bool src, bool n) {
+        kind = ExpressionKind::IS_SOURCE_DEST;
+        value = std::move(v);
+        edge = std::move(e);
+        is_source = src;
+        negated = n;
+    }
+    std::unique_ptr<Expression> clone() const override {
+        return std::make_unique<IsSourceDestExpr>(value ? value->clone() : nullptr,
+                                                  edge ? edge->clone() : nullptr, is_source, negated);
     }
 };
 

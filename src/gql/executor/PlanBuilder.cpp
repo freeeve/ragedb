@@ -137,6 +137,8 @@ static std::string describe_expression(const Expression* expr) {
         }
         case ExpressionKind::CAST:      return "CAST(...)";
         case ExpressionKind::IS_LABELED: return "IS LABELED";
+        case ExpressionKind::IS_DIRECTED: return "IS DIRECTED";
+        case ExpressionKind::IS_SOURCE_DEST: return "IS SOURCE/DESTINATION OF";
         case ExpressionKind::AGGREGATION: return "<aggregate>";
         default:
             return "<expr>";

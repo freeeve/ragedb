@@ -96,6 +96,28 @@ void collect_accessed_properties(const Expression* expr,
             collect_accessed_properties(l->value.get(), accessed_props, whole_objects);
             break;
         }
+        case ExpressionKind::IS_DIRECTED: {
+            // Reads the edge's orientation from the entity, so keep it as a whole object.
+            auto* d = static_cast<const IsDirectedExpr*>(expr);
+            if (d->value && d->value->kind == ExpressionKind::VARIABLE) {
+                whole_objects.insert(static_cast<const VariableExpr*>(d->value.get())->name);
+            }
+            collect_accessed_properties(d->value.get(), accessed_props, whole_objects);
+            break;
+        }
+        case ExpressionKind::IS_SOURCE_DEST: {
+            // Compares node/edge identities and endpoints, so both operands must survive as whole objects.
+            auto* s = static_cast<const IsSourceDestExpr*>(expr);
+            if (s->value && s->value->kind == ExpressionKind::VARIABLE) {
+                whole_objects.insert(static_cast<const VariableExpr*>(s->value.get())->name);
+            }
+            if (s->edge && s->edge->kind == ExpressionKind::VARIABLE) {
+                whole_objects.insert(static_cast<const VariableExpr*>(s->edge.get())->name);
+            }
+            collect_accessed_properties(s->value.get(), accessed_props, whole_objects);
+            collect_accessed_properties(s->edge.get(), accessed_props, whole_objects);
+            break;
+        }
         case ExpressionKind::LITERAL:
         default:
             break;

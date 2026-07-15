@@ -755,6 +755,23 @@ GqlValue evaluate_expression(const GqlRow& row, const Expression* expr) {
             auto* l = static_cast<const IsLabeledExpr*>(expr);
             return apply_is_labeled(evaluate_expression(row, l->value.get()), l->label_expr, l->negated);
         }
+        case ExpressionKind::IS_DIRECTED: {
+            auto* d = static_cast<const IsDirectedExpr*>(expr);
+            GqlValue v = evaluate_expression(row, d->value.get());
+            if (v.type != GqlValue::RELATIONSHIP) return GqlValue();  // undefined for non-relationships
+            // ragedb relationships are always directed.
+            return GqlValue(d->negated ? false : true);
+        }
+        case ExpressionKind::IS_SOURCE_DEST: {
+            auto* s = static_cast<const IsSourceDestExpr*>(expr);
+            GqlValue node = evaluate_expression(row, s->value.get());
+            GqlValue edge = evaluate_expression(row, s->edge.get());
+            if (node.type != GqlValue::NODE || edge.type != GqlValue::RELATIONSHIP) return GqlValue();
+            uint64_t endpoint = s->is_source ? edge.relationship->getStartingNodeId()
+                                             : edge.relationship->getEndingNodeId();
+            bool result = (node.node->getId() == endpoint);
+            return GqlValue(s->negated ? !result : result);
+        }
         case ExpressionKind::IN_LIST: {
             auto* in = static_cast<const InExpr*>(expr);
             GqlValue needle = evaluate_expression(row, in->value.get());

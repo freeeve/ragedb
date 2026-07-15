@@ -1419,6 +1419,35 @@ std::unique_ptr<Expression> GqlParser::parse_comparison() {
                 expr = std::make_unique<IsLabeledExpr>(std::move(expr), parse_label_expression(false), is_not);
                 continue;
             }
+            // `e IS [NOT] DIRECTED` and `n IS [NOT] (SOURCE | DESTINATION) OF e`. DIRECTED/SOURCE/
+            // DESTINATION/OF are not reserved words, so they arrive as identifiers here.
+            if (check(TokenType::NAME)) {
+                std::string kw = peek().text;
+                std::transform(kw.begin(), kw.end(), kw.begin(), [](unsigned char c){ return std::toupper(c); });
+                if (kw == "DIRECTED") {
+                    advance();
+                    expr = std::make_unique<IsDirectedExpr>(std::move(expr), is_not);
+                    continue;
+                }
+                if (kw == "SOURCE" || kw == "DESTINATION") {
+                    bool is_source = (kw == "SOURCE");
+                    advance();
+                    std::string of_tok = check(TokenType::NAME) ? peek().text : "";
+                    std::transform(of_tok.begin(), of_tok.end(), of_tok.begin(), [](unsigned char c){ return std::toupper(c); });
+                    if (of_tok != "OF") {
+                        throw std::runtime_error("Expected 'OF' after IS [NOT] SOURCE/DESTINATION");
+                    }
+                    advance(); // consume OF
+                    if (!check(TokenType::NAME)) {
+                        throw std::runtime_error("Expected a relationship variable after 'OF'");
+                    }
+                    std::string edge_var = peek().text;
+                    advance();
+                    expr = std::make_unique<IsSourceDestExpr>(std::move(expr),
+                        std::make_unique<VariableExpr>(edge_var), is_source, is_not);
+                    continue;
+                }
+            }
             consume(TokenType::NULL_KW, "Expected 'NULL' or 'LABELED' after 'IS [NOT]'");
             expr = std::make_unique<IsNullExpr>(std::move(expr), is_not);
             continue;

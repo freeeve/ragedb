@@ -116,8 +116,8 @@ TEST_CASE("GQL Execution Shortest Path Tests", "[gql_executor_shortest_path]") {
     // One bound start against an unbound endpoint runs a separate search per candidate pair -- the
     // shape that made a person-to-every-Person-of-a-first-name query exhaust the heap. The searches
     // now run with a bounded number in flight, and neither the rows nor their order may depend on
-    // that bound (task 028).
-    SECTION("many-endpoint search is invariant under the concurrency bound (task 028)") {
+    // that bound.
+    SECTION("many-endpoint search is invariant under the concurrency bound") {
         std::string query_str = "MATCH p = ANY SHORTEST (a)-[:Links]-{1,10}(b) WHERE a.name = 'Arcadia' RETURN b.name AS name, length(p) AS d";
 
         const size_t saved_concurrency = gql_shortest_path_concurrency;

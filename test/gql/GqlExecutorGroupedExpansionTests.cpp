@@ -25,7 +25,7 @@ using namespace ragedb;
 using namespace ragedb::gql;
 
 /*
- * Grouped aggregation over a multi-hop expansion--the shape that OOMs at scale (task 015):
+ * Grouped aggregation over a multi-hop expansion--the shape that OOMs at scale:
  *   MATCH (c:Comment)-[:HAS_CREATOR]->(p:Person) RETURN p.name, count(c) ...
  * The executor flattens the whole (comment, person) expansion before grouping, so at SF1 scale
  * (~1.7M comments) it exhausts memory. These tests pin the CORRECT small-graph behaviour so a
@@ -140,7 +140,7 @@ TEST_CASE("GQL grouped aggregation over expansion: ungrouped count/sum over the 
  * A var-length expansion (the friend-of-friend shape) used to build every path from a start node into
  * one vector before a single row reached the aggregate -- one person's KNOWS{1,3} neighbourhood at SF1
  * is over a million paths, each carrying the nodes and relationships along it, so a bare count(*)
- * exhausted the heap (task 037). The expansion now streams its finished paths to the aggregate and
+ * exhausted the heap. The expansion now streams its finished paths to the aggregate and
  * expands a node's branches with a bounded number in flight.
  *
  * A six-person ring with one chord, so a 1..3 hop expansion produces many more paths than persons.
@@ -164,7 +164,7 @@ static void populate_knows_ring(Graph& graph) {
     knows(0, 3);
 }
 
-TEST_CASE("GQL var-length expansion streams into the aggregate (task 037)", "[gql_executor_aggregation][grouped_expansion][task037]") {
+TEST_CASE("GQL var-length expansion streams into the aggregate", "[gql_executor_aggregation][grouped_expansion]") {
     auto graph = Graph("gql_var_len_stream_test");
     graph.Start().get();
     populate_knows_ring(graph);

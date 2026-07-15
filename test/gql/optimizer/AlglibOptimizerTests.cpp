@@ -78,9 +78,9 @@ TEST_CASE("GQL Optimizer Phase 23: Transitive Path Pruning", "[gql_optimizer][al
     }
 }
 
-// Guards (task 003): the transitive-reachability rewrite must NOT fire for patterns the fast path
+// Guards: the transitive-reachability rewrite must NOT fire for patterns the fast path
 // gets wrong, and shortcut pruning must not drop constrained/bound matches.
-TEST_CASE("GQL Optimizer Phase 23: transitive rewrite guards", "[gql_optimizer][alglib][task003]") {
+TEST_CASE("GQL Optimizer Phase 23: transitive rewrite guards", "[gql_optimizer][alglib]") {
     GqlVirtualCatalog::local().clear();
     GqlVirtualCatalog::local().set_relationship_algebraic_properties("ancestor_of", {"transitive"});
 
@@ -137,8 +137,8 @@ TEST_CASE("GQL Optimizer Phase 24: Irreflexive Contradiction Pruner", "[gql_opti
     }
 }
 
-// Negative controls (task 005): the irreflexive pruner must NOT no_op these--each is satisfiable.
-TEST_CASE("GQL Optimizer Phase 24: Irreflexive pruner negative controls", "[gql_optimizer][alglib][task005]") {
+// Negative controls: the irreflexive pruner must NOT no_op these--each is satisfiable.
+TEST_CASE("GQL Optimizer Phase 24: Irreflexive pruner negative controls", "[gql_optimizer][alglib]") {
     GqlVirtualCatalog::local().clear();
     GqlVirtualCatalog::local().set_relationship_algebraic_properties("parent_of", {"irreflexive"});
 
@@ -216,9 +216,9 @@ TEST_CASE("GQL Optimizer Phase 26: Equivalence Class Coalescing", "[gql_optimize
     REQUIRE(match.pattern.edges[0].max_hops == 1);
 }
 
-// Guards (task 004): the equivalence-partition rewrite must NOT fire for patterns the fast path
+// Guards: the equivalence-partition rewrite must NOT fire for patterns the fast path
 // gets wrong (bounded hops, direction, bound edge variable, predicates, path var, shortest).
-TEST_CASE("GQL Optimizer Phase 26: equivalence rewrite guards", "[gql_optimizer][alglib][task004]") {
+TEST_CASE("GQL Optimizer Phase 26: equivalence rewrite guards", "[gql_optimizer][alglib]") {
     GqlVirtualCatalog::local().clear();
     GqlVirtualCatalog::local().set_relationship_algebraic_properties("same_group", {"reflexive", "symmetric", "transitive"});
 
@@ -244,9 +244,9 @@ TEST_CASE("GQL Optimizer Phase 26: equivalence rewrite guards", "[gql_optimizer]
     }
 }
 
-// Task 001: the antisymmetric collapser must preserve labels/constraints/bound edge variables and
+// the antisymmetric collapser must preserve labels/constraints/bound edge variables and
 // detect the irreflexive contradiction, while still collapsing the unconstrained case.
-TEST_CASE("GQL Optimizer Phase 25: collapser preserves constraints", "[gql_optimizer][alglib][task001]") {
+TEST_CASE("GQL Optimizer Phase 25: collapser preserves constraints", "[gql_optimizer][alglib]") {
     GqlVirtualCatalog::local().clear();
 
     SECTION("a labeled single-node match is not pruned away") {

@@ -44,7 +44,7 @@ namespace ragedb::gql {
 
 /**
  * @brief Page size for chunked start-node scans: edge patterns scan the label in pages of this
- *        many nodes instead of materialising the whole label up front (task 020). Tests shrink it
+ *        many nodes instead of materialising the whole label up front. Tests shrink it
  *        to exercise chunk boundaries on small graphs.
  */
 inline size_t gql_scan_chunk_size = 65536;
@@ -57,12 +57,12 @@ inline size_t gql_scan_chunk_size = 65536;
  */
 inline size_t gql_stream_chunk_size = 256;
 
-// Max incoming rows driven concurrently through a streamed traversal (task 029): the per-row drives
+// Max incoming rows driven concurrently through a streamed traversal: the per-row drives
 // await graph I/O independently, so bounding the in-flight count keeps memory O(concurrency x chunk)
 // while overlapping the latency of a large piped frontier (FoF expansion) instead of serialising it.
 inline size_t gql_stream_concurrency = 32;
 
-// Max rows driven concurrently at each INNER step of a multi-match chain (task 029): a chain step's
+// Max rows driven concurrently at each INNER step of a multi-match chain: a chain step's
 // output (e.g. a friend's forums) fans into the next match (each forum's posts) concurrently. Kept
 // small so the nested product with gql_stream_concurrency stays bounded (independent semaphores per
 // level, so no cross-level deadlock).

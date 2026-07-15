@@ -206,7 +206,7 @@ static std::unique_ptr<Expression> substitute_return_aliases(
 
 /**
  * @brief Bind the RETURN/WITH projection's output aliases into the ORDER BY sort-key scope by
- *        substituting them with their defining expressions (task 027).
+ *        substituting them with their defining expressions.
  */
 static void resolve_order_by_aliases(GqlQuery& query) {
     if (query.order_by.empty() || query.returns.empty()) return;
@@ -639,7 +639,7 @@ GqlQuery GqlParser::parse_single_query() {
         }
         // Otherwise a RETURN follows and re-projects the ordered/paged rows. Push the ORDER BY/LIMIT
         // into the producing (previous) segment so its streaming top-K bounds the sort during the
-        // traversal, instead of materialising the whole intermediate to sort it here (task 034). Valid
+        // traversal, instead of materialising the whole intermediate to sort it here. Valid
         // because the order keys are the previous segment's output columns and this segment only
         // re-projects; only push when that segment has no ordering/paging of its own to clobber.
         auto& producer = with_segments.back();
@@ -654,7 +654,7 @@ GqlQuery GqlParser::parse_single_query() {
 
     // openCypher WITH is not ISO GQL. RageDB is a pure GQL dialect: reject WITH with guidance toward
     // the linear-query equivalents (RETURN ... NEXT for a projection boundary, LET for a value binding,
-    // FILTER for a post-projection predicate). See task 033.
+    // FILTER for a post-projection predicate).
     if (check(TokenType::WITH)) {
         throw std::runtime_error(
             "WITH is not GQL: use 'RETURN ... NEXT' for a projection boundary, 'LET x = ...' for a "

@@ -380,12 +380,12 @@ TEST_CASE("GQL Execution Read Tests", "[gql_executor_read]") {
     guard.stop();
 }
 
-// NOTE: the transitive/equivalence fast paths execute via seastar::async (task 002) and cannot be
+// NOTE: the transitive/equivalence fast paths execute via seastar::async and cannot be
 // driven from inside the Catch harness (which itself runs the session in a seastar::async), so 016 is
 // verified on the live server instead--the unlabeled transitive query no longer OOMs and bounded
 // queries still return the correct closure.
 
-TEST_CASE("GQL LIMIT with a residual WHERE returns the full LIMIT", "[gql_executor_read][task009]") {
+TEST_CASE("GQL LIMIT with a residual WHERE returns the full LIMIT", "[gql_executor_read]") {
     auto graph = Graph("gql_limit_pushdown_test");
     graph.Start().get();
     graph.Clear();

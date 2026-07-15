@@ -171,7 +171,7 @@ seastar::future<std::vector<Node>> get_start_nodes(ragedb::Graph& graph, const P
 }
 
 /**
- * @brief Fetch one page of candidate start nodes in scan order (task 020). Only filterless scans
+ * @brief Fetch one page of candidate start nodes in scan order. Only filterless scans
  *        are paged: AllNodesPeered distributes skip/limit across shards from per-shard counts, so
  *        each page is genuinely bounded (unlike the filtered scan paths, which fetch skip+limit
  *        rows from every shard per call).
@@ -652,7 +652,7 @@ static seastar::future<std::vector<GqlRow>> traverse_step(ragedb::Graph& graph, 
             }
         }
 
-        // Bound-target semi-join (task 035): when the far node is already bound (a piped/earlier binding),
+        // Bound-target semi-join: when the far node is already bound (a piped/earlier binding),
         // we already hold that Node. A verification match like `(forum)-[hm:HAS_MEMBER]->(f)` then only
         // needs to keep the relationship(s) whose other end IS the bound node -- so build the row from the
         // matched rel directly instead of fetching every neighbour node (one NodeGetPeered per rel) and
@@ -1164,7 +1164,7 @@ seastar::future<std::vector<GqlRow>> traverse_path_pattern(ragedb::Graph& graph,
         }
     }
 
-    // Task 035: anchor on a bound (e.g. piped) node when the written first node is unbound. If the
+    // anchor on a bound (e.g. piped) node when the written first node is unbound. If the
     // pattern's first node has no binding in base_row but its last node does, reverse the pattern so
     // the traversal starts from the bound node instead of scanning the first node's whole label (a
     // piped `(forum:Forum)-[:CONTAINER_OF]->(post)-[:HAS_CREATOR]->(f)` otherwise scans every Forum

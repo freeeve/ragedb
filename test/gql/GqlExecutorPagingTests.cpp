@@ -25,7 +25,7 @@ using namespace ragedb;
 using namespace ragedb::gql;
 
 /*
- * ISO GQL OFFSET (task 032): the page is [offset, offset + limit) of the ORDERED result. Every path that
+ * ISO GQL OFFSET: the page is [offset, offset + limit) of the ORDERED result. Every path that
  * prunes rows early -- the streamed top-K heap, the streamed group folds, the sort-with-limit sites and the
  * scan-limit pushdown -- has to retain offset + limit rows rather than just limit, or it throws away
  * exactly the rows the page returns. These tests pin that across the paths.
@@ -60,12 +60,12 @@ static void populate_paging_graph(Graph& graph) {
  * ISO GQL's default path mode is WALK -- "the absence of any filtering" -- so an unqualified quantified
  * pattern may repeat both nodes AND edges. ragedb previously defaulted to TRAIL (no repeated edges), which
  * is Cypher's relationship-uniqueness rule, not GQL's: it silently dropped every path that reuses an edge.
- * A query that wants trail semantics must now say TRAIL (task 047).
+ * A query that wants trail semantics must now say TRAIL.
  *
  * Two people joined by a single undirected edge make the difference unmissable: under WALK, A-B-A is a
  * legal 2-hop walk (it re-crosses the one edge); under TRAIL it is not.
  */
-TEST_CASE("the default path mode is WALK, not TRAIL (task 047)", "[gql_executor_paging][task047_walk]") {
+TEST_CASE("the default path mode is WALK, not TRAIL", "[gql_executor_paging]") {
     auto graph = Graph("gql_path_mode_default");
     graph.Start().get();
     graph.Clear();
@@ -174,7 +174,7 @@ TEST_CASE("an unbounded WALK on cyclic data fails loudly instead of diverging", 
     graph.Stop().get();
 }
 
-TEST_CASE("ISO GQL OFFSET pages the ordered result (task 032)", "[gql_executor_paging][task032_offset]") {
+TEST_CASE("ISO GQL OFFSET pages the ordered result", "[gql_executor_paging]") {
     auto graph = Graph("gql_paging_test");
     graph.Start().get();
     populate_paging_graph(graph);

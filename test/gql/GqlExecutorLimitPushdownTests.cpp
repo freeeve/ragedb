@@ -25,7 +25,7 @@ using namespace ragedb;
 using namespace ragedb::gql;
 
 /*
- * Task 021: LIMIT may only bound the physical scan when every remaining predicate runs INSIDE
+ * LIMIT may only bound the physical scan when every remaining predicate runs INSIDE
  * that scan. These cases cover predicates the original residual guard missed: inline property
  * filters on a downstream (non-anchor) node, RETURN DISTINCT, and multi-filter anchor scans.
  * Matching rows are always created AFTER non-matching ones so a pushed-down limit scans only
@@ -38,8 +38,8 @@ static size_t count_occurrences(const std::string& haystack, const std::string& 
     return count;
 }
 
-TEST_CASE("LIMIT pushdown residual gaps", "[gql_executor_limit][task021]") {
-    auto graph = Graph("gql_limit_pushdown_task021");
+TEST_CASE("LIMIT pushdown residual gaps", "[gql_executor_limit]") {
+    auto graph = Graph("gql_limit_pushdown_residual");
     graph.Start().get();
     graph.Clear();
     graph.shard.local().NodeTypeInsertPeered("Person").get();
@@ -106,8 +106,8 @@ TEST_CASE("LIMIT pushdown residual gaps", "[gql_executor_limit][task021]") {
     graph.Stop().get();
 }
 
-TEST_CASE("chunked start-node scan matches one-shot scan results", "[gql_executor_limit][task020]") {
-    auto graph = Graph("gql_chunked_scan_task020");
+TEST_CASE("chunked start-node scan matches one-shot scan results", "[gql_executor_limit]") {
+    auto graph = Graph("gql_chunked_scan");
     graph.Start().get();
     graph.Clear();
     graph.shard.local().NodeTypeInsertPeered("Person").get();
@@ -162,10 +162,10 @@ TEST_CASE("chunked start-node scan matches one-shot scan results", "[gql_executo
  * folds, so any aggregate or top-K over a bare label held the whole label (every node WITH its properties)
  * in one vector before folding. At SF1 a date-filtered count of Posts died on std::bad_alloc that way. The
  * scan now pages and the fold consumes each page, so these must be correct AND independent of the page
- * size (task 020).
+ * size.
  */
-TEST_CASE("aggregates and top-K over a bare label scan page instead of materialising", "[gql_executor_limit][task020_scan]") {
-    auto graph = Graph("gql_bare_scan_task020");
+TEST_CASE("aggregates and top-K over a bare label scan page instead of materialising", "[gql_executor_limit]") {
+    auto graph = Graph("gql_bare_scan");
     graph.Start().get();
     graph.Clear();
     graph.shard.local().NodeTypeInsertPeered("Post").get();
@@ -248,11 +248,11 @@ TEST_CASE("aggregates and top-K over a bare label scan page instead of materiali
  * A LIMIT bounds the RESULT rows. An aggregate folds the matched rows into far fewer result rows, so the
  * LIMIT must not be pushed into the scan -- doing so truncates the rows the aggregate folds over and
  * answers with the limit instead of the aggregate. At SF1 `RETURN count(f) ... LIMIT 1` returned 1 for a
- * person with 848 friends (task 044). The executor's own scan-limit gate refused this; the pushdown pass
+ * person with 848 friends. The executor's own scan-limit gate refused this; the pushdown pass
  * did not.
  */
-TEST_CASE("LIMIT is not pushed into the scan when the query aggregates (task 044)", "[gql_executor_limit][task044]") {
-    auto graph = Graph("gql_limit_aggregate_task044");
+TEST_CASE("LIMIT is not pushed into the scan when the query aggregates", "[gql_executor_limit]") {
+    auto graph = Graph("gql_limit_aggregate");
     graph.Start().get();
     graph.Clear();
     graph.shard.local().NodeTypeInsertPeered("Person").get();

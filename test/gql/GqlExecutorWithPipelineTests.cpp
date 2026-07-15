@@ -25,7 +25,7 @@ using namespace ragedb;
 using namespace ragedb::gql;
 
 /*
- * WITH-pipeline correctness (task 019): continuation segments carry piped rows, so any planner
+ * WITH-pipeline correctness: continuation segments carry piped rows, so any planner
  * that answers from indexes or re-runs the pattern from scratch must be skipped for them, and an
  * empty segment must still flow into a later ungrouped aggregate (which yields count = 0).
  *
@@ -60,7 +60,7 @@ static void populate_with_pipeline_graph(Graph& graph) {
     graph.shard.local().NodeAddPeered("Comment", "c2", "{\"score\": 2}").get();
 }
 
-TEST_CASE("NEXT continuation segments must consume piped rows", "[gql_executor_with][task019]") {
+TEST_CASE("NEXT continuation segments must consume piped rows", "[gql_executor_with]") {
     auto graph = Graph("gql_with_piped_rows_test");
     graph.Start().get();
     populate_with_pipeline_graph(graph);
@@ -115,7 +115,7 @@ TEST_CASE("NEXT continuation segments must consume piped rows", "[gql_executor_w
     graph.Stop().get();
 }
 
-TEST_CASE("streamed top-K and group folds match materialised results", "[gql_executor_with][task018][stream]") {
+TEST_CASE("streamed top-K and group folds match materialised results", "[gql_executor_with][stream]") {
     auto graph = Graph("gql_streaming_fold_test");
     graph.Start().get();
     graph.Clear();
@@ -192,7 +192,7 @@ TEST_CASE("streamed top-K and group folds match materialised results", "[gql_exe
     graph.Stop().get();
 }
 
-TEST_CASE("ORDER BY over RETURN aliases executes correctly (task 027)", "[gql_executor_with][task027]") {
+TEST_CASE("ORDER BY over RETURN aliases executes correctly", "[gql_executor_with]") {
     auto graph = Graph("gql_orderby_alias_test");
     graph.Start().get();
     graph.Clear();
@@ -236,7 +236,7 @@ TEST_CASE("ORDER BY over RETURN aliases executes correctly (task 027)", "[gql_ex
     graph.Stop().get();
 }
 
-TEST_CASE("count over an empty expansion is 0 even when rewritten to a degree sum", "[gql_executor_with][task019]") {
+TEST_CASE("count over an empty expansion is 0 even when rewritten to a degree sum", "[gql_executor_with]") {
     auto graph = Graph("gql_count_to_sum_empty_test");
     graph.Start().get();
     graph.Clear();
@@ -253,7 +253,7 @@ TEST_CASE("count over an empty expansion is 0 even when rewritten to a degree su
     graph.Stop().get();
 }
 
-TEST_CASE("streaming edge aggregate rejects unsupported shapes", "[gql_executor_with][task019]") {
+TEST_CASE("streaming edge aggregate rejects unsupported shapes", "[gql_executor_with]") {
     auto graph = Graph("gql_streaming_guard_test");
     graph.Start().get();
     graph.Clear();
@@ -278,8 +278,8 @@ TEST_CASE("streaming edge aggregate rejects unsupported shapes", "[gql_executor_
     graph.Stop().get();
 }
 
-TEST_CASE("GQL expression forms execute (task 032: CASE/length/zoned_datetime/COUNT{}/collect_list/IN)",
-          "[gql_executor_with][task032]") {
+TEST_CASE("GQL expression forms execute (CASE/length/zoned_datetime/COUNT{}/collect_list/IN)",
+          "[gql_executor_with]") {
     auto graph = Graph("gql_expr_forms_test");
     graph.Start().get();
     graph.Clear();
@@ -344,7 +344,7 @@ TEST_CASE("GQL expression forms execute (task 032: CASE/length/zoned_datetime/CO
     graph.Stop().get();
 }
 
-TEST_CASE("multi-match streamed group fold matches the batch result (task 029)", "[gql_executor_with][task029]") {
+TEST_CASE("multi-match streamed group fold matches the batch result", "[gql_executor_with]") {
     auto graph = Graph("gql_multimatch_stream_test");
     graph.Start().get();
     graph.Clear();
@@ -397,7 +397,7 @@ TEST_CASE("multi-match streamed group fold matches the batch result (task 029)",
     graph.Stop().get();
 }
 
-TEST_CASE("GQL IC5 shape executes without crashing (task 032 crash repro)", "[gql_executor_with][task032ic5]") {
+TEST_CASE("GQL IC5 shape executes without crashing", "[gql_executor_with]") {
     auto graph = Graph("gql_ic5_shape_test");
     graph.Start().get();
     graph.Clear();
@@ -448,7 +448,7 @@ TEST_CASE("GQL IC5 shape executes without crashing (task 032 crash repro)", "[gq
     graph.Stop().get();
 }
 
-TEST_CASE("NEXT ORDER BY LIMIT pushes a bounded top-K into the producing segment (task 034)", "[gql_executor_with][task034]") {
+TEST_CASE("NEXT ORDER BY LIMIT pushes a bounded top-K into the producing segment", "[gql_executor_with]") {
     auto graph = Graph("gql_topk_pushdown_test");
     graph.Start().get();
     graph.Clear();
@@ -491,7 +491,7 @@ TEST_CASE("NEXT ORDER BY LIMIT pushes a bounded top-K into the producing segment
     graph.Stop().get();
 }
 
-TEST_CASE("cost-based reorder runs the cheap match first (task 035)", "[gql_executor_with][task035]") {
+TEST_CASE("cost-based reorder runs the cheap match first", "[gql_executor_with]") {
     auto graph = Graph("gql_reorder_test");
     graph.Start().get();
     graph.Clear();
@@ -542,9 +542,9 @@ TEST_CASE("cost-based reorder runs the cheap match first (task 035)", "[gql_exec
 /*
  * A property map value is a general value expression in ISO GQL, not only a literal, so a binding
  * carried in from an earlier segment is legal there. It used to be rejected outright ("Expected literal
- * value for property map"), which forced the FILTER spelling of the same predicate (task 040).
+ * value for property map"), which forced the FILTER spelling of the same predicate.
  */
-TEST_CASE("property map accepts a value expression, not only a literal (task 040)", "[gql_executor_with][task040]") {
+TEST_CASE("property map accepts a value expression, not only a literal", "[gql_executor_with]") {
     auto graph = Graph("gql_property_map_expr_test");
     graph.Start().get();
     populate_with_pipeline_graph(graph);

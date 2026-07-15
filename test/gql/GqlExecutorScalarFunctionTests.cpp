@@ -41,7 +41,7 @@ struct FnGraphStopGuard {
 };
 
 /*
- * The scalar function library (task 046). Before this, only five functions existed and every other name
+ * The scalar function library. Before this, only five functions existed and every other name
  * evaluated to NULL, so a query calling one returned plausible wrong answers. These are the ones the LDBC
  * suites actually call, plus the standard numeric/string/null functions.
  */
@@ -60,7 +60,7 @@ static void populate_fn_graph(Graph& graph) {
     graph.shard.local().RelationshipAddPeered("KNOWS", a, b, "{}").get();
 }
 
-TEST_CASE("scalar function library (task 046)", "[gql_executor_functions][task046]") {
+TEST_CASE("scalar function library", "[gql_executor_functions]") {
     auto graph = Graph("gql_scalar_functions");
     graph.Start().get();
     FnGraphStopGuard guard(graph);

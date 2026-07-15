@@ -963,7 +963,7 @@ static bool row_edges_all_distinct(const GqlRow& row, const std::set<std::string
  *        Cross-match binding works because traverse_path_pattern uses already-bound variables in the
  *        row as pattern anchors; each match's path/mode constraint is checked on its own output before
  *        driving the next match. This keeps a multi-match expansion (FoF -> forum -> post) bounded to
- *        one traversal chunk instead of the whole join (task 029).
+ *        one traversal chunk instead of the whole join.
  */
 static seastar::future<> stream_match_chain(
         ragedb::Graph& graph, std::shared_ptr<GqlQuery> query_ptr,
@@ -1465,8 +1465,8 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
         !query_ptr->order_by.empty() && query_ptr->limit.has_value() && !query_contains_aggregates) {
         return run_streaming_topk(graph, query_ptr, std::move(incoming), pruner);
     }
-    // Streaming grouped aggregate: one or more streamable matches (bounds the FoF -> expand ->
-    // count(DISTINCT) crash class, task 029) by folding each joined row into per-group accumulators.
+    // Streaming grouped aggregate: one or more streamable matches, bounding the FoF -> expand ->
+    // count(DISTINCT) crash class by folding each joined row into per-group accumulators.
     if (stream_group_eligible(*query_ptr) && !query_ptr->distinct && query_contains_aggregates) {
         // Mirrors the batch fold's key derivation: a bare returned variable groups by the whole
         // entity, so property lookups on it are not separate keys.

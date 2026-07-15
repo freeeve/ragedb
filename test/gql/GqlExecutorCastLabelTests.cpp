@@ -46,7 +46,7 @@ struct CastGraphStopGuard {
 };
 
 /*
- * ISO GQL CAST(x AS T) and `x IS [NOT] LABELED <labelExpr>` (task 032) -- both required by the
+ * ISO GQL CAST(x AS T) and `x IS [NOT] LABELED <labelExpr>` -- both required by the
  * bi/spb/finbench query sets. A value with no representation in the target type casts to NULL rather
  * than to a truncated prefix, and IS LABELED reuses the pattern label grammar so AND/OR/NOT compose.
  *
@@ -69,7 +69,7 @@ static void populate_cast_graph(Graph& graph) {
     graph.shard.local().NodeAddPeered("Company", "acme", "{\"name\": \"Acme\"}").get();
 }
 
-TEST_CASE("ISO GQL CAST converts values and yields NULL when it cannot (task 032)", "[gql_executor_cast][task032_cast]") {
+TEST_CASE("ISO GQL CAST converts values and yields NULL when it cannot", "[gql_executor_cast]") {
     auto graph = Graph("gql_cast_test");
     graph.Start().get();
     CastGraphStopGuard guard(graph);
@@ -116,7 +116,7 @@ TEST_CASE("ISO GQL CAST converts values and yields NULL when it cannot (task 032
     guard.stop();
 }
 
-TEST_CASE("ISO GQL IS LABELED tests an entity's label (task 032)", "[gql_executor_cast][task032_labeled]") {
+TEST_CASE("ISO GQL IS LABELED tests an entity's label", "[gql_executor_cast]") {
     auto graph = Graph("gql_labeled_test");
     graph.Start().get();
     CastGraphStopGuard guard(graph);

@@ -46,7 +46,7 @@ struct ForGraphStopGuard {
 };
 
 /*
- * ISO GQL `FOR x IN <list>` -- the standard's UNWIND (task 032). Unlike LET, which adds a column to each
+ * ISO GQL `FOR x IN <list>` -- the standard's UNWIND. Unlike LET, which adds a column to each
  * row, FOR MULTIPLIES the rows: one per element. It expands the working table before LET/FILTER/RETURN
  * see it, and it is a row source in its own right, so a pattern-less `FOR x IN [1,2,3] RETURN x` is a
  * complete query.
@@ -67,7 +67,7 @@ static void populate_for_graph(Graph& graph) {
     graph.shard.local().RelationshipAddPeered("KNOWS", alice, carol, "{}").get();
 }
 
-TEST_CASE("ISO GQL FOR expands a list into rows (task 032)", "[gql_executor_for][task032_for]") {
+TEST_CASE("ISO GQL FOR expands a list into rows", "[gql_executor_for]") {
     auto graph = Graph("gql_for_test");
     graph.Start().get();
     ForGraphStopGuard guard(graph);

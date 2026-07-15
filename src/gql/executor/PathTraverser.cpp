@@ -23,6 +23,7 @@
 #include <seastar/core/thread.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/util/later.hh>
+#include <seastar/coroutine/maybe_yield.hh>
 #include <algorithm>
 #include <unordered_set>
 #include <iterator>
@@ -1768,7 +1769,8 @@ seastar::future<std::vector<GqlRow>> traverse_match_statement(ragedb::Graph& gra
         }
 
         return seastar::when_all_succeed(std::move(partitions_fut), std::move(start_nodes_fut), std::move(end_nodes_fut))
-        .then([&graph, stmt, row, start_node_var, end_node_var, rel_type](std::tuple<PartitionPtr, std::vector<Node>, std::vector<Node>> results) {
+        .then([stmt, row, start_node_var, end_node_var, rel_type](std::tuple<PartitionPtr, std::vector<Node>, std::vector<Node>> results)
+                -> seastar::future<std::vector<GqlRow>> {
             auto wcc_ptr = std::move(std::get<0>(results));
             const auto& wcc = *wcc_ptr;
             auto start_nodes = std::move(std::get<1>(results));
@@ -1796,7 +1798,10 @@ seastar::future<std::vector<GqlRow>> traverse_match_statement(ragedb::Graph& gra
                 valid_ends.push_back(node);
             }
 
+            // When neither endpoint is bound this pairs every valid start against every valid end
+            // (O(V^2)); yield periodically so the enumeration stays cooperative on the reactor.
             std::vector<GqlRow> out_rows;
+            uint64_t work = 0;
             for (const auto& s : valid_starts) {
                 uint64_t s_id = s.getId();
                 auto s_it = wcc.find(s_id);
@@ -1825,6 +1830,7 @@ seastar::future<std::vector<GqlRow>> traverse_match_statement(ragedb::Graph& gra
                         }
                         out_rows.push_back(std::move(new_row));
                     }
+                    if ((++work & 0xFFFF) == 0) co_await seastar::coroutine::maybe_yield();
                 }
             }
 
@@ -1836,10 +1842,10 @@ seastar::future<std::vector<GqlRow>> traverse_match_statement(ragedb::Graph& gra
                 if (!end_node_var.empty() && opt_row.bindings.find(end_node_var) == opt_row.bindings.end()) {
                     opt_row.bindings[end_node_var] = GqlValue();
                 }
-                return std::vector<GqlRow>{opt_row};
+                co_return std::vector<GqlRow>{opt_row};
             }
 
-            return out_rows;
+            co_return out_rows;
         });
     }
 

@@ -29,6 +29,12 @@ namespace ragedb::gql {
 /**
  * Thread-local cache for Transitive Reachability descendant sets.
  * Keyed by relationship type. Avoids repeated calculations of transitive closures.
+ *
+ * Footprint: one entry per distinct relationship type queried, per shard. Each entry is a
+ * shared snapshot of the closure -- up to O(V^2) for a densely reachable graph. Real schemas
+ * have a handful of relationship types, so the natural bound is small; kMaxEntries is only a
+ * runaway guard against a pathological stream of distinct type strings. Entries are re-derived
+ * on a miss, so dropping them on overflow costs a recompute, never correctness.
  */
 class TransitiveReachabilityCache {
 public:
@@ -39,6 +45,7 @@ private:
     // Entries are immutable shared snapshots: readers hold a shared_ptr instead of copying the
     // (potentially O(V^2)) map per query row, and invalidation just drops the cache's reference.
     std::unordered_map<std::string, std::shared_ptr<const DescendantsMap>> cache;
+    static constexpr size_t kMaxEntries = 64;
 
 public:
     static TransitiveReachabilityCache& local() {
@@ -65,6 +72,9 @@ public:
     }
 
     std::shared_ptr<const DescendantsMap> set(const std::string& rel_type, DescendantsMap&& descendants) {
+        if (cache.size() >= kMaxEntries && cache.find(rel_type) == cache.end()) {
+            cache.clear();
+        }
         auto snapshot = std::make_shared<const DescendantsMap>(std::move(descendants));
         cache[rel_type] = snapshot;
         return snapshot;

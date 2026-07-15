@@ -144,6 +144,9 @@ add_executable(tests tests.cpp shard/ShardIds.cpp shard/Ids.cpp shard/NodeTypes.
         ../src/gql/GqlAst.h
         )
 target_link_libraries(tests PRIVATE project_warnings project_options catch_main Graph Seastar::seastar)
+# lld links the tests binary in a fraction of GNU ld's peak memory (149 TUs statically linked against
+# seastar + iresearch), keeping the link under a 16GB box's budget where GNU ld OOM-killed it.
+target_link_options(tests PRIVATE -fuse-ld=lld)
 target_include_directories(tests PRIVATE
         ../src/graph
         ../src/graph/eve

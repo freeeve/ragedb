@@ -79,13 +79,27 @@ TEST_CASE("GQL Execution Shortest Path Tests", "[gql_executor_shortest_path]") {
     graph.shard.local().RelationshipAddPeered("Links", lunaria, solara, "{}").get();
 
     SECTION("ANY SHORTEST path query") {
+        // Arcadia->Eldoria has two shortest paths (via Solara and via Mirage). ANY returns one of them.
         std::string query_str = "MATCH p = ANY SHORTEST (a)-[:Links]-{1,10}(b) WHERE a.name = 'Arcadia' AND b.name = 'Eldoria' RETURN p";
         auto query = GqlParser::parse(query_str);
         GqlOptimizer::optimize(query);
         std::string results = GqlExecutor::execute(graph, std::move(query)).get();
         REQUIRE(results.find("Arcadia") != std::string::npos);
-        REQUIRE(results.find("Solara") != std::string::npos);
         REQUIRE(results.find("Eldoria") != std::string::npos);
+        REQUIRE((results.find("Solara") != std::string::npos || results.find("Mirage") != std::string::npos));
+    }
+
+    SECTION("ANY SHORTEST with an unbounded quantifier terminates (task 053: IC13 OOM)") {
+        // `{1,}` has no upper bound. A path-enumerating BFS fans out by the average degree each level
+        // and exhausts the heap before reaching the destination; the ANY search must instead keep one
+        // path per node so the frontier stays bounded and it returns the single 2-hop shortest path.
+        std::string query_str = "MATCH p = ANY SHORTEST (a)-[:Links]-{1,}(b) WHERE a.name = 'Arcadia' AND b.name = 'Eldoria' RETURN p";
+        auto query = GqlParser::parse(query_str);
+        GqlOptimizer::optimize(query);
+        std::string results = GqlExecutor::execute(graph, std::move(query)).get();
+        REQUIRE(results.find("Arcadia") != std::string::npos);
+        REQUIRE(results.find("Eldoria") != std::string::npos);
+        REQUIRE((results.find("Solara") != std::string::npos || results.find("Mirage") != std::string::npos));
     }
 
     SECTION("ALL SHORTEST paths query") {

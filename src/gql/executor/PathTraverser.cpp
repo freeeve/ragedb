@@ -1878,8 +1878,7 @@ seastar::future<std::vector<GqlRow>> traverse_match_statement(ragedb::Graph& gra
             });
         }
 
-        return descendants_fut.then([&graph, stmt, row, start_node_var, end_node_var, pruner](DescendantsPtr descendants_ptr) {
-        const auto& descendants = *descendants_ptr;
+        return descendants_fut.then([&graph, stmt, row, start_node_var, end_node_var, rel_type, pruner](DescendantsPtr descendants_ptr) {
         const auto& start_pat = stmt.pattern.nodes[0];
         const auto& end_pat = stmt.pattern.nodes[1];
         // An unbound endpoint with no label/property/filter constraint would scan the whole graph via
@@ -1891,6 +1890,13 @@ seastar::future<std::vector<GqlRow>> traverse_match_statement(ragedb::Graph& gra
         bool end_unconstrained = !end_pat.label_expr && end_pat.properties.empty() &&
             end_pat.property_filters.empty() && !end_pat.where_expr;
 
+        // The unconstrained candidate id lists are the same for every incoming row, so build them
+        // once per relationship type (cached alongside the closure) rather than re-deriving per row.
+        std::shared_ptr<const TransitiveReachabilityCache::Candidates> cand;
+        if (start_unconstrained || end_unconstrained) {
+            cand = TransitiveReachabilityCache::local().get_candidates(rel_type);
+        }
+
         seastar::future<std::vector<Node>> start_nodes_fut = seastar::make_ready_future<std::vector<Node>>();
         bool start_resolved = false;
         if (!start_node_var.empty()) {
@@ -1901,11 +1907,8 @@ seastar::future<std::vector<GqlRow>> traverse_match_statement(ragedb::Graph& gra
             }
         }
         if (!start_resolved) {
-            if (start_unconstrained) {
-                std::vector<uint64_t> ids;
-                ids.reserve(descendants.size());
-                for (const auto& kv : descendants) ids.push_back(kv.first);
-                start_nodes_fut = graph.shard.local().NodesGetPeered(ids);
+            if (start_unconstrained && cand) {
+                start_nodes_fut = graph.shard.local().NodesGetPeered(cand->key_ids);
             } else {
                 start_nodes_fut = get_start_nodes(graph, stmt.pattern.nodes[0], 0, pruner);
             }
@@ -1921,13 +1924,8 @@ seastar::future<std::vector<GqlRow>> traverse_match_statement(ragedb::Graph& gra
             }
         }
         if (!end_resolved) {
-            if (end_unconstrained) {
-                std::unordered_set<uint64_t> end_id_set;
-                for (const auto& kv : descendants) {
-                    for (uint64_t d : kv.second) end_id_set.insert(d);
-                }
-                std::vector<uint64_t> ids(end_id_set.begin(), end_id_set.end());
-                end_nodes_fut = graph.shard.local().NodesGetPeered(ids);
+            if (end_unconstrained && cand) {
+                end_nodes_fut = graph.shard.local().NodesGetPeered(cand->end_ids);
             } else {
                 end_nodes_fut = get_start_nodes(graph, stmt.pattern.nodes[1], 0, pruner);
             }

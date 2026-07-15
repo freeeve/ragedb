@@ -248,6 +248,7 @@ add_executable(ragedb src/main/main.cpp src/main/util/stop_signal.hh
         src/gql/executor/PlanBuilder.cpp src/gql/executor/PlanBuilder.h
         src/gql/executor/HoneycombExecutor.cpp src/gql/executor/HoneycombExecutor.h
         src/gql/executor/LftjExecutor.cpp src/gql/executor/LftjExecutor.h
+        src/gql/executor/StreamingAggregates.cpp src/gql/executor/ExecutorInternal.h
 
         src/gql/GqlCatalog.cpp src/gql/GqlCatalog.h
         src/gql/GqlTypechecker.cpp src/gql/GqlTypechecker.h

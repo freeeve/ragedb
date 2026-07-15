@@ -136,6 +136,7 @@ add_executable(tests tests.cpp shard/ShardIds.cpp shard/Ids.cpp shard/NodeTypes.
         ../src/gql/executor/PlanBuilder.cpp ../src/gql/executor/PlanBuilder.h
         ../src/gql/executor/HoneycombExecutor.cpp ../src/gql/executor/HoneycombExecutor.h
         ../src/gql/executor/LftjExecutor.cpp ../src/gql/executor/LftjExecutor.h
+        ../src/gql/executor/StreamingAggregates.cpp ../src/gql/executor/ExecutorInternal.h
         ../src/gql/GqlCatalog.cpp ../src/gql/GqlCatalog.h
         ../src/gql/GqlTypechecker.cpp ../src/gql/GqlTypechecker.h
         ../src/gql/GqlValue.cpp ../src/gql/GqlValue.h
@@ -229,6 +230,7 @@ add_executable(tests2 main/ConnectedHandler.cpp
         ../src/gql/executor/PlanBuilder.cpp ../src/gql/executor/PlanBuilder.h
         ../src/gql/executor/HoneycombExecutor.cpp ../src/gql/executor/HoneycombExecutor.h
         ../src/gql/executor/LftjExecutor.cpp ../src/gql/executor/LftjExecutor.h
+        ../src/gql/executor/StreamingAggregates.cpp ../src/gql/executor/ExecutorInternal.h
         ../src/gql/GqlCatalog.cpp ../src/gql/GqlCatalog.h
         ../src/gql/GqlTypechecker.cpp ../src/gql/GqlTypechecker.h
         ../src/gql/GqlValue.cpp ../src/gql/GqlValue.h

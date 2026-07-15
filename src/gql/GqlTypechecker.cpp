@@ -438,6 +438,12 @@ GqlType GqlTypechecker::check_expression(const Expression& expr) {
                 }
                 return agg.fn_kind == AggregateKind::AVG ? GqlType::DOUBLE : t;
             }
+            if (agg.fn_kind == AggregateKind::STDDEV_POP || agg.fn_kind == AggregateKind::STDDEV_SAMP) {
+                if (!is_numeric(t)) {
+                    throw std::runtime_error("Aggregation input must be numeric, got " + to_string(t));
+                }
+                return GqlType::DOUBLE;
+            }
             if (agg.fn_kind == AggregateKind::MIN || agg.fn_kind == AggregateKind::MAX) {
                 if (t == GqlType::NODE || t == GqlType::RELATIONSHIP || t == GqlType::PATH || is_list(t)) {
                     throw std::runtime_error("Cannot aggregate non-scalar type " + to_string(t));

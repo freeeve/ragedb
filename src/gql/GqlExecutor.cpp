@@ -38,6 +38,7 @@
 #include "executor/LftjExecutor.h"
 
 #include <sstream>
+#include <cmath>
 #include <optional>
 #include <unordered_set>
 #include <unordered_map>
@@ -125,6 +126,35 @@ static void apply_page(std::vector<Row>& rows, const GqlQuery& q) {
     if (q.limit && rows.size() > static_cast<size_t>(*q.limit)) {
         rows.resize(static_cast<size_t>(*q.limit));
     }
+}
+
+/**
+ * @brief Computes STDDEV_POP or STDDEV_SAMP over the aggregated rows: the standard deviation of the
+ *        expression's numeric values. Population divides the summed squared deviations by n, sample by
+ *        n-1. NULL for no numeric input, and additionally for a single value in the sample form (n-1 = 0).
+ */
+static void collect_numeric(const GqlValue& v, std::vector<double>& out) {
+    if (v.type != GqlValue::PROPERTY) return;
+    if (std::holds_alternative<int64_t>(v.property)) out.push_back(static_cast<double>(std::get<int64_t>(v.property)));
+    else if (std::holds_alternative<double>(v.property)) out.push_back(std::get<double>(v.property));
+}
+
+static GqlValue stddev_of(const std::vector<double>& values, bool sample) {
+    const size_t n = values.size();
+    if (n == 0 || (sample && n < 2)) return GqlValue();
+    double mean = 0.0;
+    for (double x : values) mean += x;
+    mean /= static_cast<double>(n);
+    double sq = 0.0;
+    for (double x : values) { const double d = x - mean; sq += d * d; }
+    const double denom = sample ? static_cast<double>(n - 1) : static_cast<double>(n);
+    return GqlValue(std::sqrt(sq / denom));
+}
+
+static GqlValue compute_stddev(const std::vector<GqlRow>& rows, const Expression* expr, bool sample) {
+    std::vector<double> values;
+    for (const auto& r : rows) collect_numeric(evaluate_expression(r, expr), values);
+    return stddev_of(values, sample);
 }
 
 /**
@@ -218,7 +248,10 @@ static std::string return_item_column_name(const ReturnItem& item, size_t index)
         std::string fn = ae->fn_kind == AggregateKind::COUNT ? "count"
             : ae->fn_kind == AggregateKind::SUM ? "sum"
             : ae->fn_kind == AggregateKind::AVG ? "avg"
-            : ae->fn_kind == AggregateKind::MIN ? "min" : "max";
+            : ae->fn_kind == AggregateKind::MIN ? "min"
+            : ae->fn_kind == AggregateKind::COLLECT ? "collect_list"
+            : ae->fn_kind == AggregateKind::STDDEV_POP ? "stddev_pop"
+            : ae->fn_kind == AggregateKind::STDDEV_SAMP ? "stddev_samp" : "max";
         if (!ae->expr) return fn + "(*)";
         if (ae->expr->kind == ExpressionKind::PROPERTY_LOOKUP) {
             auto* pl = static_cast<const PropertyLookupExpr*>(ae->expr.get());
@@ -400,7 +433,12 @@ static bool plan_streaming_edge_aggregate(const GqlQuery& q, EdgeAggPlan& out) {
     // fall back to the normal grouped aggregation path.
     for (const auto* agg : out.aggs) {
         if (agg->distinct) return false;
-        if (agg->fn_kind == AggregateKind::COLLECT) return false;
+        // COLLECT and STDDEV need the whole value set (a list, or sum-of-squares), which the streaming
+        // accumulator does not carry, so they take the materialising path.
+        if (agg->fn_kind == AggregateKind::COLLECT ||
+            agg->fn_kind == AggregateKind::STDDEV_POP || agg->fn_kind == AggregateKind::STDDEV_SAMP) {
+            return false;
+        }
     }
 
     // Aggregates must be count(*) or over a single variable / one of its properties.
@@ -1488,13 +1526,17 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
         std::vector<const AggregateExpr*> aggs;
         for (const auto& item : query_ptr->returns) find_aggregates(item.expr.get(), aggs);
         for (const auto& spec : query_ptr->order_by) find_aggregates(spec.expr.get(), aggs);
-        // collect_list gathers a list the streaming accumulator does not build; use the materialising
-        // group path for it.
-        bool has_collect = false;
+        // collect_list gathers a list, and stddev needs a sum-of-squares, neither of which the streaming
+        // accumulator builds; use the materialising group path for them.
+        bool needs_materialising = false;
         for (const auto* a : aggs) {
-            if (a->fn_kind == AggregateKind::COLLECT) { has_collect = true; break; }
+            if (a->fn_kind == AggregateKind::COLLECT ||
+                a->fn_kind == AggregateKind::STDDEV_POP || a->fn_kind == AggregateKind::STDDEV_SAMP) {
+                needs_materialising = true;
+                break;
+            }
         }
-        if (!aggs.empty() && !has_collect) {
+        if (!aggs.empty() && !needs_materialising) {
             return run_streaming_group_fold(graph, query_ptr, std::move(incoming), pruner,
                                             std::move(grouping_keys), std::move(aggs));
         }
@@ -1913,6 +1955,10 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
                             aggregate_results[agg] = distinct_vals.empty() ? GqlValue() : *distinct_vals.rbegin();
                         } else if (agg->fn_kind == AggregateKind::COLLECT) {
                             aggregate_results[agg] = GqlValue(std::vector<GqlValue>(distinct_vals.begin(), distinct_vals.end()));
+                        } else if (agg->fn_kind == AggregateKind::STDDEV_POP || agg->fn_kind == AggregateKind::STDDEV_SAMP) {
+                            std::vector<double> values;
+                            for (const auto& v : distinct_vals) collect_numeric(v, values);
+                            aggregate_results[agg] = stddev_of(values, agg->fn_kind == AggregateKind::STDDEV_SAMP);
                         } else {  // SUM / AVG with int->double promotion, mirroring the row fold below
                             int64_t sum_int = 0;
                             double sum_double = 0.0;
@@ -2033,6 +2079,9 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
                             if (v.type != GqlValue::NIL) items.push_back(std::move(v));
                         }
                         aggregate_results[agg] = GqlValue(std::move(items));
+                    } else if (agg->fn_kind == AggregateKind::STDDEV_POP || agg->fn_kind == AggregateKind::STDDEV_SAMP) {
+                        aggregate_results[agg] = compute_stddev(agg_rows, agg->expr.get(),
+                                                                agg->fn_kind == AggregateKind::STDDEV_SAMP);
                     }
                 }
 

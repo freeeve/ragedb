@@ -83,8 +83,10 @@ enum class AggregateKind {
     AVG,
     MIN,
     MAX,
-    COLLECT   ///< collect_list: gather values into a LIST (DISTINCT dedups). GQL's general set function;
-              ///< the openCypher collect() spelling is rejected.
+    COLLECT,     ///< collect_list: gather values into a LIST (DISTINCT dedups). GQL's general set function;
+                 ///< the openCypher collect() spelling is rejected.
+    STDDEV_POP,  ///< Population standard deviation: sqrt(sum((x-mean)^2) / n).
+    STDDEV_SAMP  ///< Sample standard deviation: sqrt(sum((x-mean)^2) / (n-1)); NULL for n < 2.
 };
 
 /**

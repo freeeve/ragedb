@@ -1782,7 +1782,7 @@ std::unique_ptr<Expression> GqlParser::parse_primary() {
                     "collect is not GQL: use collect_list(...)");
             }
             if (upper_name == "COUNT" || upper_name == "SUM" || upper_name == "AVG" || upper_name == "MIN" || upper_name == "MAX" ||
-                upper_name == "COLLECT_LIST") {
+                upper_name == "COLLECT_LIST" || upper_name == "STDDEV_POP" || upper_name == "STDDEV_SAMP") {
                 advance(); // consume function name
                 consume(TokenType::LPAREN, "Expected '(' after aggregate function");
                 
@@ -1806,6 +1806,8 @@ std::unique_ptr<Expression> GqlParser::parse_primary() {
                 else if (upper_name == "AVG") fn = AggregateKind::AVG;
                 else if (upper_name == "MIN") fn = AggregateKind::MIN;
                 else if (upper_name == "COLLECT_LIST") fn = AggregateKind::COLLECT;
+                else if (upper_name == "STDDEV_POP") fn = AggregateKind::STDDEV_POP;
+                else if (upper_name == "STDDEV_SAMP") fn = AggregateKind::STDDEV_SAMP;
                 else fn = AggregateKind::MAX;
 
                 return std::make_unique<AggregateExpr>(fn, std::move(arg), distinct);

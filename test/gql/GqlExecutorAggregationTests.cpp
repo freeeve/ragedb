@@ -52,6 +52,25 @@ TEST_CASE("GQL Execution Aggregation and Set Tests", "[gql_executor_aggregation]
         REQUIRE(res.find("\"max(p.age)\": 35") != std::string::npos);
     }
 
+    SECTION("Aggregations: STDDEV_POP and STDDEV_SAMP") {
+        // Ages 30 and 35, mean 32.5. Squared deviations sum to 12.5.
+        // Population: sqrt(12.5 / 2) = 2.5. Sample: sqrt(12.5 / 1) = 3.5355...
+        std::string res = GqlExecutor::execute(graph, GqlParser::parse(
+            "MATCH (p:Person) RETURN stddev_pop(p.age) AS sp, stddev_samp(p.age) AS ss")).get();
+        INFO("result: " << res);
+        REQUIRE(res.find("\"sp\": 2.5") != std::string::npos);
+        REQUIRE(res.find("\"ss\": 3.53") != std::string::npos);
+    }
+
+    SECTION("Aggregations: STDDEV_SAMP of a single value is NULL") {
+        std::string res = GqlExecutor::execute(graph, GqlParser::parse(
+            "MATCH (p:Person) FILTER p.name = 'Alice' RETURN stddev_samp(p.age) AS ss, stddev_pop(p.age) AS sp")).get();
+        INFO("result: " << res);
+        // n = 1: sample stddev is undefined (n-1 = 0) -> NULL; population stddev is 0.
+        REQUIRE(res.find("\"ss\": null") != std::string::npos);
+        REQUIRE(res.find("\"sp\": 0") != std::string::npos);
+    }
+
     SECTION("Aggregations: Grouping by property and sorting") {
         // Insert Charlie, who is also 30, so we have two people aged 30 and one aged 35
         uint64_t id3 = graph.shard.local().NodeAddPeered("Person", "charlie", "{\"name\": \"Charlie\", \"age\": 30}").get();

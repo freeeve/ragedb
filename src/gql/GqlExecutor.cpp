@@ -1243,6 +1243,8 @@ seastar::future<std::string> GqlExecutor::execute(ragedb::Graph& graph, GqlQuery
                 json_res += "\"" + column_names[i] + "\": " + serialize_gql_value(row[i]);
                 first_col = false;
             }
+            // flatten_plan_tree emits estimated_rows at index 5; surface it as the operator's row estimate.
+            json_res += ", \"Est. Rows\": " + serialize_gql_value(row.size() > 5 ? row[5] : GqlValue());
             std::string cache_status = query_val.plan_cache_hit ? "\"HIT\"" : "\"MISS\"";
             json_res += ", \"Cache\": " + cache_status;
             json_res += ", \"Execution\": " + serialize_gql_value(GqlValue(first_row ? execution : std::string()));

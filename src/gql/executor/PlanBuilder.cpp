@@ -25,6 +25,7 @@
 #include <map>
 #include <algorithm>
 #include <limits>
+#include <optional>
 
 namespace ragedb::gql {
 
@@ -198,9 +199,71 @@ static std::string join_strings(const std::set<std::string>& strings, const std:
     return res;
 }
 
+// ===== Cardinality estimation ===================================================================
+// Rough per-operator row estimates for EXPLAIN. Base scans use the real label / relationship counts
+// from the local shard; filters, fan-out and paging apply simple heuristics. These are indicative,
+// not optimiser-grade: there is no distinct-value or histogram statistic to draw on, so equality on a
+// non-id property is assumed ~10% selective and a range ~33%.
+static double node_scan_selectivity(const PatternNode& n, bool& has_id_eq) {
+    has_id_eq = false;
+    double sel = 1.0;
+    for (const auto& [prop, val] : n.properties) {
+        if (prop == "id") has_id_eq = true;
+        else sel *= 0.1;
+    }
+    for (const auto& f : n.property_filters) {
+        if (f.property == "id" && f.op == Operation::EQ) has_id_eq = true;
+        else if (f.op == Operation::EQ) sel *= 0.1;
+        else sel *= 0.33;
+    }
+    return sel;
+}
+
+static int64_t estimate_node_scan(ragedb::Graph& graph, const PatternNode& n) {
+    std::string label;
+    if (n.label_expr && n.label_expr->kind == LabelExprKind::LITERAL) label = n.label_expr->name;
+    int64_t base = label.empty() ? static_cast<int64_t>(graph.shard.local().AllNodesCount())
+                                  : static_cast<int64_t>(graph.shard.local().NodeCount(label));
+    bool has_id_eq = false;
+    double sel = node_scan_selectivity(n, has_id_eq);
+    if (has_id_eq) return 1;  // id equality selects a single node
+    int64_t est = static_cast<int64_t>(static_cast<double>(base) * sel);
+    return est < 1 ? 1 : est;
+}
+
+// Estimate the rows a single match statement produces: the anchor node's scan, fanned out along each
+// edge by the relationship type's average degree, narrowed by each subsequent node's filters.
+static int64_t estimate_match_cardinality(ragedb::Graph& graph, const MatchStatement& stmt) {
+    if (stmt.pattern.nodes.empty()) return 1;
+    int64_t est = estimate_node_scan(graph, stmt.pattern.nodes[0]);
+    const int64_t total_nodes = static_cast<int64_t>(graph.shard.local().AllNodesCount());
+    for (size_t i = 0; i < stmt.pattern.edges.size(); ++i) {
+        const auto& e = stmt.pattern.edges[i];
+        std::string rt;
+        if (e.label_expr && e.label_expr->kind == LabelExprKind::LITERAL) rt = e.label_expr->name;
+        int64_t rels = rt.empty() ? static_cast<int64_t>(graph.shard.local().AllRelationshipsCount())
+                                  : static_cast<int64_t>(graph.shard.local().RelationshipCount(rt));
+        double fanout = total_nodes > 0 ? static_cast<double>(rels) / static_cast<double>(total_nodes) : 1.0;
+        est = static_cast<int64_t>(static_cast<double>(est) * fanout);
+        if (i + 1 < stmt.pattern.nodes.size()) {
+            bool hid = false;
+            double sel = node_scan_selectivity(stmt.pattern.nodes[i + 1], hid);
+            est = hid ? 1 : static_cast<int64_t>(static_cast<double>(est) * sel);
+        }
+        if (est < 1) est = 1;
+    }
+    return est;
+}
+
+// The estimate carried by an already-built child operator, if any.
+static std::optional<int64_t> child_estimate(const std::shared_ptr<PlanNode>& n) {
+    if (!n || n->children.empty()) return std::nullopt;
+    return n->children.front()->estimated_rows;
+}
+
 /**
  * @brief Recursively builds the plan tree for a sequence of MATCH statements.
- * 
+ *
  * Analyzes variables and relationships to decide between Index Seeks, Scans,
  * expansions, natural/left-outer joins, and star join rewriter strategies.
  */
@@ -387,10 +450,20 @@ static std::shared_ptr<PlanNode> build_match_plan(
             node->detail = describe_pattern(stmt.pattern);
         }
         node->key = "match_" + std::to_string(stmt.id);
+        // Estimated rows this match produces (indicative). A piped match is driven by the incoming
+        // rows, so scale the pattern estimate by the input's cardinality relative to a bare scan.
+        node->estimated_rows = estimate_match_cardinality(graph, stmt);
         if (input_plan) {
             node->children.push_back(input_plan);
+            if (input_plan->estimated_rows && !stmt.pattern.nodes.empty()) {
+                int64_t anchor = estimate_node_scan(graph, stmt.pattern.nodes[0]);
+                if (anchor > 0) {
+                    double ratio = static_cast<double>(*input_plan->estimated_rows) / static_cast<double>(anchor);
+                    node->estimated_rows = std::max<int64_t>(1, static_cast<int64_t>(static_cast<double>(*node->estimated_rows) * ratio));
+                }
+            }
         }
-        
+
         for (const auto& n : stmt.pattern.nodes) {
             if (!n.variable.empty()) incoming_vars.insert(n.variable);
         }
@@ -578,6 +651,9 @@ static std::shared_ptr<PlanNode> build_single_query_plan(ragedb::Graph& graph, c
         filter_node->detail = describe_expression(query.where_expr.get());
         filter_node->variables = join_strings(incoming_vars, ", ");
         if (current) filter_node->children.push_back(current);
+        if (auto c = child_estimate(filter_node)) {
+            filter_node->estimated_rows = std::max<int64_t>(1, static_cast<int64_t>(static_cast<double>(*c) * 0.5));
+        }
         current = filter_node;
     }
 
@@ -603,6 +679,14 @@ static std::shared_ptr<PlanNode> build_single_query_plan(ragedb::Graph& graph, c
         agg_node->key = "aggregate";
         agg_node->variables = join_strings(incoming_vars, ", ");
         if (current) agg_node->children.push_back(current);
+        // A global aggregate yields one row; a grouped one yields at most its input (no distinct-value
+        // statistic to estimate the group count from, so the child is an upper bound).
+        bool grouped = !query.group_by.empty();
+        for (const auto& item : query.returns) {
+            if (item.expr && !has_aggregates(item.expr.get())) { grouped = true; break; }
+        }
+        if (!grouped) agg_node->estimated_rows = 1;
+        else if (auto c = child_estimate(agg_node)) agg_node->estimated_rows = *c;
         current = agg_node;
     }
 
@@ -612,6 +696,7 @@ static std::shared_ptr<PlanNode> build_single_query_plan(ragedb::Graph& graph, c
         distinct_node->key = "distinct";
         distinct_node->variables = join_strings(incoming_vars, ", ");
         if (current) distinct_node->children.push_back(current);
+        if (auto c = child_estimate(distinct_node)) distinct_node->estimated_rows = *c;  // upper bound
         current = distinct_node;
     }
 
@@ -627,6 +712,7 @@ static std::shared_ptr<PlanNode> build_single_query_plan(ragedb::Graph& graph, c
         sort_node->detail = details;
         sort_node->variables = join_strings(incoming_vars, ", ");
         if (current) sort_node->children.push_back(current);
+        if (auto c = child_estimate(sort_node)) sort_node->estimated_rows = *c;  // ordering preserves count
         current = sort_node;
     }
 
@@ -637,6 +723,11 @@ static std::shared_ptr<PlanNode> build_single_query_plan(ragedb::Graph& graph, c
         limit_node->detail = std::to_string(*query.limit);
         limit_node->variables = join_strings(incoming_vars, ", ");
         if (current) limit_node->children.push_back(current);
+        {
+            int64_t lim = static_cast<int64_t>(*query.limit);
+            auto c = child_estimate(limit_node);
+            limit_node->estimated_rows = c ? std::min<int64_t>(lim, *c) : lim;
+        }
         current = limit_node;
     }
 
@@ -655,6 +746,7 @@ static std::shared_ptr<PlanNode> build_single_query_plan(ragedb::Graph& graph, c
     produce_node->detail = returns_str;
     produce_node->variables = returns_str;
     if (current) produce_node->children.push_back(current);
+    if (auto c = child_estimate(produce_node)) produce_node->estimated_rows = *c;
     current = produce_node;
 
     return current;

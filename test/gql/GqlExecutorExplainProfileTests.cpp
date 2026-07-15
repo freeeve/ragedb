@@ -96,6 +96,28 @@ TEST_CASE("GQL Execution EXPLAIN and PROFILE Tests", "[gql_explain_profile]") {
         REQUIRE(cnt.find("\"Execution\": \"Materialising\"") == std::string::npos);
     }
 
+    SECTION("EXPLAIN reports estimated per-operator row counts") {
+        // Two Person nodes, so a bare scan estimates 2.
+        std::string scan = GqlExecutor::execute(graph, GqlParser::parse(
+            "EXPLAIN MATCH (p:Person) RETURN p.name")).get();
+        INFO("scan: " << scan);
+        REQUIRE(scan.find("\"Est. Rows\":") != std::string::npos);
+        REQUIRE(scan.find("\"Est. Rows\": 2") != std::string::npos);
+
+        // A global aggregate collapses to a single row.
+        std::string agg = GqlExecutor::execute(graph, GqlParser::parse(
+            "EXPLAIN MATCH (p:Person) RETURN count(*)")).get();
+        INFO("agg: " << agg);
+        REQUIRE(agg.find("\"Est. Rows\": 2") != std::string::npos);   // the scan under the aggregate
+        REQUIRE(agg.find("\"Est. Rows\": 1") != std::string::npos);   // the aggregate itself
+
+        // An equality filter is highly selective: on two nodes the estimate floors to 1.
+        std::string byname = GqlExecutor::execute(graph, GqlParser::parse(
+            "EXPLAIN MATCH (p:Person) WHERE p.name = 'Alice' RETURN p.name")).get();
+        INFO("byname: " << byname);
+        REQUIRE(byname.find("\"Est. Rows\": 1") != std::string::npos);
+    }
+
     SECTION("PROFILE query plan") {
         std::string query_str = "PROFILE MATCH (p:Person)-[:FRIEND]->(friend) RETURN p.name, friend.name";
         auto query = GqlParser::parse(query_str);

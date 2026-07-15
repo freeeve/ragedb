@@ -444,6 +444,19 @@ GqlType GqlTypechecker::check_expression(const Expression& expr) {
                 }
                 return GqlType::DOUBLE;
             }
+            if (agg.fn_kind == AggregateKind::PERCENTILE_CONT || agg.fn_kind == AggregateKind::PERCENTILE_DISC) {
+                if (!is_numeric(t)) {
+                    throw std::runtime_error("Percentile input must be numeric, got " + to_string(t));
+                }
+                if (!agg.arg2) {
+                    throw std::runtime_error("Percentile function expects a fraction argument");
+                }
+                GqlType ft = check_expression(*agg.arg2);
+                if (!is_numeric(ft)) {
+                    throw std::runtime_error("Percentile fraction must be numeric, got " + to_string(ft));
+                }
+                return GqlType::DOUBLE;
+            }
             if (agg.fn_kind == AggregateKind::MIN || agg.fn_kind == AggregateKind::MAX) {
                 if (t == GqlType::NODE || t == GqlType::RELATIONSHIP || t == GqlType::PATH || is_list(t)) {
                     throw std::runtime_error("Cannot aggregate non-scalar type " + to_string(t));

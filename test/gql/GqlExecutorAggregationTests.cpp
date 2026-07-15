@@ -71,6 +71,22 @@ TEST_CASE("GQL Execution Aggregation and Set Tests", "[gql_executor_aggregation]
         REQUIRE(res.find("\"sp\": 0") != std::string::npos);
     }
 
+    SECTION("Aggregations: PERCENTILE_CONT and PERCENTILE_DISC") {
+        // Ages 30 and 35. CONT interpolates: median = 30 + (35-30)*0.5 = 32.5. DISC returns an actual
+        // value: the lower of the two at fraction 0.5. The endpoints are the min and max.
+        std::string res = GqlExecutor::execute(graph, GqlParser::parse(
+            "MATCH (p:Person) RETURN percentile_cont(p.age, 0.5) AS pc, percentile_disc(p.age, 0.5) AS pd")).get();
+        INFO("result: " << res);
+        REQUIRE(res.find("\"pc\": 32.5") != std::string::npos);
+        REQUIRE(res.find("\"pd\": 30") != std::string::npos);
+
+        std::string ends = GqlExecutor::execute(graph, GqlParser::parse(
+            "MATCH (p:Person) RETURN percentile_cont(p.age, 0.0) AS lo, percentile_cont(p.age, 1.0) AS hi")).get();
+        INFO("ends: " << ends);
+        REQUIRE(ends.find("\"lo\": 30") != std::string::npos);
+        REQUIRE(ends.find("\"hi\": 35") != std::string::npos);
+    }
+
     SECTION("Aggregations: Grouping by property and sorting") {
         // Insert Charlie, who is also 30, so we have two people aged 30 and one aged 35
         uint64_t id3 = graph.shard.local().NodeAddPeered("Person", "charlie", "{\"name\": \"Charlie\", \"age\": 30}").get();

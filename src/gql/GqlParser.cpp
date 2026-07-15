@@ -1811,6 +1811,21 @@ std::unique_ptr<Expression> GqlParser::parse_primary() {
                 else fn = AggregateKind::MAX;
 
                 return std::make_unique<AggregateExpr>(fn, std::move(arg), distinct);
+            } else if (upper_name == "PERCENTILE_CONT" || upper_name == "PERCENTILE_DISC") {
+                // ISO GQL binary set function: PERCENTILE_CONT(value, fraction). The second argument
+                // is the percentile in [0,1]; the first is the value expression to rank.
+                advance(); // consume function name
+                consume(TokenType::LPAREN, "Expected '(' after percentile function");
+                bool distinct = match(TokenType::DISTINCT);
+                std::unique_ptr<Expression> value = parse_expression();
+                consume(TokenType::COMMA, "Expected ',' between percentile value and fraction");
+                std::unique_ptr<Expression> fraction = parse_expression();
+                consume(TokenType::RPAREN, "Expected ')' after percentile arguments");
+                AggregateKind fn = upper_name == "PERCENTILE_CONT"
+                    ? AggregateKind::PERCENTILE_CONT : AggregateKind::PERCENTILE_DISC;
+                auto agg = std::make_unique<AggregateExpr>(fn, std::move(value), distinct);
+                agg->arg2 = std::move(fraction);
+                return agg;
             } else if (upper_name == "SIZE") {
                 advance(); // consume "size"
                 consume(TokenType::LPAREN, "Expected '(' after size");

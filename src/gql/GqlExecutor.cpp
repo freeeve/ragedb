@@ -164,7 +164,9 @@ std::string return_item_column_name(const ReturnItem& item, size_t index) {
             : ae->fn_kind == AggregateKind::MIN ? "min"
             : ae->fn_kind == AggregateKind::COLLECT ? "collect_list"
             : ae->fn_kind == AggregateKind::STDDEV_POP ? "stddev_pop"
-            : ae->fn_kind == AggregateKind::STDDEV_SAMP ? "stddev_samp" : "max";
+            : ae->fn_kind == AggregateKind::STDDEV_SAMP ? "stddev_samp"
+            : ae->fn_kind == AggregateKind::PERCENTILE_CONT ? "percentile_cont"
+            : ae->fn_kind == AggregateKind::PERCENTILE_DISC ? "percentile_disc" : "max";
         if (!ae->expr) return fn + "(*)";
         if (ae->expr->kind == ExpressionKind::PROPERTY_LOOKUP) {
             auto* pl = static_cast<const PropertyLookupExpr*>(ae->expr.get());
@@ -607,7 +609,8 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
         bool needs_materialising = false;
         for (const auto* a : aggs) {
             if (a->fn_kind == AggregateKind::COLLECT ||
-                a->fn_kind == AggregateKind::STDDEV_POP || a->fn_kind == AggregateKind::STDDEV_SAMP) {
+                a->fn_kind == AggregateKind::STDDEV_POP || a->fn_kind == AggregateKind::STDDEV_SAMP ||
+                a->fn_kind == AggregateKind::PERCENTILE_CONT || a->fn_kind == AggregateKind::PERCENTILE_DISC) {
                 needs_materialising = true;
                 break;
             }

@@ -158,10 +158,11 @@ bool plan_streaming_edge_aggregate(const GqlQuery& q, EdgeAggPlan& out) {
     // fall back to the normal grouped aggregation path.
     for (const auto* agg : out.aggs) {
         if (agg->distinct) return false;
-        // COLLECT and STDDEV need the whole value set (a list, or sum-of-squares), which the streaming
-        // accumulator does not carry, so they take the materialising path.
+        // COLLECT, STDDEV and PERCENTILE need the whole value set (a list, sum-of-squares, or a sort),
+        // which the streaming accumulator does not carry, so they take the materialising path.
         if (agg->fn_kind == AggregateKind::COLLECT ||
-            agg->fn_kind == AggregateKind::STDDEV_POP || agg->fn_kind == AggregateKind::STDDEV_SAMP) {
+            agg->fn_kind == AggregateKind::STDDEV_POP || agg->fn_kind == AggregateKind::STDDEV_SAMP ||
+            agg->fn_kind == AggregateKind::PERCENTILE_CONT || agg->fn_kind == AggregateKind::PERCENTILE_DISC) {
             return false;
         }
     }
@@ -464,7 +465,8 @@ std::string classify_execution_strategy(GqlQuery& q) {
             bool needs_mat = false;
             for (const auto* a : aggs) {
                 if (a->fn_kind == AggregateKind::COLLECT ||
-                    a->fn_kind == AggregateKind::STDDEV_POP || a->fn_kind == AggregateKind::STDDEV_SAMP) {
+                    a->fn_kind == AggregateKind::STDDEV_POP || a->fn_kind == AggregateKind::STDDEV_SAMP ||
+                    a->fn_kind == AggregateKind::PERCENTILE_CONT || a->fn_kind == AggregateKind::PERCENTILE_DISC) {
                     needs_mat = true;
                     break;
                 }

@@ -86,7 +86,9 @@ enum class AggregateKind {
     COLLECT,     ///< collect_list: gather values into a LIST (DISTINCT dedups). GQL's general set function;
                  ///< the openCypher collect() spelling is rejected.
     STDDEV_POP,  ///< Population standard deviation: sqrt(sum((x-mean)^2) / n).
-    STDDEV_SAMP  ///< Sample standard deviation: sqrt(sum((x-mean)^2) / (n-1)); NULL for n < 2.
+    STDDEV_SAMP, ///< Sample standard deviation: sqrt(sum((x-mean)^2) / (n-1)); NULL for n < 2.
+    PERCENTILE_CONT, ///< Continuous percentile: interpolated value at fraction f. Binary: (value, f).
+    PERCENTILE_DISC  ///< Discrete percentile: actual data value at fraction f. Binary: (value, f).
 };
 
 /**
@@ -222,6 +224,8 @@ struct IsNullExpr : public Expression {
 struct AggregateExpr : public Expression {
     AggregateKind fn_kind;              ///< The kind of aggregate function.
     std::unique_ptr<Expression> expr;   ///< Expression target to aggregate (nullptr for COUNT(*)).
+    /// Second argument of a binary set function (PERCENTILE_CONT/DISC): the fraction in [0,1].
+    std::unique_ptr<Expression> arg2;
     bool distinct = false;              ///< True for DISTINCT aggregates, e.g. count(DISTINCT x).
     /// True when a COUNT was rewritten into a degree SUM: the empty-input result must then stay
     /// count-shaped (0), not sum-shaped (null).
@@ -235,6 +239,7 @@ struct AggregateExpr : public Expression {
     std::unique_ptr<Expression> clone() const override {
         auto copy = std::make_unique<AggregateExpr>(fn_kind, expr ? expr->clone() : nullptr, distinct);
         copy->count_to_sum = count_to_sum;
+        copy->arg2 = arg2 ? arg2->clone() : nullptr;
         return copy;
     }
 };

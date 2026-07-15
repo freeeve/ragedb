@@ -119,6 +119,32 @@ inline GqlValue stddev_of(const std::vector<double>& values, bool sample) {
     return GqlValue(std::sqrt(sq / denom));
 }
 
+// Percentile over numeric values at fraction f in [0,1]. PERCENTILE_DISC returns an actual data
+// value (the smallest whose cumulative fraction reaches f); PERCENTILE_CONT interpolates linearly
+// between the two nearest ranks. NULL for empty input.
+inline GqlValue percentile_of(std::vector<double> values, double f, bool discrete) {
+    if (values.empty()) return GqlValue();
+    std::sort(values.begin(), values.end());
+    const size_t n = values.size();
+    if (f < 0.0) f = 0.0;
+    if (f > 1.0) f = 1.0;
+    if (discrete) {
+        size_t idx = 0;
+        if (f > 0.0) {
+            long r = static_cast<long>(std::ceil(f * static_cast<double>(n)));
+            if (r < 1) r = 1;
+            if (r > static_cast<long>(n)) r = static_cast<long>(n);
+            idx = static_cast<size_t>(r - 1);
+        }
+        return GqlValue(values[idx]);
+    }
+    const double rank = f * static_cast<double>(n - 1);
+    const size_t lo = static_cast<size_t>(std::floor(rank));
+    const size_t hi = static_cast<size_t>(std::ceil(rank));
+    const double frac = rank - static_cast<double>(lo);
+    return GqlValue(values[lo] + (values[hi] - values[lo]) * frac);
+}
+
 /**
  * @brief Derive the output column name for a RETURN item. The single source of truth for column
  *        naming: query_result_to_rows turns column names into next-segment bindings in WITH
@@ -188,12 +214,21 @@ struct EdgeAggAccumulator {
     std::unordered_set<uint64_t> distinct_node_ids;
     std::unordered_set<uint64_t> distinct_rel_ids;
     std::vector<GqlValue> collect_vals;   // COLLECT: values in row order
-    std::vector<double> numeric_vals;     // STDDEV: numeric values for the two-pass stddev
+    std::vector<double> numeric_vals;     // STDDEV / PERCENTILE: numeric values (sorted at finalize)
+    double percentile_fraction = 0.0;     // PERCENTILE_CONT/DISC: the fraction argument in [0,1]
 
     static EdgeAggAccumulator make(const AggregateExpr* agg) {
         EdgeAggAccumulator acc{agg->fn_kind, agg->expr.get()};
         acc.distinct = agg->distinct && agg->expr != nullptr;
         acc.count_to_sum = agg->count_to_sum;
+        if ((agg->fn_kind == AggregateKind::PERCENTILE_CONT ||
+             agg->fn_kind == AggregateKind::PERCENTILE_DISC) && agg->arg2) {
+            GqlValue fv = evaluate_expression(GqlRow{}, agg->arg2.get());
+            if (fv.type == GqlValue::PROPERTY) {
+                if (std::holds_alternative<double>(fv.property)) acc.percentile_fraction = std::get<double>(fv.property);
+                else if (std::holds_alternative<int64_t>(fv.property)) acc.percentile_fraction = static_cast<double>(std::get<int64_t>(fv.property));
+            }
+        }
         return acc;
     }
 
@@ -239,7 +274,8 @@ struct EdgeAggAccumulator {
             if (v.type != GqlValue::NIL && (!extreme_set || compare_gql_values(v, extreme) > 0)) { extreme = v; extreme_set = true; }
         } else if (kind == AggregateKind::COLLECT) {
             if (v.type != GqlValue::NIL) collect_vals.push_back(std::move(v));
-        } else if (kind == AggregateKind::STDDEV_POP || kind == AggregateKind::STDDEV_SAMP) {
+        } else if (kind == AggregateKind::STDDEV_POP || kind == AggregateKind::STDDEV_SAMP ||
+                   kind == AggregateKind::PERCENTILE_CONT || kind == AggregateKind::PERCENTILE_DISC) {
             collect_numeric(v, numeric_vals);
         }
     }
@@ -264,6 +300,9 @@ struct EdgeAggAccumulator {
         if (kind == AggregateKind::STDDEV_POP || kind == AggregateKind::STDDEV_SAMP) {
             return stddev_of(numeric_vals, kind == AggregateKind::STDDEV_SAMP);
         }
+        if (kind == AggregateKind::PERCENTILE_CONT || kind == AggregateKind::PERCENTILE_DISC) {
+            return percentile_of(numeric_vals, percentile_fraction, kind == AggregateKind::PERCENTILE_DISC);
+        }
         return extreme_set ? extreme : GqlValue();
     }
 
@@ -282,6 +321,11 @@ struct EdgeAggAccumulator {
             std::vector<double> vals;
             for (const auto& v : distinct_vals) collect_numeric(v, vals);
             return stddev_of(vals, kind == AggregateKind::STDDEV_SAMP);
+        }
+        if (kind == AggregateKind::PERCENTILE_CONT || kind == AggregateKind::PERCENTILE_DISC) {
+            std::vector<double> vals;
+            for (const auto& v : distinct_vals) collect_numeric(v, vals);
+            return percentile_of(vals, percentile_fraction, kind == AggregateKind::PERCENTILE_DISC);
         }
         int64_t s_int = 0;
         double s_double = 0.0;

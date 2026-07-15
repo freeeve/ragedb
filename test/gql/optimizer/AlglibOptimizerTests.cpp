@@ -22,21 +22,65 @@
 using namespace ragedb;
 using namespace ragedb::gql;
 
-TEST_CASE("GQL Optimizer Phase 22: Symmetric Traversal Simplification", "[gql_optimizer][alglib]") {
+// Phase 21 (DirectionSwapOptimizer) reverses a match so traversal begins at the more selective
+// endpoint. It is driven purely by endpoint selectivity and is semantics-preserving for every
+// relation -- which is why the old symmetric-only "Phase 22" gate was removed as redundant. These
+// cases isolate that trigger: the swap must depend on WHERE-derived selectivity, not on any trait,
+// so each asserts the exact reordered pattern and each negative control asserts no reordering.
+TEST_CASE("GQL Optimizer Phase 21: Cardinality-Aware Direction Swap", "[gql_optimizer][alglib]") {
     GqlVirtualCatalog::local().clear();
-    GqlVirtualCatalog::local().set_relationship_algebraic_properties("knows", {"symmetric"});
 
-    // Query with filter on target node 'b' making it more selective (UNIQUE selectivity)
-    std::string query_str = "MATCH (a)-[:knows]->(b) WHERE b.id = 1 RETURN a, b";
-    auto query = GqlParser::parse(query_str);
-    GqlOptimizer::optimize(query);
+    SECTION("id equality on the end node (UNIQUE) swaps traversal to start there") {
+        auto query = GqlParser::parse("MATCH (a)-[:knows]->(b) WHERE b.id = 1 RETURN a, b");
+        GqlOptimizer::optimize(query);
 
-    // Direction should swap to start from selective variable 'b'
-    const auto& match = query.matches[0];
-    REQUIRE(match.pattern.nodes.size() == 2);
-    REQUIRE(match.pattern.nodes[0].variable == "b");
-    REQUIRE(match.pattern.nodes[1].variable == "a");
-    REQUIRE(match.pattern.edges[0].direction == EdgeDirection::LEFT);
+        const auto& match = query.matches[0];
+        REQUIRE(match.pattern.nodes.size() == 2);
+        REQUIRE(match.pattern.nodes[0].variable == "b");
+        REQUIRE(match.pattern.nodes[1].variable == "a");
+        REQUIRE(match.pattern.edges[0].direction == EdgeDirection::LEFT);
+    }
+
+    SECTION("a non-id property filter (INDEXED) on the end node also swaps") {
+        auto query = GqlParser::parse("MATCH (a)-[:knows]->(b) WHERE b.age = 5 RETURN a, b");
+        GqlOptimizer::optimize(query);
+
+        const auto& match = query.matches[0];
+        REQUIRE(match.pattern.nodes[0].variable == "b");
+        REQUIRE(match.pattern.edges[0].direction == EdgeDirection::LEFT);
+    }
+
+    SECTION("selectivity already at the start node does NOT swap") {
+        // 'a' is UNIQUE, 'b' is a SCAN: the end is not more selective, so the pattern is untouched.
+        auto query = GqlParser::parse("MATCH (a)-[:knows]->(b) WHERE a.id = 1 RETURN a, b");
+        GqlOptimizer::optimize(query);
+
+        const auto& match = query.matches[0];
+        REQUIRE(match.pattern.nodes[0].variable == "a");
+        REQUIRE(match.pattern.nodes[1].variable == "b");
+        REQUIRE(match.pattern.edges[0].direction == EdgeDirection::RIGHT);
+    }
+
+    SECTION("no selective filter (both SCAN) does NOT swap") {
+        auto query = GqlParser::parse("MATCH (a)-[:knows]->(b) RETURN a, b");
+        GqlOptimizer::optimize(query);
+
+        const auto& match = query.matches[0];
+        REQUIRE(match.pattern.nodes[0].variable == "a");
+        REQUIRE(match.pattern.edges[0].direction == EdgeDirection::RIGHT);
+    }
+
+    SECTION("the swap is trait-independent: registering 'symmetric' changes nothing") {
+        // The removed Phase 22 gated this reversal on a symmetric trait. Proving the swap is
+        // identical with and without the trait is what the old test failed to show.
+        GqlVirtualCatalog::local().set_relationship_algebraic_properties("knows", {"symmetric"});
+        auto query = GqlParser::parse("MATCH (a)-[:knows]->(b) WHERE b.id = 1 RETURN a, b");
+        GqlOptimizer::optimize(query);
+
+        const auto& match = query.matches[0];
+        REQUIRE(match.pattern.nodes[0].variable == "b");
+        REQUIRE(match.pattern.edges[0].direction == EdgeDirection::LEFT);
+    }
 }
 
 TEST_CASE("GQL Optimizer Phase 23: Transitive Path Pruning", "[gql_optimizer][alglib]") {

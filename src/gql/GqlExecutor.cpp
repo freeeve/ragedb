@@ -223,6 +223,39 @@ static seastar::future<std::vector<GqlRow>> execute_with_segments(
         });
 }
 
+/**
+ * @brief Derive the grouping-key expressions for an aggregate query, and collect the group variables.
+ *        With an explicit GROUP BY the keys are its variables; otherwise a bare non-aggregate returned
+ *        variable groups by the whole entity and a property lookup on such a variable is not a separate
+ *        key. Both the streaming and materialising aggregate paths use this so they cannot diverge.
+ */
+static std::vector<const Expression*> derive_grouping_keys(const GqlQuery& q, std::set<std::string>& group_variables) {
+    std::vector<const Expression*> grouping_keys;
+    if (!q.group_by.empty()) {
+        for (const auto& g : q.group_by) {
+            if (g && g->kind == ExpressionKind::VARIABLE) {
+                group_variables.insert(static_cast<const VariableExpr*>(g.get())->name);
+            }
+            if (g) grouping_keys.push_back(g.get());
+        }
+        return grouping_keys;
+    }
+    for (const auto& item : q.returns) {
+        if (item.expr && !has_aggregates(item.expr.get()) && item.expr->kind == ExpressionKind::VARIABLE) {
+            group_variables.insert(static_cast<const VariableExpr*>(item.expr.get())->name);
+        }
+    }
+    for (const auto& item : q.returns) {
+        if (!item.expr || has_aggregates(item.expr.get())) continue;
+        if (item.expr->kind == ExpressionKind::PROPERTY_LOOKUP &&
+            group_variables.count(static_cast<const PropertyLookupExpr*>(item.expr.get())->variable)) {
+            continue;
+        }
+        grouping_keys.push_back(item.expr.get());
+    }
+    return grouping_keys;
+}
+
 static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph, std::shared_ptr<GqlQuery> query_ptr, std::optional<std::vector<GqlRow>> incoming) {
     // WITH continuation segments carry piped rows; planners that answer from indexes or run the
     // pattern from scratch cannot consume them and must be skipped (they would ignore the pipe).
@@ -584,23 +617,8 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
     // Streaming grouped aggregate: one or more streamable matches, bounding the FoF -> expand ->
     // count(DISTINCT) crash class by folding each joined row into per-group accumulators.
     if (stream_group_eligible(*query_ptr) && !query_ptr->distinct && query_contains_aggregates) {
-        // Mirrors the batch fold's key derivation: a bare returned variable groups by the whole
-        // entity, so property lookups on it are not separate keys.
         std::set<std::string> group_variables;
-        for (const auto& item : query_ptr->returns) {
-            if (item.expr && !has_aggregates(item.expr.get()) && item.expr->kind == ExpressionKind::VARIABLE) {
-                group_variables.insert(static_cast<const VariableExpr*>(item.expr.get())->name);
-            }
-        }
-        std::vector<const Expression*> grouping_keys;
-        for (const auto& item : query_ptr->returns) {
-            if (has_aggregates(item.expr.get())) continue;
-            if (item.expr->kind == ExpressionKind::PROPERTY_LOOKUP &&
-                group_variables.count(static_cast<const PropertyLookupExpr*>(item.expr.get())->variable)) {
-                continue;
-            }
-            grouping_keys.push_back(item.expr.get());
-        }
+        std::vector<const Expression*> grouping_keys = derive_grouping_keys(*query_ptr, group_variables);
         std::vector<const AggregateExpr*> aggs;
         for (const auto& item : query_ptr->returns) find_aggregates(item.expr.get(), aggs);
         for (const auto& spec : query_ptr->order_by) find_aggregates(spec.expr.get(), aggs);
@@ -964,26 +982,7 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
             }
 
             std::set<std::string> group_variables;
-            for (const auto& item : query.returns) {
-                if (item.expr && !has_aggregates(item.expr.get())) {
-                    if (item.expr->kind == ExpressionKind::VARIABLE) {
-                        group_variables.insert(static_cast<const VariableExpr*>(item.expr.get())->name);
-                    }
-                }
-            }
-
-            std::vector<const Expression*> grouping_keys;
-            for (const auto& item : query.returns) {
-                if (item.expr && !has_aggregates(item.expr.get())) {
-                    if (item.expr->kind == ExpressionKind::PROPERTY_LOOKUP) {
-                        auto* pl = static_cast<const PropertyLookupExpr*>(item.expr.get());
-                        if (group_variables.count(pl->variable)) {
-                            continue;
-                        }
-                    }
-                    grouping_keys.push_back(item.expr.get());
-                }
-            }
+            std::vector<const Expression*> grouping_keys = derive_grouping_keys(query, group_variables);
 
             std::map<std::vector<GqlValue>, GqlGroup, GqlValueVectorLess> groups;
             for (auto& row : filtered_rows) {

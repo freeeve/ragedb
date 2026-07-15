@@ -771,6 +771,11 @@ void GqlTypechecker::check_segment_body(const GqlQuery& query) {
         check_return_item(ret);
     }
 
+    // Process GROUP BY: each grouping variable must be bound.
+    for (const auto& g : query.group_by) {
+        if (g) check_expression(*g);
+    }
+
     // Process ORDER BY
     for (const auto& sort : query.order_by) {
         check_expression(*sort.expr);

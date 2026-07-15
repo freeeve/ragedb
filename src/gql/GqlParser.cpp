@@ -223,6 +223,30 @@ static void resolve_order_by_aliases(GqlQuery& query) {
 }
 
 /**
+/**
+ * @brief Parse an optional ISO GQL `GROUP BY <var> (, <var>)*` clause into query.group_by. GROUP is a
+ *        keyword but the following BY is not, so it arrives as an identifier. Only fires when both are
+ *        present, so a bare GROUP elsewhere (e.g. SHORTEST k GROUP) is untouched.
+ */
+void GqlParser::parse_group_by(GqlQuery& query) {
+    if (!check(TokenType::GROUP_KW)) return;
+    Token by = peek(1);
+    std::string by_up = by.text;
+    std::transform(by_up.begin(), by_up.end(), by_up.begin(), [](unsigned char c){ return std::toupper(c); });
+    if (by.type != TokenType::NAME || by_up != "BY") return;
+    advance(); // GROUP
+    advance(); // BY
+    do {
+        if (!check(TokenType::NAME)) {
+            throw std::runtime_error("Expected a grouping variable after GROUP BY");
+        }
+        std::string var = peek().text;
+        advance();
+        query.group_by.push_back(std::make_unique<VariableExpr>(var));
+    } while (match(TokenType::COMMA));
+}
+
+/**
  * @brief Parse an optional ORDER BY clause (with per-key ASC/DESC) into query.order_by.
  */
 void GqlParser::parse_order_by(GqlQuery& query) {
@@ -667,6 +691,7 @@ GqlQuery GqlParser::parse_single_query() {
             query.distinct = true;
         }
         parse_return_items(query, false);
+        parse_group_by(query);
 
         // ISO GQL: `RETURN ... [ORDER BY ...] [LIMIT ...] NEXT` is an intermediate projection that
         // feeds the next linear-query statement -- the same pipeline boundary as openCypher WITH.

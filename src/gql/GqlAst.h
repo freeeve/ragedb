@@ -712,6 +712,9 @@ struct GqlQuery {
     std::vector<ReturnItem> let_bindings;    ///< ISO GQL LET: computed bindings added to the working table before projection.
     std::vector<ForBinding> for_bindings;    ///< ISO GQL FOR: list expansions applied to the working table before LET/FILTER/RETURN.
     bool distinct = false;                   ///< True if distinct results are required.
+    /// ISO GQL explicit GROUP BY: the grouping-key variables (empty means implicit grouping by the
+    /// non-aggregate RETURN items). Each element is a variable reference per the grammar.
+    std::vector<std::unique_ptr<Expression>> group_by;
     std::vector<SortSpec> order_by;          ///< Sequence of sort specifications.
     std::optional<uint64_t> limit;           ///< Optional maximum number of rows to return.
     std::optional<uint64_t> offset;          ///< Optional rows to skip before the limit (ISO GQL OFFSET).
@@ -773,7 +776,12 @@ struct GqlQuery {
         }
 
         copy.distinct = distinct;
-        
+
+        copy.group_by.reserve(group_by.size());
+        for (const auto& g : group_by) {
+            copy.group_by.push_back(g ? g->clone() : nullptr);
+        }
+
         copy.order_by.reserve(order_by.size());
         for (const auto& s : order_by) {
             copy.order_by.push_back(s.clone());

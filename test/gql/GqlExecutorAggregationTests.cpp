@@ -87,6 +87,21 @@ TEST_CASE("GQL Execution Aggregation and Set Tests", "[gql_executor_aggregation]
         REQUIRE(ends.find("\"hi\": 35") != std::string::npos);
     }
 
+    SECTION("Aggregations: explicit GROUP BY a bound variable") {
+        uint64_t id3 = graph.shard.local().NodeAddPeered("Person", "charlie", "{\"name\": \"Charlie\", \"age\": 30}").get();
+        REQUIRE(id3 > 0);
+        // Two people aged 30, one aged 35. GROUP BY the LET-bound age variable collapses rows by value.
+        std::string res = GqlExecutor::execute(graph, GqlParser::parse(
+            "MATCH (p:Person) LET a = p.age RETURN a AS ag, count(*) AS c GROUP BY a ORDER BY a")).get();
+        INFO("group by: " << res);
+        REQUIRE(res.find("\"ag\": 30") != std::string::npos);
+        REQUIRE(res.find("\"ag\": 35") != std::string::npos);
+        REQUIRE(res.find("\"c\": 2") != std::string::npos);   // two aged 30
+        REQUIRE(res.find("\"c\": 1") != std::string::npos);   // one aged 35
+        // 30 sorts before 35.
+        REQUIRE(res.find("\"ag\": 30") < res.find("\"ag\": 35"));
+    }
+
     SECTION("Aggregations: Grouping by property and sorting") {
         // Insert Charlie, who is also 30, so we have two people aged 30 and one aged 35
         uint64_t id3 = graph.shard.local().NodeAddPeered("Person", "charlie", "{\"name\": \"Charlie\", \"age\": 30}").get();

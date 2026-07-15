@@ -43,6 +43,7 @@ private:
     GqlQuery parse_intersect();
     GqlQuery parse_single_query();
     void parse_return_items(GqlQuery& query, bool require_alias_for_expressions);
+    void parse_group_by(GqlQuery& query);
     void parse_order_by(GqlQuery& query);
     void parse_limit(GqlQuery& query);
     MatchStatement parse_match();

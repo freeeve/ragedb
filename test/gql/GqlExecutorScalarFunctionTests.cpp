@@ -83,6 +83,30 @@ TEST_CASE("scalar function library", "[gql_executor_functions]") {
         REQUIRE(tail.find("\"t\": \"00:00:00\"") != std::string::npos);
     }
 
+    SECTION("graph element functions: element_id, property_exists, all_different, same") {
+        // property_exists takes a bare property-name identifier and tests the element's actual props.
+        std::string pe = run("MATCH (p:Person) FILTER p.name = 'Bob' "
+                             "RETURN property_exists(p, score) AS has_score, property_exists(p, missing) AS has_missing");
+        INFO("property_exists: " << pe);
+        REQUIRE(pe.find("\"has_score\": true") != std::string::npos);
+        REQUIRE(pe.find("\"has_missing\": false") != std::string::npos);
+
+        // Across a KNOWS edge the endpoints are distinct elements; an element is the same as itself.
+        std::string el = run("MATCH (p:Person)-[:KNOWS]->(q:Person) "
+                             "RETURN same(p, q) AS s_pq, same(p, p) AS s_pp, all_different(p, q) AS ad");
+        INFO("element predicates: " << el);
+        REQUIRE(el.find("\"s_pq\": false") != std::string::npos);
+        REQUIRE(el.find("\"s_pp\": true") != std::string::npos);
+        REQUIRE(el.find("\"ad\": true") != std::string::npos);
+
+        // element_id yields a non-null integer for each matched element.
+        std::string eid = run("MATCH (p:Person)-[:KNOWS]->(q:Person) RETURN element_id(p) AS ep, element_id(q) AS eq");
+        INFO("element_id: " << eid);
+        REQUIRE(eid.find("\"ep\":") != std::string::npos);
+        REQUIRE(eid.find("\"eq\":") != std::string::npos);
+        REQUIRE(eid.find("null") == std::string::npos);
+    }
+
     SECTION("char_length and cardinality") {
         std::string res = run("MATCH (p:Person) FILTER p.name = 'Bob' RETURN char_length(p.name) AS n");
         REQUIRE(res.find("\"n\": 3") != std::string::npos);

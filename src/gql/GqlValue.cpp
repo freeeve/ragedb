@@ -256,6 +256,11 @@ const std::vector<std::string>& scalar_function_names() {
         // null handling
         "coalesce",
         "nullif",
+        // graph element functions / predicates
+        "element_id",
+        "property_exists",
+        "all_different",
+        "same",
     };
     return names;
 }
@@ -481,6 +486,67 @@ GqlValue evaluate_scalar_function_with(const FunctionCallExpr* fc,
         GqlValue b = eval_arg(fc->args[1].get());
         if (compare_gql_values(a, b) == 0) return GqlValue();
         return a;
+    }
+
+    // ---- graph element functions / predicates ------------------------------------------------------
+    // element_id(element): the internal id of a node or relationship.
+    if (fc->name == "element_id") {
+        if (fc->args.size() != 1) return GqlValue();
+        GqlValue v = eval_arg(fc->args[0].get());
+        if (v.type == GqlValue::NODE) return GqlValue(static_cast<int64_t>(v.node->getId()));
+        if (v.type == GqlValue::RELATIONSHIP) return GqlValue(static_cast<int64_t>(v.relationship->getId()));
+        return GqlValue();
+    }
+    // property_exists(element, propertyName): whether the element carries the named property. The name
+    // is a bare identifier (or a string), taken from the argument's syntax rather than evaluated.
+    if (fc->name == "property_exists") {
+        if (fc->args.size() != 2) return GqlValue();
+        GqlValue v = eval_arg(fc->args[0].get());
+        std::string prop;
+        const Expression* pe = fc->args[1].get();
+        if (pe->kind == ExpressionKind::VARIABLE) {
+            prop = static_cast<const VariableExpr*>(pe)->name;
+        } else {
+            GqlValue pv = eval_arg(pe);
+            if (pv.type == GqlValue::PROPERTY && std::holds_alternative<std::string>(pv.property)) {
+                prop = std::get<std::string>(pv.property);
+            }
+        }
+        if (prop.empty()) return GqlValue();
+        if (v.type == GqlValue::NODE) {
+            auto props = v.node->getProperties();
+            return GqlValue(props.find(prop) != props.end());
+        }
+        if (v.type == GqlValue::RELATIONSHIP) {
+            auto props = v.relationship->getProperties();
+            return GqlValue(props.find(prop) != props.end());
+        }
+        return GqlValue();
+    }
+    // all_different(a, b, ...): true iff every element argument is a distinct graph element (by kind+id).
+    // same(a, b, ...): true iff every element argument is the same graph element.
+    if (fc->name == "all_different" || fc->name == "same") {
+        if (fc->args.size() < 2) return GqlValue();
+        std::vector<std::pair<int, uint64_t>> keys;  // kind: 0 = node, 1 = relationship
+        keys.reserve(fc->args.size());
+        for (const auto& a : fc->args) {
+            GqlValue v = eval_arg(a.get());
+            if (v.type == GqlValue::NODE) keys.emplace_back(0, v.node->getId());
+            else if (v.type == GqlValue::RELATIONSHIP) keys.emplace_back(1, v.relationship->getId());
+            else return GqlValue();  // a non-element argument leaves the predicate undefined
+        }
+        if (fc->name == "same") {
+            for (size_t i = 1; i < keys.size(); ++i) {
+                if (keys[i] != keys[0]) return GqlValue(false);
+            }
+            return GqlValue(true);
+        }
+        for (size_t i = 0; i < keys.size(); ++i) {
+            for (size_t j = i + 1; j < keys.size(); ++j) {
+                if (keys[i] == keys[j]) return GqlValue(false);
+            }
+        }
+        return GqlValue(true);
     }
 
     return GqlValue(); // unreachable: the parser rejects names not in scalar_function_names()

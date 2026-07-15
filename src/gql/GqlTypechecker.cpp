@@ -496,12 +496,21 @@ GqlType GqlTypechecker::check_expression(const Expression& expr) {
         }
         case ExpressionKind::FUNCTION_CALL: {
             const auto& fc = static_cast<const FunctionCallExpr&>(expr);
+            // property_exists(element, propertyName): the second argument is a property-name identifier,
+            // not a bound value, so it is not resolved as a variable.
+            if (fc.name == "property_exists") {
+                if (!fc.args.empty()) check_expression(*fc.args[0]);
+                return GqlType::BOOLEAN;
+            }
             for (const auto& a : fc.args) {
                 check_expression(*a);
             }
             if (fc.name == "length" || fc.name == "zoned_datetime" || fc.name == "datetime" ||
-                fc.name == "date" || fc.name == "localdatetime") {
+                fc.name == "date" || fc.name == "localdatetime" || fc.name == "element_id") {
                 return GqlType::INTEGER;
+            }
+            if (fc.name == "all_different" || fc.name == "same") {
+                return GqlType::BOOLEAN;
             }
             return GqlType::ANY;
         }

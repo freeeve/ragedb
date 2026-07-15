@@ -328,6 +328,12 @@ bool stream_eligible(const GqlQuery& q);
 
 bool stream_group_eligible(const GqlQuery& q);
 
+// EXPLAIN support: reports which path execute_query_internal's dispatch cascade will take for this
+// standalone query -- one of the "Streaming (...)" fast paths or "Materialising". Mirrors that
+// cascade's order and guards; kept beside the eligibility predicates so the two stay in step. Takes
+// a mutable query because it briefly clears explain/profile (which the predicates gate on) to probe.
+std::string classify_execution_strategy(GqlQuery& q);
+
 seastar::future<QueryResult> run_streaming_edge_aggregate(
         ragedb::Graph& graph, std::shared_ptr<GqlQuery> query_ptr, EdgeAggPlan plan);
 

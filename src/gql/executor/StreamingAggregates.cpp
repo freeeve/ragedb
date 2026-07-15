@@ -427,6 +427,57 @@ bool stream_group_eligible(const GqlQuery& q) {
     return true;
 }
 
+std::string classify_execution_strategy(GqlQuery& q) {
+    // The eligibility predicates deliberately return false under EXPLAIN/PROFILE (those need the
+    // general plan tree, not a streaming bypass), so clear the flags for the probe and restore them.
+    const bool saved_explain = q.explain;
+    const bool saved_profile = q.profile;
+    q.explain = false;
+    q.profile = false;
+
+    std::string strategy = "Materialising";
+    if (q.let_bindings.empty() && q.for_bindings.empty()) {
+        SimpleNodeCountPlan cplan;
+        EdgeAggPlan eplan;
+        if (try_plan_simple_node_count(q, cplan)) {
+            strategy = "Streaming (node-count)";
+        } else if (plan_streaming_edge_aggregate(q, eplan)) {
+            strategy = "Streaming (edge-aggregate)";
+        }
+    }
+    if (strategy == "Materialising") {
+        bool has_agg = false;
+        for (const auto& item : q.returns) {
+            if (item.expr && has_aggregates(item.expr.get())) { has_agg = true; break; }
+        }
+        if (!has_agg) {
+            for (const auto& spec : q.order_by) {
+                if (has_aggregates(spec.expr.get())) { has_agg = true; break; }
+            }
+        }
+        if (stream_eligible(q) && !q.distinct && !q.order_by.empty() && q.limit.has_value() && !has_agg) {
+            strategy = "Streaming (top-K heap)";
+        } else if (stream_group_eligible(q) && !q.distinct && has_agg) {
+            std::vector<const AggregateExpr*> aggs;
+            for (const auto& item : q.returns) find_aggregates(item.expr.get(), aggs);
+            for (const auto& spec : q.order_by) find_aggregates(spec.expr.get(), aggs);
+            bool needs_mat = false;
+            for (const auto* a : aggs) {
+                if (a->fn_kind == AggregateKind::COLLECT ||
+                    a->fn_kind == AggregateKind::STDDEV_POP || a->fn_kind == AggregateKind::STDDEV_SAMP) {
+                    needs_mat = true;
+                    break;
+                }
+            }
+            if (!aggs.empty() && !needs_mat) strategy = "Streaming (group fold)";
+        }
+    }
+
+    q.explain = saved_explain;
+    q.profile = saved_profile;
+    return strategy;
+}
+
 /**
  * @brief Streamed ORDER BY + LIMIT: fold every matched row into a bounded top-K heap as the
  *        traversal produces it, so peak memory is K rows plus one traversal chunk instead of the

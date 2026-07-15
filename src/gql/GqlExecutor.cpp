@@ -1222,10 +1222,13 @@ seastar::future<std::string> GqlExecutor::execute(ragedb::Graph& graph, GqlQuery
 
     if (query_val.explain) {
         auto plan = build_query_plan(graph, query_val);
+        // Which dispatch path the query would actually run -- a streaming fast path bypasses the plan
+        // tree shown below, so surface it on the root row. Whole-query disposition, shown once.
+        std::string execution = classify_execution_strategy(query_val);
         std::vector<std::vector<GqlValue>> plan_rows;
         flatten_plan_tree(plan, plan_rows, "", true);
 
-        std::vector<std::string> column_names = { "Operator", "Details", "Outputs", "Cache" };
+        std::vector<std::string> column_names = { "Operator", "Details", "Outputs" };
 
         std::string json_res = "[";
         bool first_row = true;
@@ -1233,13 +1236,14 @@ seastar::future<std::string> GqlExecutor::execute(ragedb::Graph& graph, GqlQuery
             if (!first_row) json_res += ", ";
             json_res += "{";
             bool first_col = true;
-            for (size_t i = 0; i < column_names.size() - 1; ++i) {
+            for (size_t i = 0; i < column_names.size(); ++i) {
                 if (!first_col) json_res += ", ";
                 json_res += "\"" + column_names[i] + "\": " + serialize_gql_value(row[i]);
                 first_col = false;
             }
             std::string cache_status = query_val.plan_cache_hit ? "\"HIT\"" : "\"MISS\"";
             json_res += ", \"Cache\": " + cache_status;
+            json_res += ", \"Execution\": " + serialize_gql_value(GqlValue(first_row ? execution : std::string()));
             json_res += "}";
             first_row = false;
         }

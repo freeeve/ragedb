@@ -79,6 +79,23 @@ TEST_CASE("GQL Execution EXPLAIN and PROFILE Tests", "[gql_explain_profile]") {
         REQUIRE(results_json.find("Actual Rows") == std::string::npos);
     }
 
+    SECTION("EXPLAIN reports the execution strategy (streaming vs materialising)") {
+        // A plain projection with no aggregate / ORDER BY+LIMIT / count fast path materialises.
+        std::string mat = GqlExecutor::execute(graph, GqlParser::parse(
+            "EXPLAIN MATCH (p:Person)-[:FRIEND]->(friend) RETURN p.name, friend.name")).get();
+        INFO("materialising: " << mat);
+        REQUIRE(mat.find("\"Execution\":") != std::string::npos);
+        REQUIRE(mat.find("Materialising") != std::string::npos);
+
+        // A pure count over a single node label is answered from the count index -- a streaming path.
+        std::string cnt = GqlExecutor::execute(graph, GqlParser::parse(
+            "EXPLAIN MATCH (p:Person) RETURN count(*)")).get();
+        INFO("count: " << cnt);
+        REQUIRE(cnt.find("Streaming (node-count)") != std::string::npos);
+        // The strategy is not the materialising label for this shape.
+        REQUIRE(cnt.find("\"Execution\": \"Materialising\"") == std::string::npos);
+    }
+
     SECTION("PROFILE query plan") {
         std::string query_str = "PROFILE MATCH (p:Person)-[:FRIEND]->(friend) RETURN p.name, friend.name";
         auto query = GqlParser::parse(query_str);

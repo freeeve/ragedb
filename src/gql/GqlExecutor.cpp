@@ -151,11 +151,6 @@ static GqlValue stddev_of(const std::vector<double>& values, bool sample) {
     return GqlValue(std::sqrt(sq / denom));
 }
 
-static GqlValue compute_stddev(const std::vector<GqlRow>& rows, const Expression* expr, bool sample) {
-    std::vector<double> values;
-    for (const auto& r : rows) collect_numeric(evaluate_expression(r, expr), values);
-    return stddev_of(values, sample);
-}
 
 /**
  * @brief Sorts the combined query results according to GQL ORDER BY specification.
@@ -548,6 +543,8 @@ struct EdgeAggAccumulator {
     std::set<GqlValue, GqlValueLess> distinct_vals;
     std::unordered_set<uint64_t> distinct_node_ids;
     std::unordered_set<uint64_t> distinct_rel_ids;
+    std::vector<GqlValue> collect_vals;   // COLLECT: values in row order
+    std::vector<double> numeric_vals;     // STDDEV: numeric values for the two-pass stddev
 
     static EdgeAggAccumulator make(const AggregateExpr* agg) {
         EdgeAggAccumulator acc{agg->fn_kind, agg->expr.get()};
@@ -596,6 +593,10 @@ struct EdgeAggAccumulator {
             if (v.type != GqlValue::NIL && (!extreme_set || compare_gql_values(v, extreme) < 0)) { extreme = v; extreme_set = true; }
         } else if (kind == AggregateKind::MAX) {
             if (v.type != GqlValue::NIL && (!extreme_set || compare_gql_values(v, extreme) > 0)) { extreme = v; extreme_set = true; }
+        } else if (kind == AggregateKind::COLLECT) {
+            if (v.type != GqlValue::NIL) collect_vals.push_back(std::move(v));
+        } else if (kind == AggregateKind::STDDEV_POP || kind == AggregateKind::STDDEV_SAMP) {
+            collect_numeric(v, numeric_vals);
         }
     }
 
@@ -615,6 +616,10 @@ struct EdgeAggAccumulator {
             return has_double ? GqlValue(sum_double / static_cast<double>(val_count))
                               : GqlValue(static_cast<double>(sum_int) / static_cast<double>(val_count));
         }
+        if (kind == AggregateKind::COLLECT) return GqlValue(collect_vals);
+        if (kind == AggregateKind::STDDEV_POP || kind == AggregateKind::STDDEV_SAMP) {
+            return stddev_of(numeric_vals, kind == AggregateKind::STDDEV_SAMP);
+        }
         return extreme_set ? extreme : GqlValue();
     }
 
@@ -626,6 +631,14 @@ struct EdgeAggAccumulator {
         }
         if (kind == AggregateKind::MIN) return distinct_vals.empty() ? GqlValue() : *distinct_vals.begin();
         if (kind == AggregateKind::MAX) return distinct_vals.empty() ? GqlValue() : *distinct_vals.rbegin();
+        if (kind == AggregateKind::COLLECT) {
+            return GqlValue(std::vector<GqlValue>(distinct_vals.begin(), distinct_vals.end()));
+        }
+        if (kind == AggregateKind::STDDEV_POP || kind == AggregateKind::STDDEV_SAMP) {
+            std::vector<double> vals;
+            for (const auto& v : distinct_vals) collect_numeric(v, vals);
+            return stddev_of(vals, kind == AggregateKind::STDDEV_SAMP);
+        }
         int64_t s_int = 0;
         double s_double = 0.0;
         bool dbl = false;
@@ -1932,157 +1945,15 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
             std::vector<GroupSortKey> sorted_groups;
 
             for (const auto& [key, group] : groups) {
+                // One accumulator per aggregate, folded over the group's rows. EdgeAggAccumulator is
+                // the single implementation of every set function (COUNT/SUM/AVG/MIN/MAX/COLLECT/
+                // STDDEV, distinct and not); the streaming group fold uses the same struct, so the
+                // materialising and streaming paths can no longer drift apart.
                 std::map<const AggregateExpr*, GqlValue> aggregate_results;
                 for (const auto* agg : aggregate_exprs) {
-                    // A DISTINCT aggregate folds over the set of distinct non-null values directly:
-                    // the values are evaluated exactly once and no rows are copied. The set is
-                    // ordered by GqlValueLess (compare_gql_values), so MIN/MAX are its endpoints.
-                    if (agg->distinct && agg->expr) {
-                        std::set<GqlValue, GqlValueLess> distinct_vals;
-                        for (const auto& r : group.rows) {
-                            GqlValue v = evaluate_expression(r, agg->expr.get());
-                            if (v.type != GqlValue::NIL) distinct_vals.insert(std::move(v));
-                        }
-                        if (agg->fn_kind == AggregateKind::COUNT) {
-                            int64_t count = static_cast<int64_t>(distinct_vals.size());
-                            if (query.count_multiplication_factor > 1) {
-                                count *= query.count_multiplication_factor;
-                            }
-                            aggregate_results[agg] = GqlValue(count);
-                        } else if (agg->fn_kind == AggregateKind::MIN) {
-                            aggregate_results[agg] = distinct_vals.empty() ? GqlValue() : *distinct_vals.begin();
-                        } else if (agg->fn_kind == AggregateKind::MAX) {
-                            aggregate_results[agg] = distinct_vals.empty() ? GqlValue() : *distinct_vals.rbegin();
-                        } else if (agg->fn_kind == AggregateKind::COLLECT) {
-                            aggregate_results[agg] = GqlValue(std::vector<GqlValue>(distinct_vals.begin(), distinct_vals.end()));
-                        } else if (agg->fn_kind == AggregateKind::STDDEV_POP || agg->fn_kind == AggregateKind::STDDEV_SAMP) {
-                            std::vector<double> values;
-                            for (const auto& v : distinct_vals) collect_numeric(v, values);
-                            aggregate_results[agg] = stddev_of(values, agg->fn_kind == AggregateKind::STDDEV_SAMP);
-                        } else {  // SUM / AVG with int->double promotion, mirroring the row fold below
-                            int64_t sum_int = 0;
-                            double sum_double = 0.0;
-                            bool has_double = false;
-                            int64_t count = 0;
-                            for (const auto& v : distinct_vals) {
-                                if (v.type != GqlValue::PROPERTY) continue;
-                                if (std::holds_alternative<int64_t>(v.property)) {
-                                    if (has_double) sum_double += static_cast<double>(std::get<int64_t>(v.property));
-                                    else sum_int += std::get<int64_t>(v.property);
-                                    count++;
-                                } else if (std::holds_alternative<double>(v.property)) {
-                                    if (!has_double) {
-                                        sum_double = static_cast<double>(sum_int);
-                                        has_double = true;
-                                    }
-                                    sum_double += std::get<double>(v.property);
-                                    count++;
-                                }
-                            }
-                            if (count == 0) {
-                                aggregate_results[agg] = GqlValue();
-                            } else if (agg->fn_kind == AggregateKind::SUM) {
-                                aggregate_results[agg] = has_double ? GqlValue(sum_double) : GqlValue(sum_int);
-                            } else {
-                                double total = has_double ? sum_double : static_cast<double>(sum_int);
-                                aggregate_results[agg] = GqlValue(total / static_cast<double>(count));
-                            }
-                        }
-                        continue;
-                    }
-                    const std::vector<GqlRow>& agg_rows = group.rows;
-                    if (agg->fn_kind == AggregateKind::COUNT) {
-                        int64_t count = 0;
-                        if (!agg->expr) {
-                            count = static_cast<int64_t>(group.rows.size());
-                        } else {
-                            for (const auto& r : agg_rows) {
-                                GqlValue v = evaluate_expression(r, agg->expr.get());
-                                if (v.type != GqlValue::NIL) {
-                                    count++;
-                                }
-                            }
-                        }
-                        if (query.count_multiplication_factor > 1) {
-                            count *= query.count_multiplication_factor;
-                        }
-                        aggregate_results[agg] = GqlValue(count);
-                    } else if (agg->fn_kind == AggregateKind::SUM || agg->fn_kind == AggregateKind::AVG) {
-                        int64_t sum_int = 0;
-                        double sum_double = 0.0;
-                        bool has_double = false;
-                        int64_t count = 0;
-
-                        for (const auto& r : agg_rows) {
-                            GqlValue v = evaluate_expression(r, agg->expr.get());
-                            if (v.type == GqlValue::PROPERTY) {
-                                if (std::holds_alternative<int64_t>(v.property)) {
-                                    if (has_double) sum_double += static_cast<double>(std::get<int64_t>(v.property));
-                                    else sum_int += std::get<int64_t>(v.property);
-                                    count++;
-                                } else if (std::holds_alternative<double>(v.property)) {
-                                    if (!has_double) {
-                                        sum_double = static_cast<double>(sum_int);
-                                        has_double = true;
-                                    }
-                                    sum_double += std::get<double>(v.property);
-                                    count++;
-                                }
-                            }
-                        }
-
-                        if (agg->fn_kind == AggregateKind::SUM) {
-                            if (count == 0) {
-                                // A COUNT rewritten into a degree SUM keeps count semantics over
-                                // empty input: 0, not the null a genuine sum would produce.
-                                aggregate_results[agg] = agg->count_to_sum ? GqlValue(static_cast<int64_t>(0)) : GqlValue();
-                            } else if (has_double) {
-                                aggregate_results[agg] = GqlValue(sum_double);
-                            } else {
-                                aggregate_results[agg] = GqlValue(sum_int);
-                            }
-                        } else {
-                            if (count == 0) {
-                                aggregate_results[agg] = GqlValue();
-                            } else if (has_double) {
-                                aggregate_results[agg] = GqlValue(sum_double / static_cast<double>(count));
-                            } else {
-                                aggregate_results[agg] = GqlValue(static_cast<double>(sum_int) / static_cast<double>(count));
-                            }
-                        }
-                    } else if (agg->fn_kind == AggregateKind::MIN) {
-                        GqlValue min_val;
-                        for (const auto& r : agg_rows) {
-                            GqlValue v = evaluate_expression(r, agg->expr.get());
-                            if (v.type != GqlValue::NIL) {
-                                if (min_val.type == GqlValue::NIL || compare_gql_values(v, min_val) < 0) {
-                                    min_val = v;
-                                }
-                            }
-                        }
-                        aggregate_results[agg] = min_val;
-                    } else if (agg->fn_kind == AggregateKind::MAX) {
-                        GqlValue max_val;
-                        for (const auto& r : agg_rows) {
-                            GqlValue v = evaluate_expression(r, agg->expr.get());
-                            if (v.type != GqlValue::NIL) {
-                                if (max_val.type == GqlValue::NIL || compare_gql_values(v, max_val) > 0) {
-                                    max_val = v;
-                                }
-                            }
-                        }
-                        aggregate_results[agg] = max_val;
-                    } else if (agg->fn_kind == AggregateKind::COLLECT) {
-                        std::vector<GqlValue> items;
-                        for (const auto& r : agg_rows) {
-                            GqlValue v = evaluate_expression(r, agg->expr.get());
-                            if (v.type != GqlValue::NIL) items.push_back(std::move(v));
-                        }
-                        aggregate_results[agg] = GqlValue(std::move(items));
-                    } else if (agg->fn_kind == AggregateKind::STDDEV_POP || agg->fn_kind == AggregateKind::STDDEV_SAMP) {
-                        aggregate_results[agg] = compute_stddev(agg_rows, agg->expr.get(),
-                                                                agg->fn_kind == AggregateKind::STDDEV_SAMP);
-                    }
+                    EdgeAggAccumulator acc = EdgeAggAccumulator::make(agg);
+                    for (const auto& r : group.rows) acc.add(r);
+                    aggregate_results[agg] = acc.finalize(query.count_multiplication_factor);
                 }
 
                 std::vector<GqlValue> projected;

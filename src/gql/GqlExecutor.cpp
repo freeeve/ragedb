@@ -113,7 +113,7 @@ static void sort_combined_result(QueryResult& res, const std::vector<SortSpec>& 
     };
 
     if (limit && *limit < res.rows.size()) {
-        std::partial_sort(res.rows.begin(), res.rows.begin() + *limit, res.rows.end(), comp);
+        std::partial_sort(res.rows.begin(), res.rows.begin() + static_cast<std::ptrdiff_t>(*limit), res.rows.end(), comp);
         res.rows.resize(*limit);
     } else {
         std::stable_sort(res.rows.begin(), res.rows.end(), comp);

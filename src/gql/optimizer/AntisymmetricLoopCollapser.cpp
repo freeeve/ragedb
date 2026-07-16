@@ -98,8 +98,8 @@ void delete_edge_at(GqlQuery& query, size_t m_idx, size_t e_idx) {
 
     merge_pattern_nodes(match.pattern.nodes[e_idx], match.pattern.nodes[e_idx + 1]);
 
-    match.pattern.edges.erase(match.pattern.edges.begin() + e_idx);
-    match.pattern.nodes.erase(match.pattern.nodes.begin() + e_idx + 1);
+    match.pattern.edges.erase(match.pattern.edges.begin() + static_cast<std::ptrdiff_t>(e_idx));
+    match.pattern.nodes.erase(match.pattern.nodes.begin() + static_cast<std::ptrdiff_t>(e_idx) + 1);
 }
 
 void prune_redundant_single_node_matches(GqlQuery& query) {

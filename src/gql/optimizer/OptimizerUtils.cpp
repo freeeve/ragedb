@@ -118,7 +118,7 @@ bool get_numeric_value(const Expression* expr, double& val) {
     if (expr->kind == ExpressionKind::LITERAL) {
         const auto* lit = static_cast<const LiteralExpr*>(expr);
         if (std::holds_alternative<int64_t>(lit->value)) {
-            val = std::get<int64_t>(lit->value);
+            val = static_cast<double>(std::get<int64_t>(lit->value));
             return true;
         } else if (std::holds_alternative<double>(lit->value)) {
             val = std::get<double>(lit->value);
@@ -242,7 +242,7 @@ std::vector<VarInfo> collect_query_vars(const GqlQuery& query) {
                 double val = 0;
                 bool is_numeric = false;
                 if (std::holds_alternative<int64_t>(val_type)) {
-                    val = std::get<int64_t>(val_type);
+                    val = static_cast<double>(std::get<int64_t>(val_type));
                     is_numeric = true;
                 } else if (std::holds_alternative<double>(val_type)) {
                     val = std::get<double>(val_type);
@@ -265,7 +265,7 @@ std::vector<VarInfo> collect_query_vars(const GqlQuery& query) {
                 double val = 0;
                 bool is_numeric = false;
                 if (std::holds_alternative<int64_t>(filter.value)) {
-                    val = std::get<int64_t>(filter.value);
+                    val = static_cast<double>(std::get<int64_t>(filter.value));
                     is_numeric = true;
                 } else if (std::holds_alternative<double>(filter.value)) {
                     val = std::get<double>(filter.value);
@@ -334,7 +334,7 @@ std::vector<VarInfo> collect_all_query_vars(const GqlQuery& query) {
                 double val = 0;
                 bool is_numeric = false;
                 if (std::holds_alternative<int64_t>(val_type)) {
-                    val = std::get<int64_t>(val_type);
+                    val = static_cast<double>(std::get<int64_t>(val_type));
                     is_numeric = true;
                 } else if (std::holds_alternative<double>(val_type)) {
                     val = std::get<double>(val_type);
@@ -357,7 +357,7 @@ std::vector<VarInfo> collect_all_query_vars(const GqlQuery& query) {
                 double val = 0;
                 bool is_numeric = false;
                 if (std::holds_alternative<int64_t>(filter.value)) {
-                    val = std::get<int64_t>(filter.value);
+                    val = static_cast<double>(std::get<int64_t>(filter.value));
                     is_numeric = true;
                 } else if (std::holds_alternative<double>(filter.value)) {
                     val = std::get<double>(filter.value);
@@ -417,7 +417,7 @@ std::vector<VarInfo> collect_all_query_vars(const GqlQuery& query) {
                 double val = 0;
                 bool is_numeric = false;
                 if (std::holds_alternative<int64_t>(val_type)) {
-                    val = std::get<int64_t>(val_type);
+                    val = static_cast<double>(std::get<int64_t>(val_type));
                     is_numeric = true;
                 } else if (std::holds_alternative<double>(val_type)) {
                     val = std::get<double>(val_type);
@@ -440,7 +440,7 @@ std::vector<VarInfo> collect_all_query_vars(const GqlQuery& query) {
                 double val = 0;
                 bool is_numeric = false;
                 if (std::holds_alternative<int64_t>(filter.value)) {
-                    val = std::get<int64_t>(filter.value);
+                    val = static_cast<double>(std::get<int64_t>(filter.value));
                     is_numeric = true;
                 } else if (std::holds_alternative<double>(filter.value)) {
                     val = std::get<double>(filter.value);

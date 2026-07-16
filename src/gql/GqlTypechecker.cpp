@@ -465,6 +465,10 @@ GqlType GqlTypechecker::check_expression(const Expression& expr) {
             }
             break;
         }
+        case ExpressionKind::SIZE_OP: {
+            // COUNT { ... } / size([...]) yields a match count.
+            return GqlType::INTEGER;
+        }
         case ExpressionKind::EXISTS: {
             const auto& exists = static_cast<const ExistsExpr&>(expr);
             auto parent_env = this->env;

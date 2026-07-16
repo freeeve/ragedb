@@ -208,13 +208,13 @@ struct EdgeAggAccumulator {
     double sum_double = 0.0;
     bool has_double = false;
     int64_t val_count = 0;
-    GqlValue extreme;
+    GqlValue extreme{};
     bool extreme_set = false;
-    std::set<GqlValue, GqlValueLess> distinct_vals;
-    std::unordered_set<uint64_t> distinct_node_ids;
-    std::unordered_set<uint64_t> distinct_rel_ids;
-    std::vector<GqlValue> collect_vals;   // COLLECT: values in row order
-    std::vector<double> numeric_vals;     // STDDEV / PERCENTILE: numeric values (sorted at finalize)
+    std::set<GqlValue, GqlValueLess> distinct_vals{};
+    std::unordered_set<uint64_t> distinct_node_ids{};
+    std::unordered_set<uint64_t> distinct_rel_ids{};
+    std::vector<GqlValue> collect_vals{};   // COLLECT: values in row order
+    std::vector<double> numeric_vals{};     // STDDEV / PERCENTILE: numeric values (sorted at finalize)
     double percentile_fraction = 0.0;     // PERCENTILE_CONT/DISC: the fraction argument in [0,1]
 
     static EdgeAggAccumulator make(const AggregateExpr* agg) {

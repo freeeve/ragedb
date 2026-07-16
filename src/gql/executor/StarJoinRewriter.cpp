@@ -426,7 +426,7 @@ seastar::future<IntermediateResult> execute_match_chain_factorized(
 
         auto start = std::chrono::steady_clock::now();
         return seastar::when_all_succeed(futs.begin(), futs.end())
-        .then([&graph, matches = std::move(matches), match_idx, incoming = std::move(incoming), limit, pruner, sort_property, sort_ascending, sort_by_id, query_ptr, start, stmt](std::vector<std::vector<GqlRow>> nested) mutable {
+        .then([&graph, matches = std::move(matches), match_idx, incoming = std::move(incoming), limit, pruner, sort_property, sort_by_id, query_ptr, start, stmt](std::vector<std::vector<GqlRow>> nested) mutable {
             std::vector<GqlRow> next_rows;
             for (const auto& vec : nested) {
                 next_rows.insert(next_rows.end(), vec.begin(), vec.end());

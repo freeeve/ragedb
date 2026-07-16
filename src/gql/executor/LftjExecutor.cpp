@@ -48,8 +48,9 @@ static size_t galloping_seek(const std::vector<uint64_t>& values, size_t start, 
     }
 
     // Binary search in [prev, curr]
-    auto it = std::lower_bound(values.begin() + prev, values.begin() + curr + 1, target);
-    return std::distance(values.begin(), it);
+    auto it = std::lower_bound(values.begin() + static_cast<std::ptrdiff_t>(prev),
+                               values.begin() + static_cast<std::ptrdiff_t>(curr) + 1, target);
+    return static_cast<size_t>(std::distance(values.begin(), it));
 }
 
 // Iterator representing pointer at a trie level of a relation
@@ -77,20 +78,20 @@ static std::vector<uint64_t> leapfrog_intersect(std::vector<LeapfrogIterator>& i
         if (it.is_at_end()) return result;
     }
     
-    int M = iters.size();
-    std::vector<int> p(M);
-    for (int i = 0; i < M; ++i) p[i] = i;
-    
+    size_t M = iters.size();
+    std::vector<size_t> p(M);
+    for (size_t i = 0; i < M; ++i) p[i] = i;
+
     auto sort_p = [&]() {
-        std::sort(p.begin(), p.end(), [&](int a, int b) {
+        std::sort(p.begin(), p.end(), [&](size_t a, size_t b) {
             return iters[a].key() < iters[b].key();
         });
     };
     sort_p();
-    
+
     while (true) {
-        int smallest_idx = p[0];
-        int largest_idx = p[M - 1];
+        size_t smallest_idx = p[0];
+        size_t largest_idx = p[M - 1];
         uint64_t smallest_val = iters[smallest_idx].key();
         uint64_t largest_val = iters[largest_idx].key();
         
@@ -107,7 +108,7 @@ static std::vector<uint64_t> leapfrog_intersect(std::vector<LeapfrogIterator>& i
             }
         }
         
-        int i = 0;
+        size_t i = 0;
         while (i < M - 1 && iters[p[i]].key() > iters[p[i + 1]].key()) {
             std::swap(p[i], p[i + 1]);
             i++;

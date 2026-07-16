@@ -43,6 +43,8 @@ static std::string describe_label_expr(const std::shared_ptr<LabelExpression>& e
             return "(" + describe_label_expr(expr->left) + " & " + describe_label_expr(expr->right) + ")";
         case LabelExprKind::OR:
             return "(" + describe_label_expr(expr->left) + " | " + describe_label_expr(expr->right) + ")";
+        case LabelExprKind::WILDCARD:
+            return "%";
     }
     return "";
 }
@@ -377,7 +379,7 @@ static std::shared_ptr<PlanNode> build_match_plan(
         }
         join_node->variables = join_strings(incoming_vars, ", ");
 
-        std::vector<MatchStatement> remaining_matches(matches.begin() + match_idx + 1, matches.end());
+        std::vector<MatchStatement> remaining_matches(matches.begin() + static_cast<std::ptrdiff_t>(match_idx) + 1, matches.end());
         return build_match_plan(graph, remaining_matches, 0, incoming_vars, join_node);
     } else {
         auto node = std::make_shared<PlanNode>();
@@ -475,7 +477,7 @@ static std::shared_ptr<PlanNode> build_match_plan(
         }
         node->variables = join_strings(incoming_vars, ", ");
 
-        std::vector<MatchStatement> remaining_matches(matches.begin() + match_idx + 1, matches.end());
+        std::vector<MatchStatement> remaining_matches(matches.begin() + static_cast<std::ptrdiff_t>(match_idx) + 1, matches.end());
         return build_match_plan(graph, remaining_matches, 0, incoming_vars, node);
     }
 }

@@ -223,7 +223,6 @@ static void resolve_order_by_aliases(GqlQuery& query) {
 }
 
 /**
-/**
  * @brief Parse an optional ISO GQL `GROUP BY <var> (, <var>)*` clause into query.group_by. GROUP is a
  *        keyword but the following BY is not, so it arrives as an identifier. Only fires when both are
  *        present, so a bare GROUP elsewhere (e.g. SHORTEST k GROUP) is untouched.
@@ -392,7 +391,7 @@ GqlQuery GqlParser::parse_single_query() {
                 advance(); // consume SHORTEST
                 uint64_t k = 1;
                 if (check(TokenType::NUMBER)) {
-                    k = peek().int_value;
+                    k = static_cast<uint64_t>(peek().int_value);
                     advance();
                 }
                 stmt.shortest_path_k = k;
@@ -405,7 +404,7 @@ GqlQuery GqlParser::parse_single_query() {
             } else if (match(TokenType::CHEAPEST_KW)) {
                 uint64_t k = 1;
                 if (check(TokenType::NUMBER)) {
-                    k = peek().int_value;
+                    k = static_cast<uint64_t>(peek().int_value);
                     advance();
                     stmt.shortest_path_kind = ShortestPathKind::CHEAPEST_K;
                     stmt.shortest_path_k = k;
@@ -1071,13 +1070,13 @@ void GqlParser::parse_edge_details(PatternEdge& edge) {
         edge.min_hops = 1;
         edge.max_hops = std::numeric_limits<uint64_t>::max();
         if (check(TokenType::NUMBER)) {
-            uint64_t val = peek().int_value;
+            uint64_t val = static_cast<uint64_t>(peek().int_value);
             advance();
             if (match(TokenType::DOT)) {
                 consume(TokenType::DOT, "Expected '..' for repetition range");
                 edge.min_hops = val;
                 if (check(TokenType::NUMBER)) {
-                    edge.max_hops = peek().int_value;
+                    edge.max_hops = static_cast<uint64_t>(peek().int_value);
                     advance();
                 }
             } else {
@@ -1088,7 +1087,7 @@ void GqlParser::parse_edge_details(PatternEdge& edge) {
             consume(TokenType::DOT, "Expected '..' for repetition range");
             edge.min_hops = 1;
             if (check(TokenType::NUMBER)) {
-                edge.max_hops = peek().int_value;
+                edge.max_hops = static_cast<uint64_t>(peek().int_value);
                 advance();
             }
         }
@@ -1158,12 +1157,12 @@ PathPattern GqlParser::parse_path_pattern() {
             } else if (match(TokenType::LBRACE)) {
                 edge.is_variable_length = true;
                 if (check(TokenType::NUMBER)) {
-                    uint64_t val = peek().int_value;
+                    uint64_t val = static_cast<uint64_t>(peek().int_value);
                     consume(TokenType::NUMBER, "Expected number");
                     if (match(TokenType::COMMA)) {
                         edge.min_hops = val;
                         if (check(TokenType::NUMBER)) {
-                            edge.max_hops = peek().int_value;
+                            edge.max_hops = static_cast<uint64_t>(peek().int_value);
                             consume(TokenType::NUMBER, "Expected number");
                         } else {
                             edge.max_hops = std::numeric_limits<uint64_t>::max();
@@ -1174,7 +1173,7 @@ PathPattern GqlParser::parse_path_pattern() {
                     }
                 } else if (match(TokenType::COMMA)) {
                     edge.min_hops = 0;
-                    edge.max_hops = peek().int_value;
+                    edge.max_hops = static_cast<uint64_t>(peek().int_value);
                     consume(TokenType::NUMBER, "Expected maximum hops");
                 } else {
                     throw std::runtime_error("Invalid quantifier format inside '{}'");
@@ -1200,12 +1199,12 @@ PathPattern GqlParser::parse_path_pattern() {
             } else if (match(TokenType::LBRACE)) {
                 edge.is_variable_length = true;
                 if (check(TokenType::NUMBER)) {
-                    uint64_t val = peek().int_value;
+                    uint64_t val = static_cast<uint64_t>(peek().int_value);
                     consume(TokenType::NUMBER, "Expected number");
                     if (match(TokenType::COMMA)) {
                         edge.min_hops = val;
                         if (check(TokenType::NUMBER)) {
-                            edge.max_hops = peek().int_value;
+                            edge.max_hops = static_cast<uint64_t>(peek().int_value);
                             consume(TokenType::NUMBER, "Expected number");
                         } else {
                             edge.max_hops = std::numeric_limits<uint64_t>::max();
@@ -1216,7 +1215,7 @@ PathPattern GqlParser::parse_path_pattern() {
                     }
                 } else if (match(TokenType::COMMA)) {
                     edge.min_hops = 0;
-                    edge.max_hops = peek().int_value;
+                    edge.max_hops = static_cast<uint64_t>(peek().int_value);
                     consume(TokenType::NUMBER, "Expected maximum hops");
                 } else {
                     throw std::runtime_error("Invalid quantifier format inside '{}'");
@@ -1239,13 +1238,13 @@ PathPattern GqlParser::parse_path_pattern() {
             bool is_range = false;
 
             if (check(TokenType::NUMBER)) {
-                uint64_t val = peek().int_value;
+                uint64_t val = static_cast<uint64_t>(peek().int_value);
                 consume(TokenType::NUMBER, "Expected number");
                 if (match(TokenType::COMMA)) {
                     min_hops = val;
                     is_range = true;
                     if (check(TokenType::NUMBER)) {
-                        max_hops = peek().int_value;
+                        max_hops = static_cast<uint64_t>(peek().int_value);
                         consume(TokenType::NUMBER, "Expected number");
                     } else {
                         max_hops = std::numeric_limits<uint64_t>::max();
@@ -1256,7 +1255,7 @@ PathPattern GqlParser::parse_path_pattern() {
                 }
             } else if (match(TokenType::COMMA)) {
                 min_hops = 0;
-                max_hops = peek().int_value;
+                max_hops = static_cast<uint64_t>(peek().int_value);
                 consume(TokenType::NUMBER, "Expected maximum hops");
                 is_range = true;
             } else {

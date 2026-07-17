@@ -337,6 +337,29 @@ GqlQuery GqlParser::parse_single_query() {
     if (pending_having) {
         query.where_expr = std::move(pending_having);
     }
+
+    // ISO GQL scoped subquery: `CALL (v1, v2, ...) { <subquery incl UNION ALL> }`. This sources the
+    // segment: the named outer variables are imported into a nested subquery, which is run and whose
+    // result rows are piped into this segment's projection (in place of a MATCH). The '(' immediately
+    // after CALL distinguishes it from a procedure call (CALL fts.search / CALL algo.propagate).
+    if (check(TokenType::CALL) && peek(1).type == TokenType::LPAREN) {
+        advance(); // CALL
+        consume(TokenType::LPAREN, "Expected '(' after CALL");
+        std::vector<std::string> imports;
+        if (!check(TokenType::RPAREN)) {
+            do {
+                imports.push_back(peek().text);
+                consume(TokenType::NAME, "Expected a variable name in the CALL import list");
+            } while (match(TokenType::COMMA));
+        }
+        consume(TokenType::RPAREN, "Expected ')' after the CALL import list");
+        consume(TokenType::LBRACE, "Expected '{' to open the CALL subquery");
+        GqlQuery sub = parse_union();
+        consume(TokenType::RBRACE, "Expected '}' to close the CALL subquery");
+        query.call_import_vars = std::move(imports);
+        query.call_subquery = std::make_shared<GqlQuery>(std::move(sub));
+    }
+
     // Parse MATCH/OPTIONAL MATCH clauses. A WHERE may sit between MATCH groups
     // (MATCH ... WHERE ... MATCH ... RETURN): after each group we take an optional WHERE and loop
     // back so a following MATCH keeps extending the same segment.
@@ -774,8 +797,9 @@ GqlQuery GqlParser::parse_single_query() {
     // Verify we have at least one MATCH or write operation (a continuation segment after WITH may
     // have neither--it operates on the rows piped in from the previous segment). A FOR statement is
     // also a row source in its own right: `FOR x IN [1, 2, 3] RETURN x` matches nothing but still
-    // produces rows.
-    if (query.matches.empty() && query.writes.empty() && with_segments.empty() && query.for_bindings.empty()) {
+    // produces rows. A scoped subquery `CALL (imports) { ... }` is likewise a row source for the segment.
+    if (query.matches.empty() && query.writes.empty() && with_segments.empty() &&
+        query.for_bindings.empty() && !query.call_subquery) {
         throw std::runtime_error("Query must contain at least one MATCH or write clause");
     }
 

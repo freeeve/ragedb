@@ -1002,6 +1002,32 @@ TEST_CASE("CALL algo.propagate(...) YIELD parses into a propagate match statemen
     REQUIRE(q.matches[0].yield_depth_var == "dist");
 }
 
+TEST_CASE("CALL (imports) { subquery } parses a scoped subquery segment", "[gql_parser]") {
+    // bi q4 shape: import an outer variable into a nested UNION ALL subquery whose rows feed the segment.
+    auto q = GqlParser::parse(
+        "CALL (topForums) {"
+        "  FOR f IN topForums MATCH (f)-[:CONTAINER_OF]->(p:Post) RETURN p AS person, count(p) AS c"
+        "  UNION ALL"
+        "  FOR f IN topForums MATCH (x:Person)<-[:HAS_MEMBER]-(f) RETURN x AS person, 0 AS c"
+        "} "
+        "RETURN person, sum(c) AS total ORDER BY total DESC");
+    REQUIRE(q.call_import_vars.size() == 1);
+    REQUIRE(q.call_import_vars[0] == "topForums");
+    REQUIRE(q.call_subquery != nullptr);
+    REQUIRE(q.call_subquery->kind == QueryKind::UNION_ALL);
+    REQUIRE(q.returns.size() == 2);
+}
+
+TEST_CASE("CALL (imports) { subquery } accepts a single-branch body and multiple imports", "[gql_parser]") {
+    auto q = GqlParser::parse(
+        "CALL (xs, ys) { FOR x IN xs MATCH (p:Person) RETURN p AS person } RETURN person");
+    REQUIRE(q.call_import_vars.size() == 2);
+    REQUIRE(q.call_import_vars[0] == "xs");
+    REQUIRE(q.call_import_vars[1] == "ys");
+    REQUIRE(q.call_subquery != nullptr);
+    REQUIRE(q.call_subquery->kind == QueryKind::SINGLE);
+}
+
 TEST_CASE("CALL algo.propagate YIELD columns are order-independent and default to their names", "[gql_parser]") {
     auto q = GqlParser::parse(
         "CALL algo.propagate(s, v, ['t'], 'out', 2, 'amount', 'desc', 0) "

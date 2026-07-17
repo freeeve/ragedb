@@ -830,6 +830,13 @@ struct GqlQuery {
     /// segment; the enclosing GqlQuery is the final segment ending in RETURN. Empty means no WITH.
     std::vector<std::shared_ptr<GqlQuery>> with_segments;
 
+    /// ISO GQL scoped subquery `CALL (importVars) { <subquery incl UNION ALL> }`. When call_subquery is
+    /// set this segment is sourced by running that nested subquery with the named outer variables imported
+    /// into its scope (per incoming row) and piping its result rows into this segment's projection --
+    /// rather than by a MATCH. call_import_vars names the outer variables made visible inside the subquery.
+    std::vector<std::string> call_import_vars;
+    std::shared_ptr<GqlQuery> call_subquery;
+
     // DDL schema controls
     std::optional<SchemaOperation> schema_op;
 
@@ -898,6 +905,10 @@ struct GqlQuery {
         copy.with_segments.reserve(with_segments.size());
         for (const auto& seg : with_segments) {
             copy.with_segments.push_back(std::make_shared<GqlQuery>(seg->clone()));
+        }
+        copy.call_import_vars = call_import_vars;
+        if (call_subquery) {
+            copy.call_subquery = std::make_shared<GqlQuery>(call_subquery->clone());
         }
         copy.schema_op = schema_op;
         copy.outer_vars = outer_vars;

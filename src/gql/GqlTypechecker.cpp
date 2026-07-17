@@ -18,6 +18,7 @@
 #include <limits>
 #include <stdexcept>
 #include <algorithm>
+#include <optional>
 
 namespace ragedb::gql {
 
@@ -312,7 +313,21 @@ void GqlTypechecker::check_path_pattern(const PathPattern& path_pattern) {
             }
         }
         if (edge.cost_expr) {
+            // In a COST expression the edge variable denotes a SINGLE relationship (the cost is applied
+            // per edge), even for a variable-length edge where the variable is otherwise a
+            // RELATIONSHIP_LIST. Rebind it to RELATIONSHIP for the check, then restore.
+            const bool rebind = edge.is_variable_length && !edge.variable.empty();
+            std::optional<VariableSchema> saved;
+            if (rebind) {
+                auto it = env.find(edge.variable);
+                if (it != env.end()) saved = it->second;
+                env[edge.variable] = VariableSchema{GqlType::RELATIONSHIP, edge_labels};
+            }
             GqlType t = check_expression(*edge.cost_expr);
+            if (rebind) {
+                if (saved) env[edge.variable] = *saved;
+                else env.erase(edge.variable);
+            }
             if (t != GqlType::INTEGER && t != GqlType::DOUBLE && t != GqlType::ANY) {
                 throw std::runtime_error("COST expression must evaluate to a numeric type, got " + to_string(t));
             }

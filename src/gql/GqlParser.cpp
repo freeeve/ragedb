@@ -535,8 +535,11 @@ GqlQuery GqlParser::parse_single_query() {
                 }
                 if (current_stmt.shortest_path_kind == ShortestPathKind::CHEAPEST ||
                     current_stmt.shortest_path_kind == ShortestPathKind::ALL_CHEAPEST ||
-                    current_stmt.shortest_path_kind == ShortestPathKind::CHEAPEST_K) {
-                    // Backwards compatibility for old-style COST clause placed outside the path pattern
+                    current_stmt.shortest_path_kind == ShortestPathKind::CHEAPEST_K ||
+                    current_stmt.shortest_path_kind == ShortestPathKind::ANY) {
+                    // A COST clause after the pattern (LDBC form: ANY SHORTEST (a)-[r]-{1,}(b) COST r.w)
+                    // selects the cheapest-by-weight path; the executor routes ANY+cost through the
+                    // weighted search. Also the legacy CHEAPEST-family placement.
                     if (match(TokenType::COST_KW)) {
                         auto expr = parse_expression();
                         if (!current_stmt.pattern.edges.empty()) {

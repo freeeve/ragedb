@@ -2104,10 +2104,15 @@ seastar::future<std::vector<GqlRow>> traverse_match_statement(ragedb::Graph& gra
 
             // Resolve the edge cost function once for the weighted selectors, rather than rebuilding
             // it for every pair.
+            // `ANY SHORTEST ... COST r.w` selects the single cheapest-by-weight path, not fewest hops:
+            // when a COST is present, drive ANY through the weighted search just like CHEAPEST.
+            const bool any_weighted = stmt.shortest_path_kind == ShortestPathKind::ANY &&
+                                      !stmt.pattern.edges.empty() && stmt.pattern.edges[0].cost_expr != nullptr;
             std::function<double(const Relationship&)> cost_fn;
             if (stmt.shortest_path_kind == ShortestPathKind::CHEAPEST ||
                 stmt.shortest_path_kind == ShortestPathKind::ALL_CHEAPEST ||
-                stmt.shortest_path_kind == ShortestPathKind::CHEAPEST_K) {
+                stmt.shortest_path_kind == ShortestPathKind::CHEAPEST_K ||
+                any_weighted) {
                 std::shared_ptr<Expression> cost_expr = nullptr;
                 std::string cost_edge_var = "";
                 if (!stmt.pattern.edges.empty()) {
@@ -2156,11 +2161,11 @@ seastar::future<std::vector<GqlRow>> traverse_match_statement(ragedb::Graph& gra
 
             return seastar::max_concurrent_for_each(indices->begin(), indices->end(), concurrency,
             [&graph, stmt, row, start_node_var, end_node_var, edge_var = edge.variable, rel_types, dir,
-             min_hops, max_hops, cost_fn, partitions, row_groups](size_t index) {
+             min_hops, max_hops, cost_fn, any_weighted, partitions, row_groups](size_t index) {
                 const auto& partition = (*partitions)[index];
                 seastar::future<std::vector<Path>> search = seastar::make_ready_future<std::vector<Path>>();
 
-                if (stmt.shortest_path_kind == ShortestPathKind::CHEAPEST) {
+                if (stmt.shortest_path_kind == ShortestPathKind::CHEAPEST || any_weighted) {
                     search = graph.shard.local().ShortestWeightedPathPeered(
                         partition.start_node.getId(), partition.end_node.getId(), dir, rel_types, cost_fn
                     ).then([](std::optional<WeightedPath> opt_wpath) {

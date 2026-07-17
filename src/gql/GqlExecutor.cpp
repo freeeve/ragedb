@@ -956,9 +956,50 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
 
     // 5. Execute matching patterns recursively using sharded traversal. WITH-pipeline continuation
     // segments start from the rows piped in from the previous segment rather than a single empty row.
-    IntermediateResult initial_res = incoming.has_value()
-        ? IntermediateResult(std::move(*incoming))
-        : IntermediateResult(std::vector<GqlRow>{ GqlRow{} });
+    std::vector<GqlRow> seed_rows = incoming.has_value()
+        ? std::move(*incoming)
+        : std::vector<GqlRow>{ GqlRow{} };
+
+    // A FOR whose variable is a MATCH pattern anchor -- FOR x IN list MATCH (x)-[:R]->(y) -- must expand
+    // BEFORE the match so each element seeds the traversal. Expanding it after the match (the default FOR
+    // stage, correct for FOR over a matched value) would leave x free in the match and then overwrite it,
+    // yielding a cross product of the whole match with the list. Pre-expand those onto the seed rows here
+    // and record them so the post-match FOR stage skips them. Such a FOR's list cannot depend on a match
+    // variable (that would be circular), so it is always evaluable against the incoming rows.
+    std::set<std::string> prematch_for_vars;
+    if (has_incoming && !query_ptr->for_bindings.empty() && !query_ptr->matches.empty()) {
+        std::set<std::string> match_pattern_vars;
+        for (const auto& m : query_ptr->matches) {
+            for (const auto& n : m.pattern.nodes) {
+                if (!n.variable.empty()) match_pattern_vars.insert(n.variable);
+            }
+            for (const auto& e : m.pattern.edges) {
+                if (!e.variable.empty()) match_pattern_vars.insert(e.variable);
+            }
+        }
+        for (const auto& binding : query_ptr->for_bindings) {
+            if (match_pattern_vars.count(binding.variable) == 0) {
+                continue;   // not a match anchor -- keep it in the post-match FOR stage
+            }
+            std::vector<GqlRow> expanded;
+            for (const auto& row : seed_rows) {
+                const GqlValue list_val = evaluate_expression(row, binding.list_expr.get());
+                const auto elements = as_list_elements(list_val);
+                if (!elements) {
+                    continue;
+                }
+                for (const auto& element : *elements) {
+                    GqlRow expanded_row = row;
+                    expanded_row.bindings[binding.variable] = element;
+                    expanded.push_back(std::move(expanded_row));
+                }
+            }
+            seed_rows = std::move(expanded);
+            prematch_for_vars.insert(binding.variable);
+        }
+    }
+
+    IntermediateResult initial_res(std::move(seed_rows));
     auto is_sorted_shared = std::make_shared<bool>(false);
 
     auto is_query_cyclic = [](const std::vector<MatchStatement>& matches) -> bool {
@@ -1083,7 +1124,7 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
 
     return matched_fut
 
-    .then([&graph, query_ptr, is_sorted_shared](IntermediateResult matched_res) {
+    .then([&graph, query_ptr, is_sorted_shared, prematch_for_vars](IntermediateResult matched_res) {
         *is_sorted_shared = matched_res.is_sorted;
         matched_res.ensure_flat();
         std::vector<GqlRow> matched_rows = std::move(matched_res.rows);
@@ -1133,7 +1174,7 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
         // Resolve correlated COUNT{} subqueries (async) before LET / WHERE / RETURN read their per-row
         // counts. No-op and cost-free when the segment contains none.
         return precompute_count_subqueries(graph, query_ptr, std::move(matched_rows))
-        .then([&graph, query_ptr](std::vector<GqlRow> matched_rows) {
+        .then([&graph, query_ptr, prematch_for_vars](std::vector<GqlRow> matched_rows) {
         const auto& query = *query_ptr;
 
         // 6a. Expand ISO GQL FOR (the standard's UNWIND) before anything else reads the working table:
@@ -1145,6 +1186,9 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
                 matched_rows.push_back(GqlRow{});
             }
             for (const auto& binding : query.for_bindings) {
+                if (prematch_for_vars.count(binding.variable)) {
+                    continue;   // already expanded before the match as a pattern anchor
+                }
                 std::vector<GqlRow> expanded;
                 for (const auto& row : matched_rows) {
                     const GqlValue list_val = evaluate_expression(row, binding.list_expr.get());

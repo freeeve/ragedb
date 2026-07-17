@@ -341,7 +341,73 @@ GqlQuery GqlParser::parse_single_query() {
     // (MATCH ... WHERE ... MATCH ... RETURN): after each group we take an optional WHERE and loop
     // back so a following MATCH keeps extending the same segment.
     while (true) {
-    while (check(TokenType::MATCH) || (check(TokenType::OPTIONAL) && peek(1).type == TokenType::MATCH)) {
+    while (check(TokenType::MATCH) || (check(TokenType::OPTIONAL) && peek(1).type == TokenType::MATCH) ||
+           check(TokenType::CALL)) {
+        // CALL fts.search('Type', 'prop', 'query') YIELD node [AS v] [, score [AS s]] -- a full-text search
+        // query prefix. Translate to the same search MatchStatement the `<v> IN SEARCH (...)` syntax builds
+        // (shared executor path); a follow-on MATCH/RETURN then references the yielded variable.
+        if (check(TokenType::CALL)) {
+            advance(); // CALL
+            // Procedure name namespace.name. `search` lexes as the SEARCH keyword (like the IN SEARCH form),
+            // so accept SEARCH or NAME for each part, and compare case-insensitively.
+            auto lower = [](std::string s) {
+                std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                return s;
+            };
+            std::string ns = lower(peek().text);
+            if (!check(TokenType::NAME) && !check(TokenType::SEARCH))
+                throw std::runtime_error("Expected a procedure namespace after CALL");
+            advance();
+            consume(TokenType::DOT, "Expected '.' in procedure name");
+            std::string proc = lower(peek().text);
+            if (!check(TokenType::NAME) && !check(TokenType::SEARCH))
+                throw std::runtime_error("Expected a procedure name after '.'");
+            advance();
+            if (ns != "fts" || proc != "search") {
+                throw std::runtime_error("Unsupported CALL procedure: " + ns + "." + proc +
+                                         " (only fts.search is supported)");
+            }
+            MatchStatement search_stmt;
+            search_stmt.is_search = true;
+            consume(TokenType::LPAREN, "Expected '(' after fts.search");
+            search_stmt.search_type = peek().text;
+            consume(TokenType::STRING_LIT, "Expected node type name string in fts.search");
+            consume(TokenType::COMMA, "Expected ',' after fts.search type");
+            search_stmt.search_properties.push_back(peek().text);
+            consume(TokenType::STRING_LIT, "Expected property name string in fts.search");
+            consume(TokenType::COMMA, "Expected ',' after fts.search property");
+            search_stmt.search_string = peek().text;
+            consume(TokenType::STRING_LIT, "Expected query string in fts.search");
+            consume(TokenType::RPAREN, "Expected ')' after fts.search arguments");
+            consume(TokenType::YIELD, "Expected 'YIELD' after fts.search(...)");
+            // YIELD node [AS v] [, score [AS s]] -- the node column binds to v (or itself); score is
+            // optional. `node` lexes as the NODE keyword, `score` as a NAME, so accept either token here.
+            std::string ycol = peek().text;
+            if (!check(TokenType::NODE) && !check(TokenType::NAME))
+                throw std::runtime_error("Expected a yield column after YIELD");
+            advance();
+            if (match(TokenType::AS)) {
+                search_stmt.yield_var = peek().text;
+                consume(TokenType::NAME, "Expected alias after AS");
+            } else {
+                search_stmt.yield_var = ycol;
+            }
+            if (match(TokenType::COMMA)) {
+                std::string scol = peek().text;
+                if (!check(TokenType::NODE) && !check(TokenType::NAME))
+                    throw std::runtime_error("Expected a second yield column");
+                advance();
+                if (match(TokenType::AS)) {
+                    search_stmt.yield_score_var = peek().text;
+                    consume(TokenType::NAME, "Expected alias after AS");
+                } else {
+                    search_stmt.yield_score_var = scol;
+                }
+            }
+            search_stmt.id = match_id_counter++;
+            query.matches.push_back(std::move(search_stmt));
+            continue;
+        }
         MatchStatement stmt;
         if (match(TokenType::OPTIONAL)) {
             stmt.is_optional = true;
@@ -790,8 +856,10 @@ GqlQuery GqlParser::parse_query() {
         }
     }
 
-    // 2. Parse special CALL CLEAR CACHE utility command
-    if (match(TokenType::CALL)) {
+    // 2. Parse special CALL CLEAR CACHE utility command. Other CALL forms (CALL fts.search(...)) are query
+    // prefixes handled in parse_single_query's statement loop, so only intercept CLEAR CACHE here.
+    if (check(TokenType::CALL) && peek(1).type == TokenType::CLEAR) {
+        advance(); // consume CALL
         consume(TokenType::CLEAR, "Expected 'CLEAR' after 'CALL'");
         consume(TokenType::CACHE, "Expected 'CACHE' after 'CLEAR'");
         GqlQuery query;

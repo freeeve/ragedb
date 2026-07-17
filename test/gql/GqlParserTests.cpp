@@ -970,3 +970,18 @@ TEST_CASE("path mode is accepted after the path variable, not only before it", "
         REQUIRE(q.matches[0].path_mode == PathMode::TRAIL);
     }
 }
+
+TEST_CASE("CALL fts.search(...) YIELD translates to a search match statement", "[gql_parser]") {
+    // spb fts shape: a full-text search prefix binding a node variable, then a follow-on MATCH uses it.
+    auto q = GqlParser::parse(
+        "CALL fts.search('CreativeWork', 'title', 'policy') YIELD node AS w "
+        "MATCH (w)-[:about]->(x) RETURN w");
+    REQUIRE(q.matches.size() >= 2);
+    REQUIRE(q.matches[0].is_search);
+    REQUIRE(q.matches[0].search_type == "CreativeWork");
+    REQUIRE(q.matches[0].search_properties.size() == 1);
+    REQUIRE(q.matches[0].search_properties[0] == "title");
+    REQUIRE(q.matches[0].search_string == "policy");
+    REQUIRE(q.matches[0].yield_var == "w");
+    REQUIRE(q.matches[1].is_search == false);   // the follow-on MATCH
+}

@@ -44,7 +44,7 @@ TEST_CASE("N-Triples loader maps RDF into the property graph", "[ntriples_loader
         if (t) triples.push_back(*t);
     }
 
-    load_ntriples(graph, triples).get();
+    load_ntriples(graph.shard.local(), triples).get();
 
     auto run = [&graph](const std::string& q) {
         auto query = GqlParser::parse(q);
@@ -81,7 +81,7 @@ TEST_CASE("N-Triples file loader reads a file and loads it", "[ntriples_loader]"
     graph.Start().get();
     graph.Clear();
 
-    load_ntriples_file(graph, path).get();
+    load_ntriples_file(graph.shard.local(), path).get();
 
     auto query = GqlParser::parse("MATCH (p:Person) RETURN p.name AS name");
     GqlOptimizer::optimize(query);

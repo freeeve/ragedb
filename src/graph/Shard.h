@@ -1176,6 +1176,8 @@ namespace ragedb {
 
         // Load CSV
         uint64_t LoadCSVViaLua(const std::string &type, const std::string& filename, const sol::optional<char> = CSV_SEPARATOR);
+        // Load RDF (N-Triples/N-Quads); returns the number of nodes created.
+        uint64_t LoadNTriplesViaLua(const std::string &filename);
         uint64_t StreamCSVViaLua(const std::string &type, const std::string& filename, const sol::optional<char> = CSV_SEPARATOR);
         std::pair<std::string, std::vector<std::string>> GetToKeysFromRelationshipsInCSV(const std::string& header, const char csv_separator);
 

@@ -18,7 +18,7 @@
 #define RAGEDB_NTRIPLESLOADER_H
 
 #include "NTriplesParser.h"
-#include "../Graph.h"
+#include "../Shard.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
@@ -88,8 +88,8 @@ namespace ragedb {
      * IRI/blank object becomes a relationship (type = the predicate's local name). Two passes: derive the
      * schema and per-node properties, then declare types before creating nodes and relationships.
      */
-    inline seastar::future<> load_ntriples(Graph &graph, std::vector<NTriple> triples) {  // by value: the
-        using namespace ntriples_detail;                          // coroutine frame owns it past a suspend
+    inline seastar::future<uint64_t> load_ntriples(Shard &shard, std::vector<NTriple> triples) {  // by value:
+        using namespace ntriples_detail;                      // the coroutine frame owns it past a suspend
 
         std::map<std::string, std::string> node_label;                         // iri -> label
         std::set<std::string> node_iris;                                       // subjects + IRI/blank objects
@@ -132,13 +132,13 @@ namespace ragedb {
 
         // Pass 2: declare the schema (types + property types + rel types) before creating any node.
         for (const auto &label : labels) {
-            co_await graph.shard.local().NodeTypeInsertPeered(label);
+            co_await shard.NodeTypeInsertPeered(label);
         }
         for (const auto &[lp, rt] : prop_type) {
-            co_await graph.shard.local().NodePropertyTypeAddPeered(lp.first, lp.second, rt);
+            co_await shard.NodePropertyTypeAddPeered(lp.first, lp.second, rt);
         }
         for (const auto &rel : rel_types) {
-            co_await graph.shard.local().RelationshipTypeInsertPeered(rel);
+            co_await shard.RelationshipTypeInsertPeered(rel);
         }
 
         std::map<std::string, uint64_t> iri_to_id;
@@ -154,7 +154,7 @@ namespace ragedb {
                 }
             }
             json += "}";
-            uint64_t id = co_await graph.shard.local().NodeAddPeered(label_of(iri), iri, json);
+            uint64_t id = co_await shard.NodeAddPeered(label_of(iri), iri, json);
             iri_to_id[iri] = id;
         }
 
@@ -162,20 +162,20 @@ namespace ragedb {
             auto f = iri_to_id.find(e.subj);
             auto o = iri_to_id.find(e.obj);
             if (f == iri_to_id.end() || o == iri_to_id.end()) continue;
-            co_await graph.shard.local().RelationshipAddPeered(e.rel, f->second, o->second, "{}");
+            co_await shard.RelationshipAddPeered(e.rel, f->second, o->second, "{}");
         }
-        co_return;
+        co_return static_cast<uint64_t>(iri_to_id.size());  // nodes created
     }
 
     /**
      * @brief Read an N-Triples/N-Quads file line by line and load it. A one-time bulk load, so a blocking
      * read (as in the CSV loader) is acceptable; the two-pass mapping needs all triples in memory to derive
-     * the schema before creating nodes. `graph` must outlive the returned future.
+     * the schema before creating nodes. `shard` must outlive the returned future.
      */
-    inline seastar::future<> load_ntriples_file(Graph &graph, const std::string &path) {
+    inline seastar::future<uint64_t> load_ntriples_file(Shard &shard, const std::string &path) {
         std::ifstream in(path);
         if (!in) {
-            return seastar::make_exception_future<>(std::runtime_error("load_ntriples: cannot open " + path));
+            return seastar::make_exception_future<uint64_t>(std::runtime_error("load_ntriples: cannot open " + path));
         }
         std::vector<NTriple> triples;
         std::string line;
@@ -183,7 +183,7 @@ namespace ragedb {
             auto t = parse_ntriple_line(line);
             if (t) triples.push_back(std::move(*t));
         }
-        return load_ntriples(graph, std::move(triples));
+        return load_ntriples(shard, std::move(triples));
     }
 
 } // namespace ragedb

@@ -63,6 +63,7 @@ set(SOURCE_FILES
         lua/Traversing.cpp peered/Traversing.cpp shard/Traversing.cpp
         lua/Types.cpp peered/Types.cpp shard/Types.cpp
         lua/LoadCSV.cpp peered/LoadCSV.cpp shard/LoadCSV.cpp
+        lua/LoadNTriples.cpp # RDF loader (header-only core in types/NTriplesLoader.h)
         lua/ShortestPath.cpp peered/ShortestPath.cpp
 
         node/Find.cpp relationship/Find.cpp

@@ -331,6 +331,7 @@ GqlValue evaluate_scalar_function_with(const FunctionCallExpr* fc,
         fc->name == "localdatetime") {
         if (fc->args.size() != 1) return GqlValue();
         GqlValue arg = eval_arg(fc->args[0].get());
+        int64_t ms;
         if (arg.type == GqlValue::PROPERTY && std::holds_alternative<std::string>(arg.property)) {
             std::string s = std::get<std::string>(arg.property);
             if (s.find('T') == std::string::npos) {
@@ -339,9 +340,21 @@ GqlValue evaluate_scalar_function_with(const FunctionCallExpr* fc,
                 else s += "T00:00:00";
             }
             double seconds = Date::convert(s);
-            return GqlValue(static_cast<int64_t>(std::llround(seconds * 1000.0)));
+            ms = static_cast<int64_t>(std::llround(seconds * 1000.0));
+        } else if (arg.type == GqlValue::PROPERTY && std::holds_alternative<int64_t>(arg.property)) {
+            // Applied to an already-epoch-ms value, e.g. date(message.creationDate): reuse it directly
+            // rather than returning null (which silently dropped every date-filtered row).
+            ms = std::get<int64_t>(arg.property);
+        } else {
+            return GqlValue();
         }
-        return GqlValue();
+        // date() is day-resolution: truncate to the start of the UTC day. The datetime variants keep the
+        // full timestamp.
+        if (fc->name == "date") {
+            const int64_t day_ms = 86400000LL;
+            ms -= ((ms % day_ms) + day_ms) % day_ms;  // floor to midnight, correct for negatives too
+        }
+        return GqlValue(ms);
     }
 
     // ---- paths -------------------------------------------------------------------------------------

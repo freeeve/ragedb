@@ -212,6 +212,16 @@ TEST_CASE("scalar function library", "[gql_executor_functions]") {
         REQUIRE(res.find("\"x\": 2") != std::string::npos);   // range(0,4)[2] == 2
     }
 
+    SECTION("date() truncates to the day (accepts an epoch-ms value, not only a string)") {
+        std::string res = run(
+            "MATCH (a:Person) FILTER a.name = 'Bob' "
+            "RETURN date(zoned_datetime('2011-01-15T12:30:00')) = date(zoned_datetime('2011-01-15T23:59:00')) AS sameDay, "
+            "       date(zoned_datetime('2011-01-15T12:30:00')) = date(zoned_datetime('2011-01-16T00:00:00')) AS diffDay");
+        INFO("result: " << res);
+        REQUIRE(res.find("\"sameDay\": true") != std::string::npos);   // both truncate to 2011-01-15
+        REQUIRE(res.find("\"diffDay\": false") != std::string::npos);  // different days
+    }
+
     SECTION("list comprehension and quantified predicates all/any/none/single") {
         std::string res = run(
             "MATCH (a:Person) FILTER a.name = 'Bob' "

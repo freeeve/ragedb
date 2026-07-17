@@ -750,6 +750,33 @@ void GqlTypechecker::check_segment_body(const GqlQuery& query) {
         return;
     }
 
+    // Scoped subquery `CALL (imports) { ... }`: validate the subquery seeing only the imported outer
+    // variables, then expose its projected output columns to this segment (as ANY, since a UNION body's
+    // branch types are checked in their own scopes). This lets the segment's own RETURN reference them.
+    if (query.call_subquery) {
+        GqlTypechecker sub_tc(graph);
+        for (const auto& v : query.call_import_vars) {
+            auto it = env.find(v);
+            if (it != env.end()) sub_tc.env[v] = it->second;
+        }
+        sub_tc.check_query(*query.call_subquery);
+        const GqlQuery* branch = query.call_subquery.get();
+        while (branch->kind != QueryKind::SINGLE && branch->left) {
+            branch = branch->left.get();
+        }
+        for (const auto& item : branch->returns) {
+            std::string name;
+            if (item.alias) {
+                name = *item.alias;
+            } else if (item.expr && item.expr->kind == ExpressionKind::VARIABLE) {
+                name = static_cast<const VariableExpr*>(item.expr.get())->name;
+            }
+            if (!name.empty()) {
+                meet_variable(name, GqlType::ANY, {});
+            }
+        }
+    }
+
     // Process all MATCH patterns first to populate variables in env
     for (const auto& match : query.matches) {
         if (match.is_propagate) {

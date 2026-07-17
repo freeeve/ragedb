@@ -224,6 +224,37 @@ static seastar::future<std::vector<GqlRow>> execute_with_segments(
 }
 
 /**
+ * @brief Execute a scoped subquery `CALL (imports) { ... }` once per incoming row, importing only the
+ *        named variables into the subquery's scope, and return all its result rows unioned together.
+ *        Runs sequentially over incoming rows (idx..) accumulating into `acc`; each invocation clones the
+ *        subquery because execute_query_internal takes ownership of and mutates its query.
+ */
+static seastar::future<std::vector<GqlRow>> execute_call_subquery(
+        ragedb::Graph& graph, std::shared_ptr<GqlQuery> subquery, std::vector<std::string> imports,
+        std::shared_ptr<std::vector<GqlRow>> in_rows, size_t idx, std::shared_ptr<std::vector<GqlRow>> acc) {
+    if (idx >= in_rows->size()) {
+        return seastar::make_ready_future<std::vector<GqlRow>>(std::move(*acc));
+    }
+    // Import isolation: the subquery sees only the named outer variables, bound from this incoming row.
+    GqlRow imported;
+    for (const auto& v : imports) {
+        auto it = (*in_rows)[idx].bindings.find(v);
+        if (it != (*in_rows)[idx].bindings.end()) {
+            imported.bindings[v] = it->second;
+        }
+    }
+    auto sub_clone = std::make_shared<GqlQuery>(subquery->clone());
+    std::vector<GqlRow> single{std::move(imported)};
+    return execute_query_internal(graph, sub_clone, std::optional<std::vector<GqlRow>>(std::move(single)))
+        .then([&graph, subquery, imports = std::move(imports), in_rows, idx, acc](QueryResult res) mutable {
+            for (auto& r : query_result_to_rows(std::move(res))) {
+                acc->push_back(std::move(r));
+            }
+            return execute_call_subquery(graph, subquery, std::move(imports), in_rows, idx + 1, acc);
+        });
+}
+
+/**
  * @brief Derive the grouping-key expressions for an aggregate query, and collect the group variables.
  *        With an explicit GROUP BY the keys are its variables; otherwise a bare non-aggregate returned
  *        variable groups by the whole entity and a property lookup on such a variable is not a separate
@@ -505,6 +536,25 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
         });
     }
 
+    // Scoped subquery `CALL (imports) { <subquery> }`: this segment is sourced by running the nested
+    // subquery once per incoming row (importing only the named variables), unioning its result rows, then
+    // projecting them through this segment's own RETURN/GROUP BY/ORDER BY/LIMIT. The projection is a
+    // matchless re-entry (call_subquery cleared) -- the same pure-projection path a WITH final segment uses.
+    if (query_ptr->call_subquery) {
+        auto in_rows = std::make_shared<std::vector<GqlRow>>(
+            incoming.has_value() ? std::move(*incoming) : std::vector<GqlRow>{GqlRow{}});
+        auto sub = query_ptr->call_subquery;
+        auto imports = query_ptr->call_import_vars;
+        auto acc = std::make_shared<std::vector<GqlRow>>();
+        return execute_call_subquery(graph, sub, std::move(imports), in_rows, 0, acc)
+            .then([&graph, query_ptr](std::vector<GqlRow> sub_rows) {
+                auto proj = std::make_shared<GqlQuery>(query_ptr->clone());
+                proj->call_subquery = nullptr;
+                proj->call_import_vars.clear();
+                return execute_query_internal(graph, proj, std::optional<std::vector<GqlRow>>(std::move(sub_rows)));
+            });
+    }
+
     // 1. Handle Set Operations (UNION, INTERSECT, EXCEPT, each with an optional ALL)
     if (query_ptr->kind != QueryKind::SINGLE) {
         // Release ownership of subqueries to execute them separately
@@ -536,12 +586,16 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
 
         // Start timing the set operation
         auto start = std::chrono::steady_clock::now();
-        
+
+        // A set operation used as a scoped-subquery body receives the imported rows; run each branch over
+        // them. A top-level set operation has no incoming, so both branches see nullopt exactly as before.
+        std::optional<std::vector<GqlRow>> inc_right = incoming;
+
         // Execute the left subquery first
-        return execute_query_internal(graph, left_ptr)
-        .then([&graph, right_ptr, query_ptr, start](QueryResult left_res) {
+        return execute_query_internal(graph, left_ptr, std::move(incoming))
+        .then([&graph, right_ptr, query_ptr, start, inc_right = std::move(inc_right)](QueryResult left_res) mutable {
             // Then execute the right subquery
-            return execute_query_internal(graph, right_ptr)
+            return execute_query_internal(graph, right_ptr, std::move(inc_right))
             .then([left_res = std::move(left_res), query_ptr, start](QueryResult right_res) {
                 // Ensure column structures match
                 if (left_res.column_names.size() != right_res.column_names.size()) {

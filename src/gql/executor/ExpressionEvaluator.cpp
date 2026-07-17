@@ -99,6 +99,9 @@ bool has_aggregates(const Expression* expr) {
         auto* qp = static_cast<const QuantifiedPredicateExpr*>(expr);
         return has_aggregates(qp->list.get()) || has_aggregates(qp->predicate.get());
     }
+    if (expr->kind == ExpressionKind::TEMPORAL_FIELD) {
+        return has_aggregates(static_cast<const TemporalFieldExpr*>(expr)->value.get());
+    }
     return false;
 }
 
@@ -165,6 +168,8 @@ void find_aggregates(const Expression* expr, std::vector<const AggregateExpr*>& 
         auto* qp = static_cast<const QuantifiedPredicateExpr*>(expr);
         find_aggregates(qp->list.get(), aggregates);
         find_aggregates(qp->predicate.get(), aggregates);
+    } else if (expr->kind == ExpressionKind::TEMPORAL_FIELD) {
+        find_aggregates(static_cast<const TemporalFieldExpr*>(expr)->value.get(), aggregates);
     }
 }
 
@@ -278,6 +283,12 @@ GqlValue evaluate_group_expression(const GqlRow& representative, const std::map<
                 case QuantifiedPredicateExpr::SINGLE: return GqlValue(matched == 1);
             }
             return GqlValue(false);
+        }
+        case ExpressionKind::TEMPORAL_FIELD: {
+            auto* tf = static_cast<const TemporalFieldExpr*>(expr);
+            GqlValue v = evaluate_group_expression(representative, aggregate_results, tf->value.get());
+            if (v.type != GqlValue::PROPERTY || !std::holds_alternative<int64_t>(v.property)) return GqlValue();
+            return gql_temporal_field(std::get<int64_t>(v.property), tf->field);
         }
         case ExpressionKind::CAST: {
             auto* c = static_cast<const CastExpr*>(expr);

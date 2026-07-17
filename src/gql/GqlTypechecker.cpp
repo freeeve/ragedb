@@ -607,6 +607,11 @@ GqlType GqlTypechecker::check_expression(const Expression& expr) {
             if (qp.predicate) check_expression(*qp.predicate);
             return GqlType::BOOLEAN;
         }
+        case ExpressionKind::TEMPORAL_FIELD: {
+            const auto& tf = static_cast<const TemporalFieldExpr&>(expr);
+            if (tf.value) check_expression(*tf.value);
+            return GqlType::INTEGER;
+        }
     }
     return GqlType::ANY;
 }

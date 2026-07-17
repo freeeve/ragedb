@@ -66,7 +66,8 @@ enum class ExpressionKind {
     LIST_LITERAL,     ///< A list value written out: [a, b, c]
     LIST_INDEX,       ///< List element access: list[index]
     LIST_COMPREHENSION, ///< [x IN list [WHERE pred] [| projection]]
-    QUANTIFIED_PREDICATE ///< all|any|none|single(x IN list WHERE pred)
+    QUANTIFIED_PREDICATE, ///< all|any|none|single(x IN list WHERE pred)
+    TEMPORAL_FIELD    ///< A temporal component accessor: <epoch-ms expr>.year/.month/.day/...
 };
 
 /**
@@ -371,6 +372,23 @@ struct QuantifiedPredicateExpr : public Expression {
     std::unique_ptr<Expression> clone() const override {
         return std::make_unique<QuantifiedPredicateExpr>(quant, variable, list ? list->clone() : nullptr,
                                                          predicate ? predicate->clone() : nullptr);
+    }
+};
+
+/**
+ * @brief Temporal component accessor: <value>.year/.month/.day/.hour/.minute/.second, where <value> is an
+ * epoch-millisecond datetime. Extracts the named UTC calendar/clock field as an integer.
+ */
+struct TemporalFieldExpr : public Expression {
+    std::unique_ptr<Expression> value; ///< The epoch-ms datetime expression.
+    std::string field;                 ///< Lowercased component name (year/month/day/hour/minute/second).
+    TemporalFieldExpr(std::unique_ptr<Expression> v, std::string f) {
+        kind = ExpressionKind::TEMPORAL_FIELD;
+        value = std::move(v);
+        field = std::move(f);
+    }
+    std::unique_ptr<Expression> clone() const override {
+        return std::make_unique<TemporalFieldExpr>(value ? value->clone() : nullptr, field);
     }
 };
 

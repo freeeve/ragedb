@@ -299,6 +299,8 @@ static bool expr_contains_subquery(const Expression* expr) {
             auto* qp = static_cast<const QuantifiedPredicateExpr*>(expr);
             return expr_contains_subquery(qp->list.get()) || expr_contains_subquery(qp->predicate.get());
         }
+        case ExpressionKind::TEMPORAL_FIELD:
+            return expr_contains_subquery(static_cast<const TemporalFieldExpr*>(expr)->value.get());
         default: return false;
     }
 }
@@ -371,6 +373,9 @@ static void collect_subqueries(Expression* expr, std::vector<Expression*>& out, 
             collect_subqueries(qp->predicate.get(), out, next_id, include_exists);
             break;
         }
+        case ExpressionKind::TEMPORAL_FIELD:
+            collect_subqueries(static_cast<TemporalFieldExpr*>(expr)->value.get(), out, next_id, include_exists);
+            break;
         default: break;
     }
 }

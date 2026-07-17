@@ -19,6 +19,7 @@
 #include <seastar/json/json_elements.hh>
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <optional>
 #include <sstream>
@@ -743,6 +744,23 @@ std::optional<std::vector<GqlValue>> as_list_elements(const GqlValue& value) {
     return std::nullopt;
 }
 
+GqlValue gql_temporal_field(int64_t epoch_ms, const std::string& field) {
+    // The value is an epoch-millisecond UTC datetime; extract the requested calendar/clock component.
+    std::chrono::sys_time<std::chrono::milliseconds> tp{std::chrono::milliseconds{epoch_ms}};
+    auto dp = std::chrono::floor<std::chrono::days>(tp);
+    std::chrono::year_month_day ymd{dp};
+    auto tod = tp - dp;  // time since midnight
+    int64_t out;
+    if (field == "year") out = static_cast<int>(ymd.year());
+    else if (field == "month") out = static_cast<unsigned>(ymd.month());
+    else if (field == "day") out = static_cast<unsigned>(ymd.day());
+    else if (field == "hour") out = std::chrono::duration_cast<std::chrono::hours>(tod).count();
+    else if (field == "minute") out = std::chrono::duration_cast<std::chrono::minutes>(tod).count() % 60;
+    else if (field == "second") out = std::chrono::duration_cast<std::chrono::seconds>(tod).count() % 60;
+    else return GqlValue();
+    return GqlValue(out);
+}
+
 GqlValue evaluate_expression(const GqlRow& row, const Expression* expr) {
     if (!expr) return GqlValue();
 
@@ -850,6 +868,12 @@ GqlValue evaluate_expression(const GqlRow& row, const Expression* expr) {
                 case QuantifiedPredicateExpr::SINGLE: result = (matched == 1); break;
             }
             return GqlValue(result);
+        }
+        case ExpressionKind::TEMPORAL_FIELD: {
+            auto* tf = static_cast<const TemporalFieldExpr*>(expr);
+            GqlValue v = evaluate_expression(row, tf->value.get());
+            if (v.type != GqlValue::PROPERTY || !std::holds_alternative<int64_t>(v.property)) return GqlValue();
+            return gql_temporal_field(std::get<int64_t>(v.property), tf->field);
         }
         case ExpressionKind::CAST: {
             auto* c = static_cast<const CastExpr*>(expr);

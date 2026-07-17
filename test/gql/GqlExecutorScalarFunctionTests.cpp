@@ -212,6 +212,20 @@ TEST_CASE("scalar function library", "[gql_executor_functions]") {
         REQUIRE(res.find("\"x\": 2") != std::string::npos);   // range(0,4)[2] == 2
     }
 
+    SECTION("temporal field accessors .year/.month/.day/.hour on an epoch-ms datetime") {
+        std::string res = run(
+            "MATCH (a:Person) FILTER a.name = 'Bob' "
+            "RETURN zoned_datetime('2011-03-15T10:20:30').year AS y, "
+            "       zoned_datetime('2011-03-15T10:20:30').month AS mo, "
+            "       zoned_datetime('2011-03-15T10:20:30').day AS d, "
+            "       zoned_datetime('2011-03-15T10:20:30').hour AS h");
+        INFO("res: " << res);
+        REQUIRE(res.find("\"y\": 2011") != std::string::npos);
+        REQUIRE(res.find("\"mo\": 3") != std::string::npos);
+        REQUIRE(res.find("\"d\": 15") != std::string::npos);
+        REQUIRE(res.find("\"h\": 10") != std::string::npos);
+    }
+
     SECTION("date() truncates to the day (accepts an epoch-ms value, not only a string)") {
         std::string res = run(
             "MATCH (a:Person) FILTER a.name = 'Bob' "

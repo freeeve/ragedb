@@ -218,6 +218,11 @@ static std::unique_ptr<Expression> substitute_return_aliases(
             if (qp->predicate) qp->predicate = substitute_return_aliases(std::move(qp->predicate), aliases);
             return expr;
         }
+        case ExpressionKind::TEMPORAL_FIELD: {
+            auto* tf = static_cast<TemporalFieldExpr*>(expr.get());
+            tf->value = substitute_return_aliases(std::move(tf->value), aliases);
+            return expr;
+        }
         default:
             return expr;
     }
@@ -1624,13 +1629,32 @@ std::unique_ptr<Expression> GqlParser::parse_unary() {
         return std::make_unique<UnaryOpExpr>(UnaryOpKind::NEG, std::move(right));
     }
     auto expr = parse_primary();
-    // Postfix list subscript: expr[index], chainable (expr[i][j]). A '[' at the head of a primary is a
-    // list literal (handled in parse_primary); a '[' following a primary is an element access.
-    while (check(TokenType::LBRACKET)) {
-        advance(); // consume '['
-        auto index = parse_expression();
-        consume(TokenType::RBRACKET, "Expected ']' after list index");
-        expr = std::make_unique<IndexExpr>(std::move(expr), std::move(index));
+    // Postfix operators after a primary: list subscript expr[index] (a '[' at the head of a primary is a
+    // list literal, handled in parse_primary; a '[' after a primary is an element access), and a temporal
+    // component accessor expr.year/.month/.day/... -- a second '.' following a property lookup, restricted
+    // to known temporal field names so an ordinary chained '.' is unaffected.
+    auto is_temporal_field = [](const std::string& n) {
+        std::string ln;
+        for (char c : n) ln += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return ln == "year" || ln == "month" || ln == "day" ||
+               ln == "hour" || ln == "minute" || ln == "second";
+    };
+    while (true) {
+        if (check(TokenType::LBRACKET)) {
+            advance(); // consume '['
+            auto index = parse_expression();
+            consume(TokenType::RBRACKET, "Expected ']' after list index");
+            expr = std::make_unique<IndexExpr>(std::move(expr), std::move(index));
+        } else if (check(TokenType::DOT) && peek(1).type == TokenType::NAME &&
+                   is_temporal_field(peek(1).text)) {
+            advance(); // '.'
+            std::string field;
+            for (char c : peek().text) field += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            advance(); // field name
+            expr = std::make_unique<TemporalFieldExpr>(std::move(expr), std::move(field));
+        } else {
+            break;
+        }
     }
     return expr;
 }

@@ -574,6 +574,8 @@ bool is_variable_referenced_outside_count(const Expression* expr, const std::str
             return is_variable_referenced_outside_count(qp->list.get(), var_name) ||
                    is_variable_referenced_outside_count(qp->predicate.get(), var_name);
         }
+        case ExpressionKind::TEMPORAL_FIELD:
+            return is_variable_referenced_outside_count(static_cast<const TemporalFieldExpr*>(expr)->value.get(), var_name);
         default:
             return false;
     }

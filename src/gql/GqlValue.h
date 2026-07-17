@@ -107,6 +107,10 @@ bool matches_filters(const std::map<std::string, property_type_t>& target, const
  */
 GqlValue evaluate_expression(const GqlRow& row, const Expression* expr);
 
+/// Extracts a temporal component (year/month/day/hour/minute/second) from an epoch-millisecond UTC
+/// datetime as an integer; returns NULL for an unrecognized field.
+GqlValue gql_temporal_field(int64_t epoch_ms, const std::string& field);
+
 /**
  * @brief Evaluates a scalar function call (e.g. length(path), zoned_datetime('2010-01-01')) against a
  *        row. Shared by the row and group expression evaluators. The parser rejects any name this does not

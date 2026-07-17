@@ -105,6 +105,9 @@ void collect_accessed_properties(const Expression* expr,
             collect_accessed_properties(qp->predicate.get(), accessed_props, whole_objects);
             break;
         }
+        case ExpressionKind::TEMPORAL_FIELD:
+            collect_accessed_properties(static_cast<const TemporalFieldExpr*>(expr)->value.get(), accessed_props, whole_objects);
+            break;
         case ExpressionKind::IS_LABELED: {
             // The label is read from the entity itself, not from a property, so the operand must survive
             // pruning as a whole object rather than as a property set.

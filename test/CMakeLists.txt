@@ -19,6 +19,7 @@ add_executable(tests tests.cpp shard/ShardIds.cpp shard/Ids.cpp shard/NodeTypes.
         Link.cpp Node.cpp Graph.cpp
         types/Date.cpp
         types/NTriplesParserTests.cpp
+        types/NTriplesLoaderTests.cpp
         gql/GqlTokenizerTests.cpp
         gql/GqlParserTests.cpp
         gql/optimizer/BasicOptimizerTests.cpp

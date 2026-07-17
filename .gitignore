@@ -65,3 +65,6 @@ test/cmake-build-release-coverage/
 # graphify
 graphify-out/cost.json
 graphify-out/cache/
+
+# Local, per-developer Claude context (durable session goal / scratch notes)
+CLAUDE.local.md

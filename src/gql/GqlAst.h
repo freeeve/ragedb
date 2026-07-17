@@ -608,6 +608,15 @@ struct MatchStatement {
     std::map<std::string, std::string> search_options;
     std::string yield_var;
     std::string yield_score_var;
+
+    // algo.propagate parameters: CALL algo.propagate(args...) YIELD node, value, depth.
+    // A value-propagating first-claim BFS whose arguments are correlated expressions (seeds/values are
+    // bound upstream), evaluated per incoming row. shared_ptr keeps MatchStatement copyable (the executor
+    // captures the statement by value); the three output columns bind to yield_var (node),
+    // yield_score_var (value) and yield_depth_var (depth).
+    bool is_propagate = false;
+    std::vector<std::shared_ptr<Expression>> propagate_args;
+    std::string yield_depth_var;
 };
 
 /**

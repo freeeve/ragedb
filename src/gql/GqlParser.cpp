@@ -363,9 +363,51 @@ GqlQuery GqlParser::parse_single_query() {
             if (!check(TokenType::NAME) && !check(TokenType::SEARCH))
                 throw std::runtime_error("Expected a procedure name after '.'");
             advance();
+            // CALL algo.propagate(seeds, values, relTypes, direction, maxDepth, valueProp, order, cap)
+            //   YIELD node [AS a], value [AS b], depth [AS c]
+            // A value-propagating first-claim BFS. The arguments are correlated expressions (the seed
+            // list and value list are bound upstream), so parse each as a full expression; the executor
+            // evaluates them per incoming row. The three output columns are fixed (node, value, depth).
+            if (ns == "algo" && proc == "propagate") {
+                MatchStatement prop_stmt;
+                prop_stmt.is_propagate = true;
+                consume(TokenType::LPAREN, "Expected '(' after algo.propagate");
+                while (!check(TokenType::RPAREN)) {
+                    prop_stmt.propagate_args.push_back(std::shared_ptr<Expression>(parse_expression().release()));
+                    if (!match(TokenType::COMMA)) break;
+                }
+                consume(TokenType::RPAREN, "Expected ')' after algo.propagate arguments");
+                consume(TokenType::YIELD, "Expected 'YIELD' after algo.propagate(...)");
+                // Fixed output columns node/value/depth, order-independent, each optionally aliased with AS.
+                // 'node' lexes as the NODE keyword; 'value' and 'depth' lex as NAME.
+                bool got_col = false;
+                while (true) {
+                    std::string col;
+                    if (check(TokenType::NODE)) { col = "node"; advance(); }
+                    else if (check(TokenType::NAME)) { col = peek().text; advance(); }
+                    else break;
+                    std::string lcol = lower(col);
+                    std::string bindv = col;
+                    if (match(TokenType::AS)) {
+                        bindv = peek().text;
+                        consume(TokenType::NAME, "Expected alias after AS");
+                    }
+                    if (lcol == "node") prop_stmt.yield_var = bindv;
+                    else if (lcol == "value") prop_stmt.yield_score_var = bindv;
+                    else if (lcol == "depth") prop_stmt.yield_depth_var = bindv;
+                    else throw std::runtime_error("Unknown algo.propagate YIELD column: " + col);
+                    got_col = true;
+                    if (!match(TokenType::COMMA)) break;
+                }
+                if (!got_col)
+                    throw std::runtime_error("Expected YIELD columns after algo.propagate(...)");
+                prop_stmt.id = match_id_counter++;
+                query.matches.push_back(std::move(prop_stmt));
+                continue;
+            }
             if (ns != "fts" || proc != "search") {
                 throw std::runtime_error("Unsupported CALL procedure: " + ns + "." + proc +
-                                         " (only fts.search is supported)");
+                                         " (only fts.search or algo.propagate are supported)");
             }
             MatchStatement search_stmt;
             search_stmt.is_search = true;

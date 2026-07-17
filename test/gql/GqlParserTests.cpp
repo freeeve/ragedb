@@ -985,3 +985,30 @@ TEST_CASE("CALL fts.search(...) YIELD translates to a search match statement", "
     REQUIRE(q.matches[0].yield_var == "w");
     REQUIRE(q.matches[1].is_search == false);   // the follow-on MATCH
 }
+
+TEST_CASE("CALL algo.propagate(...) YIELD parses into a propagate match statement", "[gql_parser]") {
+    // finbench CR8 shape: a value-propagating first-claim BFS over correlated seed/value lists, then
+    // a follow-on RETURN reads the three yielded columns (node, value, depth).
+    auto q = GqlParser::parse(
+        "CALL algo.propagate(seeds, vals, ['transfer', 'withdraw'], 'out', 3, 'amount', 'asc', 10000) "
+        "YIELD node AS dst, value AS inflow, depth AS dist "
+        "RETURN dst.id AS dstId");
+    REQUIRE(q.matches.size() >= 1);
+    REQUIRE(q.matches[0].is_propagate);
+    REQUIRE(q.matches[0].is_search == false);
+    REQUIRE(q.matches[0].propagate_args.size() == 8);
+    REQUIRE(q.matches[0].yield_var == "dst");
+    REQUIRE(q.matches[0].yield_score_var == "inflow");
+    REQUIRE(q.matches[0].yield_depth_var == "dist");
+}
+
+TEST_CASE("CALL algo.propagate YIELD columns are order-independent and default to their names", "[gql_parser]") {
+    auto q = GqlParser::parse(
+        "CALL algo.propagate(s, v, ['t'], 'out', 2, 'amount', 'desc', 0) "
+        "YIELD depth, node, value "
+        "RETURN node");
+    REQUIRE(q.matches[0].is_propagate);
+    REQUIRE(q.matches[0].yield_var == "node");
+    REQUIRE(q.matches[0].yield_score_var == "value");
+    REQUIRE(q.matches[0].yield_depth_var == "depth");
+}

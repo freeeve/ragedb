@@ -2014,6 +2014,51 @@ std::unique_ptr<Expression> GqlParser::parse_primary() {
                 
                 consume(TokenType::RPAREN, "Expected ')' after size expression");
                 return std::make_unique<SizeExpr>(std::move(matches), std::move(sub_where));
+            } else if (upper_name == "DURATION") {
+                advance(); // consume "duration"
+                consume(TokenType::LPAREN, "Expected '(' after duration");
+                if (check(TokenType::LBRACE)) {
+                    // Map form duration({hours: 4, minutes: 30, ...}): fixed unit keys and numeric-literal
+                    // values, so fold to a millisecond count at parse time (the string form is evaluated at
+                    // runtime; both yield an integer count of milliseconds).
+                    advance(); // '{'
+                    int64_t ms = 0;
+                    if (!check(TokenType::RBRACE)) {
+                        do {
+                            std::string unit = peek().text;
+                            std::transform(unit.begin(), unit.end(), unit.begin(),
+                                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                            consume(TokenType::NAME, "Expected a duration unit key");
+                            consume(TokenType::COLON, "Expected ':' after a duration unit");
+                            bool neg = match(TokenType::MINUS);
+                            double num;
+                            if (check(TokenType::NUMBER)) { num = static_cast<double>(peek().int_value); advance(); }
+                            else if (check(TokenType::FLOAT_LIT)) { num = peek().float_value; advance(); }
+                            else throw std::runtime_error("Expected a numeric value for duration unit '" + unit + "'");
+                            if (neg) num = -num;
+                            double unit_ms;
+                            if (unit == "years") unit_ms = 365.0 * 86400000.0;
+                            else if (unit == "months") unit_ms = 30.0 * 86400000.0;
+                            else if (unit == "weeks") unit_ms = 7.0 * 86400000.0;
+                            else if (unit == "days") unit_ms = 86400000.0;
+                            else if (unit == "hours") unit_ms = 3600000.0;
+                            else if (unit == "minutes") unit_ms = 60000.0;
+                            else if (unit == "seconds") unit_ms = 1000.0;
+                            else if (unit == "milliseconds") unit_ms = 1.0;
+                            else throw std::runtime_error("Unknown duration unit '" + unit + "'");
+                            ms += static_cast<int64_t>(num * unit_ms);
+                        } while (match(TokenType::COMMA));
+                    }
+                    consume(TokenType::RBRACE, "Expected '}' to close the duration map");
+                    consume(TokenType::RPAREN, "Expected ')' after duration");
+                    return std::make_unique<LiteralExpr>(ms);
+                }
+                // String form duration('P100D'): evaluated at runtime by the duration scalar function.
+                auto darg = parse_expression();
+                consume(TokenType::RPAREN, "Expected ')' after duration argument");
+                std::vector<std::unique_ptr<Expression>> dargs;
+                dargs.push_back(std::move(darg));
+                return std::make_unique<FunctionCallExpr>("duration", std::move(dargs));
             } else {
                 // Generic scalar function call: name ( arg, ... ) -- e.g. length(p),
                 // zoned_datetime('2010-01-01'). Dispatched by name in the evaluator/typechecker.

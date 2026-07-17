@@ -238,6 +238,17 @@ TEST_CASE("scalar function library", "[gql_executor_functions]") {
         REQUIRE(res.find("\"minus2h\": true") != std::string::npos);
     }
 
+    SECTION("duration({...}) map form folds to milliseconds at parse time") {
+        std::string res = run(
+            "MATCH (a:Person) FILTER a.name = 'Bob' "
+            "RETURN duration({hours: 4}) AS h, duration({days: 1, hours: 2}) AS d, "
+            "       (zoned_datetime('2011-01-01T00:00:00') + duration({days: 1}) = zoned_datetime('2011-01-02T00:00:00')) AS nextDay");
+        INFO("res: " << res);
+        REQUIRE(res.find("\"h\": 14400000") != std::string::npos);   // 4 hours
+        REQUIRE(res.find("\"d\": 93600000") != std::string::npos);   // 1 day + 2 hours
+        REQUIRE(res.find("\"nextDay\": true") != std::string::npos);
+    }
+
     SECTION("date() truncates to the day (accepts an epoch-ms value, not only a string)") {
         std::string res = run(
             "MATCH (a:Person) FILTER a.name = 'Bob' "

@@ -21,6 +21,8 @@
 #include "../../src/gql/GqlParser.h"
 #include "../../src/gql/GqlOptimizer.h"
 #include "../../src/gql/GqlExecutor.h"
+#include <cstdio>
+#include <fstream>
 
 using namespace ragedb;
 using namespace ragedb::gql;
@@ -64,4 +66,29 @@ TEST_CASE("N-Triples loader maps RDF into the property graph", "[ntriples_loader
     }
 
     graph.Stop().get();
+}
+
+TEST_CASE("N-Triples file loader reads a file and loads it", "[ntriples_loader]") {
+    const std::string path = "/tmp/ragedb_nt_loader_test.nt";
+    {
+        std::ofstream out(path);
+        out << "<http://ex/p/1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://ex/Person> .\n";
+        out << "<http://ex/p/1> <http://ex/name> \"Alice\" .\n";
+        out << "# a comment, then a blank line\n";
+        out << "\n";
+    }
+    auto graph = Graph("nt_file_loader_test");
+    graph.Start().get();
+    graph.Clear();
+
+    load_ntriples_file(graph, path).get();
+
+    auto query = GqlParser::parse("MATCH (p:Person) RETURN p.name AS name");
+    GqlOptimizer::optimize(query);
+    std::string r = GqlExecutor::execute(graph, std::move(query)).get();
+    INFO("result: " << r);
+    REQUIRE(r.find("Alice") != std::string::npos);
+
+    graph.Stop().get();
+    std::remove(path.c_str());
 }

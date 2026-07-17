@@ -23,8 +23,10 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 
+#include <fstream>
 #include <map>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -86,8 +88,8 @@ namespace ragedb {
      * IRI/blank object becomes a relationship (type = the predicate's local name). Two passes: derive the
      * schema and per-node properties, then declare types before creating nodes and relationships.
      */
-    inline seastar::future<> load_ntriples(Graph &graph, const std::vector<NTriple> &triples) {
-        using namespace ntriples_detail;
+    inline seastar::future<> load_ntriples(Graph &graph, std::vector<NTriple> triples) {  // by value: the
+        using namespace ntriples_detail;                          // coroutine frame owns it past a suspend
 
         std::map<std::string, std::string> node_label;                         // iri -> label
         std::set<std::string> node_iris;                                       // subjects + IRI/blank objects
@@ -163,6 +165,25 @@ namespace ragedb {
             co_await graph.shard.local().RelationshipAddPeered(e.rel, f->second, o->second, "{}");
         }
         co_return;
+    }
+
+    /**
+     * @brief Read an N-Triples/N-Quads file line by line and load it. A one-time bulk load, so a blocking
+     * read (as in the CSV loader) is acceptable; the two-pass mapping needs all triples in memory to derive
+     * the schema before creating nodes. `graph` must outlive the returned future.
+     */
+    inline seastar::future<> load_ntriples_file(Graph &graph, const std::string &path) {
+        std::ifstream in(path);
+        if (!in) {
+            return seastar::make_exception_future<>(std::runtime_error("load_ntriples: cannot open " + path));
+        }
+        std::vector<NTriple> triples;
+        std::string line;
+        while (std::getline(in, line)) {
+            auto t = parse_ntriple_line(line);
+            if (t) triples.push_back(std::move(*t));
+        }
+        return load_ntriples(graph, std::move(triples));
     }
 
 } // namespace ragedb

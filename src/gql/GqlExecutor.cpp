@@ -319,8 +319,16 @@ static void collect_subqueries(Expression* expr, std::vector<Expression*>& out, 
         return;
     }
     if (include_exists && expr->kind == ExpressionKind::EXISTS) {
-        static_cast<ExistsExpr*>(expr)->subquery_id = next_id++;
-        out.push_back(expr);
+        auto* ee = static_cast<ExistsExpr*>(expr);
+        // An EXISTS the optimizer already semi-join-rewrote carries a target_variable and is answered by
+        // that binding; only precompute the ones the rewrite did not reach (e.g. an EXISTS inside a CASE
+        // or aggregate argument in a projection, which is a value, not a row filter).
+        if (ee->target_variable.empty()) {
+            ee->subquery_id = next_id++;
+            out.push_back(expr);
+        } else {
+            ee->subquery_id = -1;  // the semi-join binding answers it; clear any id from a prior execution
+        }
         return;
     }
     switch (expr->kind) {
@@ -406,11 +414,7 @@ static void reduce_and_bind(std::shared_ptr<std::vector<GqlRow>> outer, size_t r
 /// label/property filters, LET, and piped nodes -- everything the far-node-blind degree rewrite cannot.
 static seastar::future<std::vector<GqlRow>> precompute_subqueries(
     ragedb::Graph& graph, std::shared_ptr<GqlQuery> query_ptr, std::vector<GqlRow> rows,
-    std::vector<Expression*> roots, bool include_exists) {
-    std::vector<Expression*> subqueries;
-    int64_t next_id = 0;
-    for (auto* r : roots) collect_subqueries(r, subqueries, next_id, include_exists);
-
+    std::vector<Expression*> subqueries) {
     if (subqueries.empty() || rows.empty()) {
         return seastar::make_ready_future<std::vector<GqlRow>>(std::move(rows));
     }
@@ -440,8 +444,12 @@ static seastar::future<std::vector<GqlRow>> precompute_subqueries(
                 traverse_path_pattern(graph, pattern, (*shared_rows)[ri], 0, pruner)
                 .then([&graph, shared_rows, ri, sid, where, is_exists, nested, query_ptr](std::vector<GqlRow> sub_rows) -> seastar::future<> {
                     if (nested) {
-                        std::vector<Expression*> inner{where};
-                        return precompute_subqueries(graph, query_ptr, std::move(sub_rows), std::move(inner), true)
+                        // A nested subquery's own WHERE is never semi-join-rewritten, so collect both
+                        // COUNT{} and EXISTS{} from it (include_exists = true) for the recursive precompute.
+                        std::vector<Expression*> inner;
+                        int64_t inner_id = 0;
+                        collect_subqueries(where, inner, inner_id, /*include_exists=*/true);
+                        return precompute_subqueries(graph, query_ptr, std::move(sub_rows), std::move(inner))
                             .then([shared_rows, ri, sid, where, is_exists](std::vector<GqlRow> resolved) {
                                 reduce_and_bind(shared_rows, ri, sid, where, is_exists, resolved);
                             });
@@ -461,12 +469,17 @@ static seastar::future<std::vector<GqlRow>> precompute_subqueries(
 /// EXISTS inside a collected COUNT{}'s WHERE is picked up by the recursion in precompute_subqueries.
 static seastar::future<std::vector<GqlRow>> precompute_count_subqueries(
     ragedb::Graph& graph, std::shared_ptr<GqlQuery> query_ptr, std::vector<GqlRow> rows) {
-    std::vector<Expression*> roots;
-    for (auto& let : query_ptr->let_bindings) roots.push_back(let.expr.get());
-    for (auto& item : query_ptr->returns) roots.push_back(item.expr.get());
-    if (query_ptr->where_expr) roots.push_back(query_ptr->where_expr.get());
-    for (auto& spec : query_ptr->order_by) roots.push_back(spec.expr.get());
-    return precompute_subqueries(graph, query_ptr, std::move(rows), std::move(roots), /*include_exists=*/false);
+    std::vector<Expression*> subqueries;
+    int64_t next_id = 0;
+    // An EXISTS in LET/RETURN/ORDER BY is a value (e.g. inside CASE or an aggregate argument), never
+    // reached by the WHERE-only semi-join rewrite, so collect it here for precompute (include_exists).
+    // A top-level WHERE EXISTS *is* semi-join-rewritten, so collect only COUNT{} from the WHERE to avoid
+    // double-handling. COUNT{} (SizeExpr) is collected in either case.
+    for (auto& let : query_ptr->let_bindings) collect_subqueries(let.expr.get(), subqueries, next_id, true);
+    for (auto& item : query_ptr->returns) collect_subqueries(item.expr.get(), subqueries, next_id, true);
+    if (query_ptr->where_expr) collect_subqueries(query_ptr->where_expr.get(), subqueries, next_id, false);
+    for (auto& spec : query_ptr->order_by) collect_subqueries(spec.expr.get(), subqueries, next_id, true);
+    return precompute_subqueries(graph, query_ptr, std::move(rows), std::move(subqueries));
 }
 
 static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph, std::shared_ptr<GqlQuery> query_ptr, std::optional<std::vector<GqlRow>> incoming) {

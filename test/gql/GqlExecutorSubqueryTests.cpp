@@ -146,6 +146,18 @@ TEST_CASE("GQL COUNT subquery applies far-node filter and works in LET", "[gql_e
         REQUIRE(r.find("\"c\": 5") != std::string::npos);
     }
 
+    SECTION("EXISTS inside a projection CASE is precomputed, not silently false (spb q9 shape)") {
+        // An EXISTS as a value (inside CASE/aggregate) is not reached by the WHERE-only semi-join rewrite;
+        // it must be precomputed. Before that, both branches evaluated the EXISTS as false.
+        std::string r = run(
+            "MATCH (p:Person {id: 1}) "
+            "RETURN CASE WHEN EXISTS { (p)<-[:HAS_CREATOR]-(:Post) } THEN 1 ELSE 0 END AS created, "
+            "       CASE WHEN EXISTS { (p)-[:HAS_CREATOR]->(:Post) } THEN 1 ELSE 0 END AS authoredBy");
+        INFO("projection exists: " << r);
+        REQUIRE(r.find("\"created\": 1") != std::string::npos);     // p has incoming HAS_CREATOR from Posts
+        REQUIRE(r.find("\"authoredBy\": 0") != std::string::npos);  // no outgoing HAS_CREATOR from p
+    }
+
     guard.stop();
 }
 

@@ -59,7 +59,7 @@ namespace {
 bool expand_virtual_views(GqlQuery& query) {
     bool expanded_any = false;
     for (auto& match : query.matches) {
-        if (match.is_search) continue;
+        if (match.is_search || match.is_propagate) continue;
         
         std::vector<PatternNode> new_nodes;
         std::vector<PatternEdge> new_edges;
@@ -93,9 +93,10 @@ bool expand_virtual_views(GqlQuery& query) {
                 
                 std::set<std::string> view_vars;
                 for (const auto& vm : view_q.matches) {
-                    if (vm.is_search) {
+                    if (vm.is_search || vm.is_propagate) {
                         if (!vm.yield_var.empty()) view_vars.insert(vm.yield_var);
                         if (!vm.yield_score_var.empty()) view_vars.insert(vm.yield_score_var);
+                        if (!vm.yield_depth_var.empty()) view_vars.insert(vm.yield_depth_var);
                     } else {
                         for (const auto& n : vm.pattern.nodes) {
                             if (!n.variable.empty()) view_vars.insert(n.variable);
@@ -530,13 +531,13 @@ void GqlOptimizer::optimize(GqlQuery& query) {
     }
 
     for (auto it = query.matches.begin(); it != query.matches.end(); ) {
-        if (it->is_search) {
+        if (it->is_search || it->is_propagate) {
             ++it;
             continue;
         }
         bool duplicate_found = false;
         for (auto prev_it = query.matches.begin(); prev_it != it; ++prev_it) {
-            if (prev_it->is_search) continue;
+            if (prev_it->is_search || prev_it->is_propagate) continue;
             if (is_equivalent_pattern(it->pattern, prev_it->pattern)) {
                 if (!it->is_optional && prev_it->is_optional) {
                     prev_it->is_optional = false;
@@ -650,7 +651,7 @@ void GqlOptimizer::optimize(GqlQuery& query) {
     }
 
     for (auto& match : query.matches) {
-        if (match.is_search) continue;
+        if (match.is_search || match.is_propagate) continue;
         for (auto& node : match.pattern.nodes) {
             if (node.where_expr) {
                 std::map<std::string, std::vector<PropertyFilter>> node_pushdowns;
@@ -691,7 +692,7 @@ void GqlOptimizer::optimize(GqlQuery& query) {
     if (pushdowns.empty()) return;
 
     for (auto& match : query.matches) {
-        if (match.is_search) continue;
+        if (match.is_search || match.is_propagate) continue;
         for (auto& node : match.pattern.nodes) {
             if (!node.variable.empty()) {
                 auto it = pushdowns.find(node.variable);
@@ -935,7 +936,7 @@ void GqlOptimizer::optimize(ragedb::Graph& graph, GqlQuery& query) {
         if (!query.matches.empty()) reorder_matches_by_cost(graph, query.matches, incoming, var_labels);
 
         for (auto& match : query.matches) {
-            if (match.is_search) continue;
+            if (match.is_search || match.is_propagate) continue;
             auto& pattern = match.pattern;
             if (pattern.nodes.size() >= 2) {
                 bool start_node_idx = has_node_index_seek(graph, pattern.nodes.front());

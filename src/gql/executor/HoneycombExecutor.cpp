@@ -197,7 +197,7 @@ seastar::future<IntermediateResult> HoneycombExecutor::execute(
     std::vector<std::vector<std::string>> node_vars(matches.size());
     std::vector<std::vector<std::string>> edge_vars(matches.size());
     for (size_t m_idx = 0; m_idx < matches.size(); ++m_idx) {
-        if (matches[m_idx].is_search) continue;
+        if (matches[m_idx].is_search || matches[m_idx].is_propagate) continue;
         node_vars[m_idx].resize(matches[m_idx].pattern.nodes.size());
         for (size_t n_idx = 0; n_idx < matches[m_idx].pattern.nodes.size(); ++n_idx) {
             std::string nv = matches[m_idx].pattern.nodes[n_idx].variable;
@@ -226,7 +226,7 @@ seastar::future<IntermediateResult> HoneycombExecutor::execute(
     std::vector<RelationMeta> rel_metas;
 
     for (size_t m_idx = 0; m_idx < matches.size(); ++m_idx) {
-        if (matches[m_idx].is_search) continue;
+        if (matches[m_idx].is_search || matches[m_idx].is_propagate) continue;
         const auto& pattern = matches[m_idx].pattern;
         for (size_t e_idx = 0; e_idx < pattern.edges.size(); ++e_idx) {
             const auto& edge = pattern.edges[e_idx];
@@ -266,7 +266,7 @@ seastar::future<IntermediateResult> HoneycombExecutor::execute(
     .then([&graph, rel_metas, matches, limit, node_vars, edge_vars](std::vector<std::vector<Relationship>> all_rels) {
         std::unordered_map<std::string, uint16_t> var_type_ids;
         for (size_t m_idx = 0; m_idx < matches.size(); ++m_idx) {
-            if (matches[m_idx].is_search) continue;
+            if (matches[m_idx].is_search || matches[m_idx].is_propagate) continue;
             for (size_t n_idx = 0; n_idx < matches[m_idx].pattern.nodes.size(); ++n_idx) {
                 const auto& node = matches[m_idx].pattern.nodes[n_idx];
                 if (node.label_expr && node.label_expr->kind == LabelExprKind::LITERAL) {
@@ -331,7 +331,7 @@ seastar::future<IntermediateResult> HoneycombExecutor::execute(
         std::vector<std::string> global_vars;
         std::set<std::string> seen_vars;
         for (size_t m_idx = 0; m_idx < matches.size(); ++m_idx) {
-            if (matches[m_idx].is_search) continue;
+            if (matches[m_idx].is_search || matches[m_idx].is_propagate) continue;
             for (const auto& nv : node_vars[m_idx]) {
                 if (seen_vars.insert(nv).second) {
                     global_vars.push_back(nv);

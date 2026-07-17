@@ -488,7 +488,7 @@ static bool is_query_cyclic(const std::vector<MatchStatement>& matches) {
     
     for (size_t m_idx = 0; m_idx < matches.size(); ++m_idx) {
         const auto& match = matches[m_idx];
-        if (match.is_search) continue;
+        if (match.is_search || match.is_propagate) continue;
         const auto& pattern = match.pattern;
         for (size_t i = 0; i < pattern.edges.size(); ++i) {
             std::string u = pattern.nodes[i].variable;
@@ -542,7 +542,7 @@ static std::shared_ptr<PlanNode> build_single_query_plan(ragedb::Graph& graph, c
     if (is_query_cyclic(query.matches)) {
         uint64_t total_rels = 0;
         for (const auto& match : query.matches) {
-            if (match.is_search) continue;
+            if (match.is_search || match.is_propagate) continue;
             for (const auto& edge : match.pattern.edges) {
                 std::string rel_type = "";
                 if (edge.label_expr && edge.label_expr->kind == LabelExprKind::LITERAL) {
@@ -584,7 +584,7 @@ static std::shared_ptr<PlanNode> build_single_query_plan(ragedb::Graph& graph, c
         
         std::set<std::string> vars;
         for (const auto& match : query.matches) {
-            if (match.is_search) continue;
+            if (match.is_search || match.is_propagate) continue;
             for (const auto& node : match.pattern.nodes) {
                 if (!node.variable.empty()) vars.insert(node.variable);
             }
@@ -605,7 +605,7 @@ static std::shared_ptr<PlanNode> build_single_query_plan(ragedb::Graph& graph, c
         
         std::set<std::string> vars;
         for (const auto& match : query.matches) {
-            if (match.is_search) continue;
+            if (match.is_search || match.is_propagate) continue;
             for (const auto& node : match.pattern.nodes) {
                 if (!node.variable.empty()) vars.insert(node.variable);
             }

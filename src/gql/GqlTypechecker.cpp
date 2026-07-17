@@ -488,7 +488,11 @@ GqlType GqlTypechecker::check_expression(const Expression& expr) {
             const auto& exists = static_cast<const ExistsExpr&>(expr);
             auto parent_env = this->env;
             for (const auto& match : exists.matches) {
-                if (match.is_search) {
+                if (match.is_propagate) {
+                    meet_variable(match.yield_var, GqlType::NODE, {});
+                    if (!match.yield_score_var.empty()) meet_variable(match.yield_score_var, GqlType::DOUBLE, {});
+                    if (!match.yield_depth_var.empty()) meet_variable(match.yield_depth_var, GqlType::INTEGER, {});
+                } else if (match.is_search) {
                     bool is_node = graph.shard.local().NodeTypesGet().count(match.search_type) > 0;
                     bool is_rel = graph.shard.local().RelationshipTypesGet().count(match.search_type) > 0;
                     if (!is_node && !is_rel) {
@@ -748,7 +752,12 @@ void GqlTypechecker::check_segment_body(const GqlQuery& query) {
 
     // Process all MATCH patterns first to populate variables in env
     for (const auto& match : query.matches) {
-        if (match.is_search) {
+        if (match.is_propagate) {
+            // algo.propagate yields a node, a double value and an integer depth.
+            meet_variable(match.yield_var, GqlType::NODE, {});
+            if (!match.yield_score_var.empty()) meet_variable(match.yield_score_var, GqlType::DOUBLE, {});
+            if (!match.yield_depth_var.empty()) meet_variable(match.yield_depth_var, GqlType::INTEGER, {});
+        } else if (match.is_search) {
             bool is_node = graph.shard.local().NodeTypesGet().count(match.search_type) > 0;
             bool is_rel = graph.shard.local().RelationshipTypesGet().count(match.search_type) > 0;
             if (!is_node && !is_rel) {

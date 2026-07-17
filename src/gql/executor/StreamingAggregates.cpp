@@ -383,7 +383,7 @@ seastar::future<QueryResult> run_streaming_edge_aggregate(
  *        expansion-heavy ones that OOM when collected (tasks 018/020).
  */
 static bool match_streamable(const MatchStatement& m) {
-    if (m.is_optional || m.is_search || m.is_khop) return false;
+    if (m.is_optional || m.is_search || m.is_propagate || m.is_khop) return false;
     if (m.shortest_path_kind != ShortestPathKind::NONE) return false;
     if (m.algebraic_path_count || m.khop_count_only) return false;
     if (m.equivalence_partition_lookup || m.transitive_reachability_lookup) return false;

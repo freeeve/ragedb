@@ -73,7 +73,7 @@ std::map<std::string, std::map<std::string, property_type_t>> collect_query_equa
     std::map<std::string, std::map<std::string, property_type_t>> equalities;
     
     for (const auto& match : query.matches) {
-        if (match.is_search) continue;
+        if (match.is_search || match.is_propagate) continue;
         for (const auto& node : match.pattern.nodes) {
             if (!node.variable.empty()) {
                 for (const auto& [prop, val] : node.properties) {
@@ -201,7 +201,7 @@ void TransitiveReachabilityPruner::transitive_reachability_pruning_pass(GqlQuery
     auto q_eqs = collect_query_equalities(query);
     
     for (auto& match : query.matches) {
-        if (match.is_search) continue;
+        if (match.is_search || match.is_propagate) continue;
         auto& pattern = match.pattern;
         
         for (size_t i = 0; i < pattern.edges.size(); ++i) {

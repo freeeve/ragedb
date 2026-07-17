@@ -913,7 +913,7 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
         
         for (size_t m_idx = 0; m_idx < matches.size(); ++m_idx) {
             const auto& match = matches[m_idx];
-            if (match.is_search) continue;
+            if (match.is_search || match.is_propagate) continue;
             const auto& pattern = match.pattern;
             for (size_t i = 0; i < pattern.edges.size(); ++i) {
                 std::string u = pattern.nodes[i].variable;
@@ -960,7 +960,7 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
     if (!has_incoming && is_query_cyclic(query_ptr->matches) && query_ptr->count_multiplication_factor <= 1) {
         uint64_t total_rels = 0;
         for (const auto& match : query_ptr->matches) {
-            if (match.is_search) continue;
+            if (match.is_search || match.is_propagate) continue;
             for (const auto& edge : match.pattern.edges) {
                 std::string rel_type = "";
                 if (edge.label_expr && edge.label_expr->kind == LabelExprKind::LITERAL) {

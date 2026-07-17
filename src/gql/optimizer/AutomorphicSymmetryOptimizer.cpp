@@ -53,7 +53,7 @@ void AutomorphicSymmetryOptimizer::automorphic_symmetry_pass(GqlQuery& query) {
     std::vector<TempEdge> edges;
     
     for (const auto& match : query.matches) {
-        if (match.is_search || match.is_khop || match.algebraic_path_count) return;
+        if (match.is_search || match.is_propagate || match.is_khop || match.algebraic_path_count) return;
         
         // Ensure no inline where filters on nodes or edges
         for (const auto& node : match.pattern.nodes) {

@@ -271,7 +271,7 @@ void UniqueJoinEliminator::unique_join_elimination_pass(GqlQuery& query) {
     auto mandatory = find_mandatory_relations();
 
     for (auto& match : query.matches) {
-        if (match.is_search) continue;
+        if (match.is_search || match.is_propagate) continue;
         auto& pattern = match.pattern;
         
         if (pattern.nodes.size() == 2 && pattern.edges.size() == 1) {

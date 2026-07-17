@@ -130,7 +130,7 @@ void LimitPushdownOptimizer::limit_pushdown_pass(GqlQuery& query) {
     bool all_mandatory = true;
     for (size_t i = 1; i < query.matches.size(); ++i) {
         const auto& match = query.matches[i];
-        if (match.is_optional || match.is_search) {
+        if (match.is_optional || match.is_search || match.is_propagate) {
             all_mandatory = false;
             break;
         }

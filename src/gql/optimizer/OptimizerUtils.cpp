@@ -806,9 +806,10 @@ void rewrite_khop_count_to_var(std::unique_ptr<Expression>& expr, const std::str
 
 void collect_variables_from_matches(const std::vector<MatchStatement>& matches, std::set<std::string>& vars) {
     for (const auto& match : matches) {
-        if (match.is_search) {
+        if (match.is_search || match.is_propagate) {
             if (!match.yield_var.empty()) vars.insert(match.yield_var);
             if (!match.yield_score_var.empty()) vars.insert(match.yield_score_var);
+            if (!match.yield_depth_var.empty()) vars.insert(match.yield_depth_var);
         } else {
             for (const auto& node : match.pattern.nodes) {
                 if (!node.variable.empty()) vars.insert(node.variable);

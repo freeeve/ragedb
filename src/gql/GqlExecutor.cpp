@@ -438,6 +438,36 @@ static void reduce_and_bind(std::shared_ptr<std::vector<GqlRow>> outer, size_t r
     }
 }
 
+/// Serialize a bound value into a stable grouping key for correlated-subquery decorrelation. Nodes and
+/// relationships key on their id; scalars on their typed value. Returns false for values that cannot be a
+/// clean grouping key (lists, paths), which makes the caller fall back to the per-row precompute.
+static bool gql_value_group_key(const GqlValue& v, std::string& out) {
+    switch (v.type) {
+        case GqlValue::NODE:
+            if (!v.node) return false;
+            out = "N" + std::to_string(v.node->getId());
+            return true;
+        case GqlValue::RELATIONSHIP:
+            if (!v.relationship) return false;
+            out = "R" + std::to_string(v.relationship->getId());
+            return true;
+        case GqlValue::NIL:
+            out = "z";
+            return true;
+        case GqlValue::PROPERTY: {
+            const auto& p = v.property;
+            if (std::holds_alternative<std::monostate>(p)) { out = "z"; return true; }
+            if (std::holds_alternative<bool>(p)) { out = std::get<bool>(p) ? "b1" : "b0"; return true; }
+            if (std::holds_alternative<int64_t>(p)) { out = "i" + std::to_string(std::get<int64_t>(p)); return true; }
+            if (std::holds_alternative<double>(p)) { out = "d" + std::to_string(std::get<double>(p)); return true; }
+            if (std::holds_alternative<std::string>(p)) { out = "s" + std::get<std::string>(p); return true; }
+            return false;
+        }
+        default:
+            return false;
+    }
+}
+
 /// Correlated subquery precompute. For each row, runs each supported subquery's pattern anchored on the
 /// row's bindings; when the subquery's own WHERE nests a further subquery (e.g. IC10's COUNT{} whose WHERE
 /// holds an EXISTS) it recursively precomputes that over the sub-rows before filtering, so the synchronous
@@ -452,43 +482,107 @@ static seastar::future<std::vector<GqlRow>> precompute_subqueries(
 
     auto shared_rows = std::make_shared<std::vector<GqlRow>>(std::move(rows));
     std::vector<seastar::future<>> futs;
-    for (size_t ri = 0; ri < shared_rows->size(); ++ri) {
-        for (auto* sq : subqueries) {
-            std::vector<MatchStatement>* matches;
-            Expression* where;
-            int64_t sid;
-            bool is_exists;
-            if (sq->kind == ExpressionKind::SIZE_OP) {
-                auto* se = static_cast<SizeExpr*>(sq);
-                matches = &se->matches; where = se->where_expr.get(); sid = se->subquery_id; is_exists = false;
-            } else {
-                auto* ee = static_cast<ExistsExpr*>(sq);
-                matches = &ee->matches; where = ee->where_expr.get(); sid = ee->subquery_id; is_exists = true;
+
+    // Outer variables available on the incoming rows (same schema across rows) -- the set a subquery can
+    // correlate on.
+    std::set<std::string> outer_vars;
+    for (const auto& kv : (*shared_rows)[0].bindings) outer_vars.insert(kv.first);
+
+    for (auto* sq : subqueries) {
+        std::vector<MatchStatement>* matches;
+        Expression* where;
+        int64_t sid;
+        bool is_exists;
+        if (sq->kind == ExpressionKind::SIZE_OP) {
+            auto* se = static_cast<SizeExpr*>(sq);
+            matches = &se->matches; where = se->where_expr.get(); sid = se->subquery_id; is_exists = false;
+        } else {
+            auto* ee = static_cast<ExistsExpr*>(sq);
+            matches = &ee->matches; where = ee->where_expr.get(); sid = ee->subquery_id; is_exists = true;
+        }
+        if (matches->size() != 1) continue;                          // multi-match not yet supported
+        const PathPattern& pattern = (*matches)[0].pattern;
+        ProjectionPruner pruner;   // keep every subquery variable so the WHERE can read properties
+        for (const auto& n : pattern.nodes) if (!n.variable.empty()) pruner.whole_objects.insert(n.variable);
+        for (const auto& e : pattern.edges) if (!e.variable.empty()) pruner.whole_objects.insert(e.variable);
+        const bool nested = where && expr_contains_subquery(where);
+
+        // Decorrelate: the subquery's result depends only on the OUTER variables it reads -- the pattern's
+        // pre-bound anchor variables plus any outer variables its WHERE references. Group the rows by those
+        // and traverse the pattern ONCE per distinct key instead of once per row (O(rows x subquery) ->
+        // O(distinct-keys x subquery)), then bind the shared count/exists to every row in the group. Fall
+        // back to the per-row precompute when the subquery nests a further subquery or a key value is not
+        // groupable, so correctness is never at risk.
+        std::set<std::string> key_vars;
+        for (const auto& n : pattern.nodes) if (!n.variable.empty() && outer_vars.count(n.variable)) key_vars.insert(n.variable);
+        for (const auto& e : pattern.edges) if (!e.variable.empty() && outer_vars.count(e.variable)) key_vars.insert(e.variable);
+        if (where) {
+            std::map<std::string, std::set<std::string>> wprops;
+            std::set<std::string> wwhole;
+            collect_accessed_properties(where, wprops, wwhole);
+            for (const auto& kv : wprops) if (outer_vars.count(kv.first)) key_vars.insert(kv.first);
+            for (const auto& v : wwhole) if (outer_vars.count(v)) key_vars.insert(v);
+        }
+
+        std::unordered_map<std::string, std::vector<size_t>> groups;
+        bool groupable = !nested;
+        for (size_t ri = 0; groupable && ri < shared_rows->size(); ++ri) {
+            std::string ks;
+            for (const auto& kv : key_vars) {
+                auto it = (*shared_rows)[ri].bindings.find(kv);
+                std::string part;
+                if (it == (*shared_rows)[ri].bindings.end() || !gql_value_group_key(it->second, part)) {
+                    groupable = false;
+                    break;
+                }
+                ks += part;
+                ks += '\x1f';
             }
-            if (matches->size() != 1) continue;                          // multi-match not yet supported
-            const PathPattern& pattern = (*matches)[0].pattern;
-            ProjectionPruner pruner;   // keep every subquery variable so the WHERE can read properties
-            for (const auto& n : pattern.nodes) if (!n.variable.empty()) pruner.whole_objects.insert(n.variable);
-            for (const auto& e : pattern.edges) if (!e.variable.empty()) pruner.whole_objects.insert(e.variable);
-            const bool nested = where && expr_contains_subquery(where);
-            futs.push_back(
-                traverse_path_pattern(graph, pattern, (*shared_rows)[ri], 0, pruner)
-                .then([&graph, shared_rows, ri, sid, where, is_exists, nested, query_ptr](std::vector<GqlRow> sub_rows) -> seastar::future<> {
-                    if (nested) {
-                        // A nested subquery's own WHERE is never semi-join-rewritten, so collect both
-                        // COUNT{} and EXISTS{} from it (include_exists = true) for the recursive precompute.
-                        std::vector<Expression*> inner;
-                        int64_t inner_id = 0;
-                        collect_subqueries(where, inner, inner_id, /*include_exists=*/true);
-                        return precompute_subqueries(graph, query_ptr, std::move(sub_rows), std::move(inner))
-                            .then([shared_rows, ri, sid, where, is_exists](std::vector<GqlRow> resolved) {
-                                reduce_and_bind(shared_rows, ri, sid, where, is_exists, resolved);
-                            });
-                    }
-                    reduce_and_bind(shared_rows, ri, sid, where, is_exists, sub_rows);
-                    return seastar::make_ready_future<>();
-                })
-            );
+            if (groupable) groups[ks].push_back(ri);
+        }
+
+        if (groupable) {
+            for (auto& g : groups) {
+                auto idx = std::make_shared<std::vector<size_t>>(g.second);
+                size_t rep = (*idx)[0];
+                futs.push_back(
+                    traverse_path_pattern(graph, pattern, (*shared_rows)[rep], 0, pruner)
+                    .then([shared_rows, idx, sid, where, is_exists](std::vector<GqlRow> sub_rows) {
+                        // The pattern anchors and every WHERE-referenced outer variable are constant across
+                        // the group (they are the key), so the sub-rows and the reduced value are shared.
+                        if (is_exists) {
+                            bool found = false;
+                            for (auto& sr : sub_rows) if (!where || evaluate_expression(sr, where).is_truthy()) { found = true; break; }
+                            for (size_t ri : *idx) (*shared_rows)[ri].bindings["_exists_" + std::to_string(sid)] = GqlValue(found);
+                        } else {
+                            int64_t cnt = 0;
+                            for (auto& sr : sub_rows) if (!where || evaluate_expression(sr, where).is_truthy()) cnt++;
+                            for (size_t ri : *idx) (*shared_rows)[ri].bindings["_count_" + std::to_string(sid)] = GqlValue(property_type_t(cnt));
+                        }
+                    })
+                );
+            }
+        } else {
+            // Per-row fallback: a nested subquery (its own WHERE is never semi-join-rewritten, so it needs
+            // the recursive precompute) or a non-groupable key value.
+            for (size_t ri = 0; ri < shared_rows->size(); ++ri) {
+                futs.push_back(
+                    traverse_path_pattern(graph, pattern, (*shared_rows)[ri], 0, pruner)
+                    .then([&graph, shared_rows, ri, sid, where, is_exists, nested, query_ptr](std::vector<GqlRow> sub_rows) -> seastar::future<> {
+                        if (nested) {
+                            std::vector<Expression*> inner;
+                            int64_t inner_id = 0;
+                            collect_subqueries(where, inner, inner_id, /*include_exists=*/true);
+                            return precompute_subqueries(graph, query_ptr, std::move(sub_rows), std::move(inner))
+                                .then([shared_rows, ri, sid, where, is_exists](std::vector<GqlRow> resolved) {
+                                    reduce_and_bind(shared_rows, ri, sid, where, is_exists, resolved);
+                                });
+                        }
+                        reduce_and_bind(shared_rows, ri, sid, where, is_exists, sub_rows);
+                        return seastar::make_ready_future<>();
+                    })
+                );
+            }
         }
     }
     return seastar::when_all_succeed(futs.begin(), futs.end())

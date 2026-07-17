@@ -202,6 +202,16 @@ TEST_CASE("scalar function library", "[gql_executor_functions]") {
         REQUIRE(res.find("\"r\": 1") != std::string::npos);   // same one KNOWS as relationships(p)
     }
 
+    SECTION("range() builds an inclusive integer list; size() over a list is its cardinality") {
+        std::string res = run(
+            "MATCH (a:Person) FILTER a.name = 'Bob' "
+            "RETURN size(range(1, 5)) AS n, size([10, 20, 30]) AS s, range(0, 4)[2] AS x");
+        INFO("result: " << res);
+        REQUIRE(res.find("\"n\": 5") != std::string::npos);   // range(1,5) = [1,2,3,4,5]
+        REQUIRE(res.find("\"s\": 3") != std::string::npos);   // size of a 3-element list literal
+        REQUIRE(res.find("\"x\": 2") != std::string::npos);   // range(0,4)[2] == 2
+    }
+
     SECTION("list subscript list[i]: 0-based, negative from end, out-of-range -> null") {
         std::string res = run(
             "MATCH (a:Person) FILTER a.name = 'Bob' "

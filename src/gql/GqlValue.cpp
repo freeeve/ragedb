@@ -246,6 +246,7 @@ const std::vector<std::string>& scalar_function_names() {
         "rtrim",
         // lists
         "cardinality",
+        "range",
         // numeric
         "abs",
         "ceil",
@@ -355,6 +356,35 @@ GqlValue evaluate_scalar_function_with(const FunctionCallExpr* fc,
             for (const auto& n : arg.path->GetNodes()) items->push_back(GqlValue(n));
         } else {
             for (const auto& r : arg.path->GetRelationships()) items->push_back(GqlValue(r));
+        }
+        GqlValue out;
+        out.type = GqlValue::LIST;
+        out.list = std::move(items);
+        return out;
+    }
+
+    // ---- lists -------------------------------------------------------------------------------------
+    // range(start, end [, step]): the inclusive integer list [start, start+step, ..., end]. Default step 1;
+    // a negative step counts down. Used e.g. as range(0, size(list)-2) to index adjacent element pairs.
+    if (fc->name == "range") {
+        if (fc->args.size() < 2 || fc->args.size() > 3) return GqlValue();
+        auto a = numeric_arg(eval_arg(fc->args[0].get()));
+        auto b = numeric_arg(eval_arg(fc->args[1].get()));
+        if (!a || !b) return GqlValue();
+        int64_t start = static_cast<int64_t>(*a);
+        int64_t end = static_cast<int64_t>(*b);
+        int64_t step = 1;
+        if (fc->args.size() == 3) {
+            auto s = numeric_arg(eval_arg(fc->args[2].get()));
+            if (!s) return GqlValue();
+            step = static_cast<int64_t>(*s);
+        }
+        if (step == 0) return GqlValue();
+        auto items = std::make_shared<std::vector<GqlValue>>();
+        if (step > 0) {
+            for (int64_t v = start; v <= end; v += step) items->push_back(GqlValue(property_type_t(v)));
+        } else {
+            for (int64_t v = start; v >= end; v += step) items->push_back(GqlValue(property_type_t(v)));
         }
         GqlValue out;
         out.type = GqlValue::LIST;

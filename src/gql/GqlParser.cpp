@@ -1909,7 +1909,17 @@ std::unique_ptr<Expression> GqlParser::parse_primary() {
             } else if (upper_name == "SIZE") {
                 advance(); // consume "size"
                 consume(TokenType::LPAREN, "Expected '(' after size");
-                
+
+                // size((pattern)) counts pattern matches (SizeExpr). size(<value expr>) -- a list or
+                // string -- is the element/character count and aliases cardinality(). A path pattern
+                // begins with a node '('; anything else at this position is a value expression.
+                if (!check(TokenType::LPAREN)) {
+                    std::vector<std::unique_ptr<Expression>> cargs;
+                    cargs.push_back(parse_expression());
+                    consume(TokenType::RPAREN, "Expected ')' after size argument");
+                    return std::make_unique<FunctionCallExpr>("cardinality", std::move(cargs));
+                }
+
                 std::vector<MatchStatement> matches;
                 MatchStatement stmt;
                 stmt.pattern = parse_path_pattern();

@@ -575,6 +575,23 @@ GqlType GqlTypechecker::check_expression(const Expression& expr) {
             if (ie.index) check_expression(*ie.index);
             return GqlType::ANY;
         }
+        case ExpressionKind::LIST_COMPREHENSION: {
+            const auto& lc = static_cast<const ListComprehensionExpr&>(expr);
+            if (lc.list) check_expression(*lc.list);
+            // The iteration variable is bound in a child scope; register it (type ANY, like FOR) so the
+            // filter/projection can reference it. It is not statically typed -- the list may hold anything.
+            if (!lc.variable.empty()) meet_variable(lc.variable, GqlType::ANY, {});
+            if (lc.filter) check_expression(*lc.filter);
+            if (lc.projection) check_expression(*lc.projection);
+            return GqlType::ANY;
+        }
+        case ExpressionKind::QUANTIFIED_PREDICATE: {
+            const auto& qp = static_cast<const QuantifiedPredicateExpr&>(expr);
+            if (qp.list) check_expression(*qp.list);
+            if (!qp.variable.empty()) meet_variable(qp.variable, GqlType::ANY, {});
+            if (qp.predicate) check_expression(*qp.predicate);
+            return GqlType::BOOLEAN;
+        }
     }
     return GqlType::ANY;
 }

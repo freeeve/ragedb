@@ -563,6 +563,17 @@ bool is_variable_referenced_outside_count(const Expression* expr, const std::str
             return is_variable_referenced_outside_count(ie->list.get(), var_name) ||
                    is_variable_referenced_outside_count(ie->index.get(), var_name);
         }
+        case ExpressionKind::LIST_COMPREHENSION: {
+            auto* lc = static_cast<const ListComprehensionExpr*>(expr);
+            return is_variable_referenced_outside_count(lc->list.get(), var_name) ||
+                   is_variable_referenced_outside_count(lc->filter.get(), var_name) ||
+                   is_variable_referenced_outside_count(lc->projection.get(), var_name);
+        }
+        case ExpressionKind::QUANTIFIED_PREDICATE: {
+            auto* qp = static_cast<const QuantifiedPredicateExpr*>(expr);
+            return is_variable_referenced_outside_count(qp->list.get(), var_name) ||
+                   is_variable_referenced_outside_count(qp->predicate.get(), var_name);
+        }
         default:
             return false;
     }

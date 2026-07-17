@@ -290,6 +290,15 @@ static bool expr_contains_subquery(const Expression* expr) {
             auto* ie = static_cast<const IndexExpr*>(expr);
             return expr_contains_subquery(ie->list.get()) || expr_contains_subquery(ie->index.get());
         }
+        case ExpressionKind::LIST_COMPREHENSION: {
+            auto* lc = static_cast<const ListComprehensionExpr*>(expr);
+            return expr_contains_subquery(lc->list.get()) || expr_contains_subquery(lc->filter.get()) ||
+                   expr_contains_subquery(lc->projection.get());
+        }
+        case ExpressionKind::QUANTIFIED_PREDICATE: {
+            auto* qp = static_cast<const QuantifiedPredicateExpr*>(expr);
+            return expr_contains_subquery(qp->list.get()) || expr_contains_subquery(qp->predicate.get());
+        }
         default: return false;
     }
 }
@@ -347,6 +356,19 @@ static void collect_subqueries(Expression* expr, std::vector<Expression*>& out, 
             auto* ie = static_cast<IndexExpr*>(expr);
             collect_subqueries(ie->list.get(), out, next_id, include_exists);
             collect_subqueries(ie->index.get(), out, next_id, include_exists);
+            break;
+        }
+        case ExpressionKind::LIST_COMPREHENSION: {
+            auto* lc = static_cast<ListComprehensionExpr*>(expr);
+            collect_subqueries(lc->list.get(), out, next_id, include_exists);
+            collect_subqueries(lc->filter.get(), out, next_id, include_exists);
+            collect_subqueries(lc->projection.get(), out, next_id, include_exists);
+            break;
+        }
+        case ExpressionKind::QUANTIFIED_PREDICATE: {
+            auto* qp = static_cast<QuantifiedPredicateExpr*>(expr);
+            collect_subqueries(qp->list.get(), out, next_id, include_exists);
+            collect_subqueries(qp->predicate.get(), out, next_id, include_exists);
             break;
         }
         default: break;

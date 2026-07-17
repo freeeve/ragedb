@@ -212,6 +212,24 @@ TEST_CASE("scalar function library", "[gql_executor_functions]") {
         REQUIRE(res.find("\"x\": 2") != std::string::npos);   // range(0,4)[2] == 2
     }
 
+    SECTION("list comprehension and quantified predicates all/any/none/single") {
+        std::string res = run(
+            "MATCH (a:Person) FILTER a.name = 'Bob' "
+            "RETURN [x IN range(1, 3) | x * 10][2] AS mappedLast, "
+            "       size([x IN range(1, 5) WHERE x > 3]) AS filteredCount, "
+            "       all(i IN range(0, 2) WHERE i < 5) AS allLt5, "
+            "       any(i IN range(0, 2) WHERE i = 2) AS anyEq2, "
+            "       none(i IN range(0, 2) WHERE i > 9) AS noneGt9, "
+            "       single(i IN range(0, 3) WHERE i = 2) AS singleEq2");
+        INFO("result: " << res);
+        REQUIRE(res.find("\"mappedLast\": 30") != std::string::npos);    // [10,20,30][2]
+        REQUIRE(res.find("\"filteredCount\": 2") != std::string::npos);  // [4,5]
+        REQUIRE(res.find("\"allLt5\": true") != std::string::npos);
+        REQUIRE(res.find("\"anyEq2\": true") != std::string::npos);
+        REQUIRE(res.find("\"noneGt9\": true") != std::string::npos);
+        REQUIRE(res.find("\"singleEq2\": true") != std::string::npos);
+    }
+
     SECTION("list subscript list[i]: 0-based, negative from end, out-of-range -> null") {
         std::string res = run(
             "MATCH (a:Person) FILTER a.name = 'Bob' "

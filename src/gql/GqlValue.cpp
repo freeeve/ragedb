@@ -801,6 +801,43 @@ GqlValue evaluate_expression(const GqlRow& row, const Expression* expr) {
             if (i < 0 || i >= n) return GqlValue();  // out of range -> null
             return (*list.list)[static_cast<size_t>(i)];
         }
+        case ExpressionKind::LIST_COMPREHENSION: {
+            auto* lc = static_cast<const ListComprehensionExpr*>(expr);
+            GqlValue src = evaluate_expression(row, lc->list.get());
+            if (src.type != GqlValue::LIST || !src.list) return GqlValue();
+            auto items = std::make_shared<std::vector<GqlValue>>();
+            for (const auto& elem : *src.list) {
+                GqlRow scoped = row;                        // bind the iteration variable in a child scope
+                scoped.bindings[lc->variable] = elem;
+                if (lc->filter && !evaluate_expression(scoped, lc->filter.get()).is_truthy()) continue;
+                items->push_back(lc->projection ? evaluate_expression(scoped, lc->projection.get()) : elem);
+            }
+            GqlValue out;
+            out.type = GqlValue::LIST;
+            out.list = std::move(items);
+            return out;
+        }
+        case ExpressionKind::QUANTIFIED_PREDICATE: {
+            auto* qp = static_cast<const QuantifiedPredicateExpr*>(expr);
+            GqlValue src = evaluate_expression(row, qp->list.get());
+            if (src.type != GqlValue::LIST || !src.list) return GqlValue();
+            int64_t matched = 0;
+            int64_t total = 0;
+            for (const auto& elem : *src.list) {
+                GqlRow scoped = row;
+                scoped.bindings[qp->variable] = elem;
+                ++total;
+                if (!qp->predicate || evaluate_expression(scoped, qp->predicate.get()).is_truthy()) ++matched;
+            }
+            bool result = false;
+            switch (qp->quant) {
+                case QuantifiedPredicateExpr::ALL:    result = (matched == total); break;
+                case QuantifiedPredicateExpr::ANY:    result = (matched > 0); break;
+                case QuantifiedPredicateExpr::NONE:   result = (matched == 0); break;
+                case QuantifiedPredicateExpr::SINGLE: result = (matched == 1); break;
+            }
+            return GqlValue(result);
+        }
         case ExpressionKind::CAST: {
             auto* c = static_cast<const CastExpr*>(expr);
             return apply_cast(evaluate_expression(row, c->value.get()), c->target);

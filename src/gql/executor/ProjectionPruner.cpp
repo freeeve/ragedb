@@ -92,6 +92,19 @@ void collect_accessed_properties(const Expression* expr,
             collect_accessed_properties(ie->index.get(), accessed_props, whole_objects);
             break;
         }
+        case ExpressionKind::LIST_COMPREHENSION: {
+            auto* lc = static_cast<const ListComprehensionExpr*>(expr);
+            collect_accessed_properties(lc->list.get(), accessed_props, whole_objects);
+            collect_accessed_properties(lc->filter.get(), accessed_props, whole_objects);
+            collect_accessed_properties(lc->projection.get(), accessed_props, whole_objects);
+            break;
+        }
+        case ExpressionKind::QUANTIFIED_PREDICATE: {
+            auto* qp = static_cast<const QuantifiedPredicateExpr*>(expr);
+            collect_accessed_properties(qp->list.get(), accessed_props, whole_objects);
+            collect_accessed_properties(qp->predicate.get(), accessed_props, whole_objects);
+            break;
+        }
         case ExpressionKind::IS_LABELED: {
             // The label is read from the entity itself, not from a property, so the operand must survive
             // pruning as a whole object rather than as a property set.

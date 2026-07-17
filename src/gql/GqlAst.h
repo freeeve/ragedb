@@ -64,7 +64,9 @@ enum class ExpressionKind {
     IS_DIRECTED,      ///< Edge orientation predicate: e IS [NOT] DIRECTED
     IS_SOURCE_DEST,   ///< Endpoint predicate: n IS [NOT] (SOURCE | DESTINATION) OF e
     LIST_LITERAL,     ///< A list value written out: [a, b, c]
-    LIST_INDEX        ///< List element access: list[index]
+    LIST_INDEX,       ///< List element access: list[index]
+    LIST_COMPREHENSION, ///< [x IN list [WHERE pred] [| projection]]
+    QUANTIFIED_PREDICATE ///< all|any|none|single(x IN list WHERE pred)
 };
 
 /**
@@ -320,6 +322,55 @@ struct IndexExpr : public Expression {
     std::unique_ptr<Expression> clone() const override {
         return std::make_unique<IndexExpr>(list ? list->clone() : nullptr,
                                            index ? index->clone() : nullptr);
+    }
+};
+
+/**
+ * @brief List comprehension: [variable IN list [WHERE filter] [| projection]]. For each element of `list`,
+ * `variable` is bound to it in a scoped row; elements failing `filter` are dropped; the result is the list
+ * of `projection` values (or the surviving elements themselves when `projection` is null).
+ */
+struct ListComprehensionExpr : public Expression {
+    std::string variable;                  ///< The iteration variable, bound per element.
+    std::unique_ptr<Expression> list;      ///< The source list expression.
+    std::unique_ptr<Expression> filter;    ///< Optional WHERE predicate (nullable).
+    std::unique_ptr<Expression> projection;///< Optional `| expr` value (nullable -> the element itself).
+    ListComprehensionExpr(std::string v, std::unique_ptr<Expression> l,
+                          std::unique_ptr<Expression> f, std::unique_ptr<Expression> p) {
+        kind = ExpressionKind::LIST_COMPREHENSION;
+        variable = std::move(v);
+        list = std::move(l);
+        filter = std::move(f);
+        projection = std::move(p);
+    }
+    std::unique_ptr<Expression> clone() const override {
+        return std::make_unique<ListComprehensionExpr>(variable, list ? list->clone() : nullptr,
+                                                       filter ? filter->clone() : nullptr,
+                                                       projection ? projection->clone() : nullptr);
+    }
+};
+
+/**
+ * @brief Quantified list predicate: all|any|none|single(variable IN list WHERE predicate). Binds
+ * `variable` to each element in a scoped row and tests `predicate`; the quantifier reduces to a boolean.
+ */
+struct QuantifiedPredicateExpr : public Expression {
+    enum Quantifier { ALL, ANY, NONE, SINGLE };
+    Quantifier quant;
+    std::string variable;
+    std::unique_ptr<Expression> list;
+    std::unique_ptr<Expression> predicate;
+    QuantifiedPredicateExpr(Quantifier q, std::string v, std::unique_ptr<Expression> l,
+                            std::unique_ptr<Expression> p) {
+        kind = ExpressionKind::QUANTIFIED_PREDICATE;
+        quant = q;
+        variable = std::move(v);
+        list = std::move(l);
+        predicate = std::move(p);
+    }
+    std::unique_ptr<Expression> clone() const override {
+        return std::make_unique<QuantifiedPredicateExpr>(quant, variable, list ? list->clone() : nullptr,
+                                                         predicate ? predicate->clone() : nullptr);
     }
 };
 

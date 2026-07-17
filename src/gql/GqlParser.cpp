@@ -205,6 +205,19 @@ static std::unique_ptr<Expression> substitute_return_aliases(
             ie->index = substitute_return_aliases(std::move(ie->index), aliases);
             return expr;
         }
+        case ExpressionKind::LIST_COMPREHENSION: {
+            auto* lc = static_cast<ListComprehensionExpr*>(expr.get());
+            lc->list = substitute_return_aliases(std::move(lc->list), aliases);
+            if (lc->filter) lc->filter = substitute_return_aliases(std::move(lc->filter), aliases);
+            if (lc->projection) lc->projection = substitute_return_aliases(std::move(lc->projection), aliases);
+            return expr;
+        }
+        case ExpressionKind::QUANTIFIED_PREDICATE: {
+            auto* qp = static_cast<QuantifiedPredicateExpr*>(expr.get());
+            qp->list = substitute_return_aliases(std::move(qp->list), aliases);
+            if (qp->predicate) qp->predicate = substitute_return_aliases(std::move(qp->predicate), aliases);
+            return expr;
+        }
         default:
             return expr;
     }
@@ -1737,9 +1750,50 @@ std::unique_ptr<Expression> GqlParser::parse_primary() {
         parse_braced_subquery(matches, sub_where);
         return std::make_unique<ExistsExpr>(std::move(matches), std::move(sub_where));
     }
+    // Quantified list predicates: all|any|none|single(x IN list WHERE pred). `all`/`any` are keywords
+    // (ALL_KW is also `ALL SHORTEST`, disambiguated here by the following '('); `none`/`single` are names.
+    {
+        bool is_quant = false;
+        QuantifiedPredicateExpr::Quantifier q = QuantifiedPredicateExpr::ALL;
+        if (check(TokenType::ALL_KW) && peek(1).type == TokenType::LPAREN) { q = QuantifiedPredicateExpr::ALL; is_quant = true; }
+        else if (check(TokenType::ANY_KW) && peek(1).type == TokenType::LPAREN) { q = QuantifiedPredicateExpr::ANY; is_quant = true; }
+        else if (check(TokenType::NAME) && peek(1).type == TokenType::LPAREN) {
+            std::string ln = peek().text;
+            std::transform(ln.begin(), ln.end(), ln.begin(), [](unsigned char c) { return std::tolower(c); });
+            if (ln == "none") { q = QuantifiedPredicateExpr::NONE; is_quant = true; }
+            else if (ln == "single") { q = QuantifiedPredicateExpr::SINGLE; is_quant = true; }
+        }
+        if (is_quant) {
+            advance(); // consume all/any/none/single
+            consume(TokenType::LPAREN, "Expected '(' after quantified predicate");
+            std::string qvar = peek().text;
+            consume(TokenType::NAME, "Expected variable name in quantified predicate");
+            consume(TokenType::IN_KW, "Expected 'IN' in quantified predicate");
+            auto qlist = parse_expression();
+            consume(TokenType::WHERE, "Expected 'WHERE' in quantified predicate");
+            auto qpred = parse_expression();
+            consume(TokenType::RPAREN, "Expected ')' after quantified predicate");
+            return std::make_unique<QuantifiedPredicateExpr>(q, std::move(qvar), std::move(qlist), std::move(qpred));
+        }
+    }
     // List literal: [a, b, c]. (The `x IN [a, b]` form is desugared to OR earlier, so it never reaches
     // here; this is the standalone list value -- what FOR expands and what a list-typed binding holds.)
     if (match(TokenType::LBRACKET)) {
+        // List comprehension: [x IN list [WHERE pred] [| projection]]. Detected by the `<name> IN` head;
+        // '|' is not a value-expression operator (only a label-alternation), so it delimits the projection.
+        if (check(TokenType::NAME) && peek(1).type == TokenType::IN_KW) {
+            std::string cvar = peek().text;
+            advance(); // variable
+            advance(); // IN
+            auto clist = parse_expression();
+            std::unique_ptr<Expression> cfilter = nullptr;
+            if (match(TokenType::WHERE)) cfilter = parse_expression();
+            std::unique_ptr<Expression> cproj = nullptr;
+            if (match(TokenType::PIPE)) cproj = parse_expression();
+            consume(TokenType::RBRACKET, "Expected ']' to close list comprehension");
+            return std::make_unique<ListComprehensionExpr>(std::move(cvar), std::move(clist),
+                                                           std::move(cfilter), std::move(cproj));
+        }
         std::vector<std::unique_ptr<Expression>> elements;
         if (!check(TokenType::RBRACKET)) {
             do {

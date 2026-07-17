@@ -228,6 +228,7 @@ const std::vector<std::string>& scalar_function_names() {
         "length",
         "nodes",
         "relationships",
+        "rels", // openCypher alias of relationships(path)
         // temporal (epoch milliseconds -- see the note on evaluate_scalar_function)
         "zoned_datetime",
         "datetime",
@@ -343,8 +344,8 @@ GqlValue evaluate_scalar_function_with(const FunctionCallExpr* fc,
     }
 
     // ---- paths -------------------------------------------------------------------------------------
-    // nodes(path) / relationships(path): the path's elements, as a LIST.
-    if (fc->name == "nodes" || fc->name == "relationships") {
+    // nodes(path) / relationships(path) (alias rels): the path's elements, as a LIST.
+    if (fc->name == "nodes" || fc->name == "relationships" || fc->name == "rels") {
         if (fc->args.size() != 1) return GqlValue();
         GqlValue arg = eval_arg(fc->args[0].get());
         if (arg.type != GqlValue::PATH) return GqlValue();

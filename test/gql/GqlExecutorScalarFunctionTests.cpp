@@ -193,5 +193,14 @@ TEST_CASE("scalar function library", "[gql_executor_functions]") {
         REQUIRE(res.find("\"r\": 1") != std::string::npos);   // one KNOWS
     }
 
+    SECTION("rels() is an alias of relationships()") {
+        std::string res = run(
+            "MATCH p = ANY SHORTEST (a:Person)-[:KNOWS]-{1,2}(b:Person) "
+            "FILTER a.name = 'Bob' AND b.score = -7 "
+            "RETURN cardinality(rels(p)) AS r");
+        INFO("result: " << res);
+        REQUIRE(res.find("\"r\": 1") != std::string::npos);   // same one KNOWS as relationships(p)
+    }
+
     guard.stop();
 }

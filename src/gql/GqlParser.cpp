@@ -361,6 +361,18 @@ GqlQuery GqlParser::parse_single_query() {
             advance(); // Consume variable
             advance(); // Consume '='
 
+            // GQL also allows the path mode after the assignment (e.g. p = TRAIL (...)), not only
+            // before it (TRAIL p = ...). The executor honors either position.
+            if (match(TokenType::TRAIL_KW)) {
+                stmt.path_mode = PathMode::TRAIL;
+            } else if (match(TokenType::ACYCLIC_KW)) {
+                stmt.path_mode = PathMode::ACYCLIC;
+            } else if (match(TokenType::SIMPLE_KW)) {
+                stmt.path_mode = PathMode::SIMPLE;
+            } else if (match(TokenType::WALK_KW)) {
+                stmt.path_mode = PathMode::WALK;
+            }
+
             // Parse shortest path selectors:
             // 1. ALL SHORTEST paths or ALL CHEAPEST paths
             if (check(TokenType::ALL_KW) && peek(1).type == TokenType::SHORTEST_KW) {

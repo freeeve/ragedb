@@ -951,3 +951,22 @@ TEST_CASE("GQL scalar functions and CASE expressions (length/CASE/zoned_datetime
             "ORDER BY postCount DESC, tagName ASC LIMIT 10"));
     }
 }
+
+TEST_CASE("path mode is accepted after the path variable, not only before it", "[gql_parser]") {
+    SECTION("p = TRAIL (...) sets TRAIL (FinBench CR1 shape)") {
+        auto q = GqlParser::parse(
+            "MATCH p = TRAIL (a:Account)-[:transfer]->{1,3}(b:Account) RETURN p");
+        REQUIRE(q.matches[0].path_mode == PathMode::TRAIL);
+        REQUIRE(q.matches[0].path_variable == "p");
+    }
+    SECTION("p = ACYCLIC (...) sets ACYCLIC (FinBench CR5 shape)") {
+        auto q = GqlParser::parse(
+            "MATCH p = ACYCLIC (a:Account)-[:transfer]->{1,3}(b:Account) RETURN p");
+        REQUIRE(q.matches[0].path_mode == PathMode::ACYCLIC);
+    }
+    SECTION("the pre-assignment form TRAIL p = (...) still works") {
+        auto q = GqlParser::parse(
+            "MATCH TRAIL p = (a:Account)-[:transfer]->{1,3}(b:Account) RETURN p");
+        REQUIRE(q.matches[0].path_mode == PathMode::TRAIL);
+    }
+}

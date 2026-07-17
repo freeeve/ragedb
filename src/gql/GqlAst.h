@@ -63,7 +63,8 @@ enum class ExpressionKind {
     IS_LABELED,       ///< Label predicate: x IS [NOT] LABELED <labelExpression>
     IS_DIRECTED,      ///< Edge orientation predicate: e IS [NOT] DIRECTED
     IS_SOURCE_DEST,   ///< Endpoint predicate: n IS [NOT] (SOURCE | DESTINATION) OF e
-    LIST_LITERAL      ///< A list value written out: [a, b, c]
+    LIST_LITERAL,     ///< A list value written out: [a, b, c]
+    LIST_INDEX        ///< List element access: list[index]
 };
 
 /**
@@ -301,6 +302,24 @@ struct ListExpr : public Expression {
             copy.push_back(e ? e->clone() : nullptr);
         }
         return std::make_unique<ListExpr>(std::move(copy));
+    }
+};
+
+/**
+ * @brief List element access: list[index]. 0-based; a negative index counts from the end; an
+ * out-of-range index (or a non-list / non-integer operand) evaluates to NULL.
+ */
+struct IndexExpr : public Expression {
+    std::unique_ptr<Expression> list;  ///< The list-valued operand.
+    std::unique_ptr<Expression> index; ///< The integer index expression.
+    IndexExpr(std::unique_ptr<Expression> l, std::unique_ptr<Expression> i) {
+        kind = ExpressionKind::LIST_INDEX;
+        list = std::move(l);
+        index = std::move(i);
+    }
+    std::unique_ptr<Expression> clone() const override {
+        return std::make_unique<IndexExpr>(list ? list->clone() : nullptr,
+                                           index ? index->clone() : nullptr);
     }
 };
 

@@ -87,6 +87,10 @@ bool has_aggregates(const Expression* expr) {
         }
         return false;
     }
+    if (expr->kind == ExpressionKind::LIST_INDEX) {
+        auto* ie = static_cast<const IndexExpr*>(expr);
+        return has_aggregates(ie->list.get()) || has_aggregates(ie->index.get());
+    }
     return false;
 }
 
@@ -140,6 +144,10 @@ void find_aggregates(const Expression* expr, std::vector<const AggregateExpr*>& 
         for (const auto& element : static_cast<const ListExpr*>(expr)->elements) {
             find_aggregates(element.get(), aggregates);
         }
+    } else if (expr->kind == ExpressionKind::LIST_INDEX) {
+        auto* ie = static_cast<const IndexExpr*>(expr);
+        find_aggregates(ie->list.get(), aggregates);
+        find_aggregates(ie->index.get(), aggregates);
     }
 }
 
@@ -206,6 +214,18 @@ GqlValue evaluate_group_expression(const GqlRow& representative, const std::map<
             out.type = GqlValue::LIST;
             out.list = std::move(items);
             return out;
+        }
+        case ExpressionKind::LIST_INDEX: {
+            auto* ie = static_cast<const IndexExpr*>(expr);
+            GqlValue list = evaluate_group_expression(representative, aggregate_results, ie->list.get());
+            GqlValue idx = evaluate_group_expression(representative, aggregate_results, ie->index.get());
+            if (list.type != GqlValue::LIST || !list.list) return GqlValue();
+            if (idx.type != GqlValue::PROPERTY || !std::holds_alternative<int64_t>(idx.property)) return GqlValue();
+            int64_t i = std::get<int64_t>(idx.property);
+            int64_t n = static_cast<int64_t>(list.list->size());
+            if (i < 0) i += n;
+            if (i < 0 || i >= n) return GqlValue();
+            return (*list.list)[static_cast<size_t>(i)];
         }
         case ExpressionKind::CAST: {
             auto* c = static_cast<const CastExpr*>(expr);

@@ -202,5 +202,15 @@ TEST_CASE("scalar function library", "[gql_executor_functions]") {
         REQUIRE(res.find("\"r\": 1") != std::string::npos);   // same one KNOWS as relationships(p)
     }
 
+    SECTION("list subscript list[i]: 0-based, negative from end, out-of-range -> null") {
+        std::string res = run(
+            "MATCH (a:Person) FILTER a.name = 'Bob' "
+            "RETURN [10, 20, 30][1] AS a1, [10, 20, 30][-1] AS a2, [10, 20, 30][5] AS a3");
+        INFO("result: " << res);
+        REQUIRE(res.find("\"a1\": 20") != std::string::npos);     // 0-based index
+        REQUIRE(res.find("\"a2\": 30") != std::string::npos);     // -1 -> last
+        REQUIRE(res.find("\"a3\": null") != std::string::npos);   // out of range
+    }
+
     guard.stop();
 }

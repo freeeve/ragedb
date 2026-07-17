@@ -199,6 +199,12 @@ static std::unique_ptr<Expression> substitute_return_aliases(
             }
             return expr;
         }
+        case ExpressionKind::LIST_INDEX: {
+            auto* ie = static_cast<IndexExpr*>(expr.get());
+            ie->list = substitute_return_aliases(std::move(ie->list), aliases);
+            ie->index = substitute_return_aliases(std::move(ie->index), aliases);
+            return expr;
+        }
         default:
             return expr;
     }
@@ -1601,7 +1607,16 @@ std::unique_ptr<Expression> GqlParser::parse_unary() {
         auto right = parse_unary();
         return std::make_unique<UnaryOpExpr>(UnaryOpKind::NEG, std::move(right));
     }
-    return parse_primary();
+    auto expr = parse_primary();
+    // Postfix list subscript: expr[index], chainable (expr[i][j]). A '[' at the head of a primary is a
+    // list literal (handled in parse_primary); a '[' following a primary is an element access.
+    while (check(TokenType::LBRACKET)) {
+        advance(); // consume '['
+        auto index = parse_expression();
+        consume(TokenType::RBRACKET, "Expected ']' after list index");
+        expr = std::make_unique<IndexExpr>(std::move(expr), std::move(index));
+    }
+    return expr;
 }
 
 /**

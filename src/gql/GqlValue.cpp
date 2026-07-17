@@ -759,6 +759,18 @@ GqlValue evaluate_expression(const GqlRow& row, const Expression* expr) {
             out.list = std::move(items);
             return out;
         }
+        case ExpressionKind::LIST_INDEX: {
+            auto* ie = static_cast<const IndexExpr*>(expr);
+            GqlValue list = evaluate_expression(row, ie->list.get());
+            GqlValue idx = evaluate_expression(row, ie->index.get());
+            if (list.type != GqlValue::LIST || !list.list) return GqlValue();
+            if (idx.type != GqlValue::PROPERTY || !std::holds_alternative<int64_t>(idx.property)) return GqlValue();
+            int64_t i = std::get<int64_t>(idx.property);
+            int64_t n = static_cast<int64_t>(list.list->size());
+            if (i < 0) i += n;                       // negative index counts from the end
+            if (i < 0 || i >= n) return GqlValue();  // out of range -> null
+            return (*list.list)[static_cast<size_t>(i)];
+        }
         case ExpressionKind::CAST: {
             auto* c = static_cast<const CastExpr*>(expr);
             return apply_cast(evaluate_expression(row, c->value.get()), c->target);

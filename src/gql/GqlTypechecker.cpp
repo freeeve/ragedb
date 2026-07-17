@@ -569,6 +569,12 @@ GqlType GqlTypechecker::check_expression(const Expression& expr) {
             }
             return GqlType::ANY;
         }
+        case ExpressionKind::LIST_INDEX: {
+            const auto& ie = static_cast<const IndexExpr&>(expr);
+            if (ie.list) check_expression(*ie.list);
+            if (ie.index) check_expression(*ie.index);
+            return GqlType::ANY;
+        }
     }
     return GqlType::ANY;
 }

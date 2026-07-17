@@ -286,6 +286,10 @@ static bool expr_contains_subquery(const Expression* expr) {
             for (const auto& e : le->elements) if (expr_contains_subquery(e.get())) return true;
             return false;
         }
+        case ExpressionKind::LIST_INDEX: {
+            auto* ie = static_cast<const IndexExpr*>(expr);
+            return expr_contains_subquery(ie->list.get()) || expr_contains_subquery(ie->index.get());
+        }
         default: return false;
     }
 }
@@ -337,6 +341,12 @@ static void collect_subqueries(Expression* expr, std::vector<Expression*>& out, 
         case ExpressionKind::LIST_LITERAL: {
             auto* le = static_cast<ListExpr*>(expr);
             for (auto& e : le->elements) collect_subqueries(e.get(), out, next_id, include_exists);
+            break;
+        }
+        case ExpressionKind::LIST_INDEX: {
+            auto* ie = static_cast<IndexExpr*>(expr);
+            collect_subqueries(ie->list.get(), out, next_id, include_exists);
+            collect_subqueries(ie->index.get(), out, next_id, include_exists);
             break;
         }
         default: break;

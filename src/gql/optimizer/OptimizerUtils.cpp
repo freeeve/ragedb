@@ -558,6 +558,11 @@ bool is_variable_referenced_outside_count(const Expression* expr, const std::str
             }
             return false;
         }
+        case ExpressionKind::LIST_INDEX: {
+            auto* ie = static_cast<const IndexExpr*>(expr);
+            return is_variable_referenced_outside_count(ie->list.get(), var_name) ||
+                   is_variable_referenced_outside_count(ie->index.get(), var_name);
+        }
         default:
             return false;
     }

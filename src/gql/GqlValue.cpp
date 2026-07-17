@@ -235,6 +235,7 @@ const std::vector<std::string>& scalar_function_names() {
         "datetime",
         "date",
         "localdatetime",
+        "duration",
         // strings
         "substring",
         "char_length",
@@ -354,6 +355,42 @@ GqlValue evaluate_scalar_function_with(const FunctionCallExpr* fc,
         if (fc->name == "date") {
             const int64_t day_ms = 86400000LL;
             ms -= ((ms % day_ms) + day_ms) % day_ms;  // floor to midnight, correct for negatives too
+        }
+        return GqlValue(ms);
+    }
+
+    // duration('P100D' / 'PT4H30M' / ...): an ISO-8601 duration, returned as a count of milliseconds so it
+    // adds/subtracts against an epoch-ms datetime with ordinary integer arithmetic. Years and months are
+    // taken as 365 and 30 days (LDBC durations use days/hours/minutes/seconds, which are exact).
+    if (fc->name == "duration") {
+        if (fc->args.size() != 1) return GqlValue();
+        auto s = string_arg(eval_arg(fc->args[0].get()));
+        if (!s || s->size() < 2 || (*s)[0] != 'P') return GqlValue();
+        const std::string& str = *s;
+        int64_t ms = 0;
+        bool in_time = false;
+        size_t i = 1;
+        while (i < str.size()) {
+            if (str[i] == 'T') { in_time = true; ++i; continue; }
+            size_t start = i;
+            while (i < str.size() && (std::isdigit(static_cast<unsigned char>(str[i])) || str[i] == '.')) ++i;
+            if (i == start || i >= str.size()) return GqlValue();  // a number must be followed by a unit
+            double num = std::stod(str.substr(start, i - start));
+            char unit = str[i++];
+            double unit_ms = 0.0;
+            if (!in_time) {
+                if (unit == 'Y') unit_ms = 365.0 * 86400000.0;
+                else if (unit == 'M') unit_ms = 30.0 * 86400000.0;
+                else if (unit == 'W') unit_ms = 7.0 * 86400000.0;
+                else if (unit == 'D') unit_ms = 86400000.0;
+                else return GqlValue();
+            } else {
+                if (unit == 'H') unit_ms = 3600000.0;
+                else if (unit == 'M') unit_ms = 60000.0;
+                else if (unit == 'S') unit_ms = 1000.0;
+                else return GqlValue();
+            }
+            ms += static_cast<int64_t>(num * unit_ms);
         }
         return GqlValue(ms);
     }

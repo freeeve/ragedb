@@ -1303,6 +1303,26 @@ namespace ragedb {
             double weight;
         };
 
+        // A reached node from a value-propagating BFS: its accumulated inflow and shortest hop distance.
+        struct PropagateResult {
+            uint64_t node;
+            double value;
+            uint32_t depth;
+        };
+
+        // PropagateBFSPeered: per-seed first-claim value-propagating BFS. One independent BFS per seed
+        // (seed carries seed_values[i] at depth 1); the first edge to reach a node in that seed's BFS
+        // claims it, carrying that edge's value_prop amount. Each expansion sorts a node's eligible
+        // out-edges (union of rel_types, optional filter_prop range window) by value_prop and truncates
+        // to trunc_limit BEFORE applying the exclusive min_value gate. Across seeds a node accumulates
+        // inflow = sum of claimed values and depth = min. Deterministic: stable fan-out sort, results
+        // sorted by node id ascending.
+        std::vector<PropagateResult> PropagateBFSPeered(
+            const std::vector<uint64_t>& seeds, const std::vector<double>& seed_values,
+            const std::vector<std::string>& rel_types, Direction direction, uint32_t max_depth,
+            const std::string& value_prop, bool order_desc, uint32_t trunc_limit, double min_value,
+            const std::string& filter_prop, int64_t filter_min, int64_t filter_max);
+
         std::vector<Edge> GetGraphEdges(const std::string& rel_type, const std::string& edge_concept, const std::string& src_rel, const std::string& dst_rel, const std::string& weight_prop, bool directed, bool weighted);
 
         std::map<uint64_t, double> PageRankPeered(const std::string& rel_type, const std::string& edge_concept, const std::string& src_rel, const std::string& dst_rel, const std::string& weight_prop, bool directed, bool weighted, double damping, uint64_t iterations, double tolerance);

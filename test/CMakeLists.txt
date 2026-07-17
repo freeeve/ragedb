@@ -16,6 +16,7 @@ add_executable(tests tests.cpp shard/ShardIds.cpp shard/Ids.cpp shard/NodeTypes.
         shard/algorithms/Community.cpp
         shard/algorithms/Clustering.cpp
         shard/algorithms/Distance.cpp
+        shard/algorithms/Propagate.cpp
         Link.cpp Node.cpp Graph.cpp
         types/Date.cpp
         types/NTriplesParserTests.cpp

@@ -45,6 +45,7 @@ set(SOURCE_FILES
         algorithms/Clustering.cpp
         algorithms/Connectivity.cpp
         algorithms/Distance.cpp
+        algorithms/Propagate.cpp
         lua/All.cpp peered/All.cpp shard/All.cpp
         lua/Bulk.cpp peered/Bulk.cpp shard/Bulk.cpp
         lua/Connected.cpp peered/Connected.cpp # no shard

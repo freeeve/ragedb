@@ -528,8 +528,11 @@ struct MatchStatement {
 struct ExistsExpr : public Expression {
     std::vector<MatchStatement> matches; ///< Nested match statements.
     std::unique_ptr<Expression> where_expr; ///< Optional nested where filter.
-    std::string target_variable; ///< Target variable for checking existence.
-    
+    std::string target_variable; ///< Target variable for checking existence (semi-join rewrite path).
+    /// Set when this EXISTS is nested inside a subquery's WHERE, where the semi-join rewrite does not reach
+    /// it: the correlated precompute binds "_exists_<subquery_id>" per row and the evaluator reads it back.
+    int64_t subquery_id = -1;
+
     ExistsExpr(std::vector<MatchStatement> m, std::unique_ptr<Expression> w) {
         kind = ExpressionKind::EXISTS;
         matches = std::move(m);
@@ -538,6 +541,7 @@ struct ExistsExpr : public Expression {
     std::unique_ptr<Expression> clone() const override {
         auto copy = std::make_unique<ExistsExpr>(matches, where_expr ? where_expr->clone() : nullptr);
         copy->target_variable = target_variable;
+        copy->subquery_id = subquery_id;
         return copy;
     }
 };

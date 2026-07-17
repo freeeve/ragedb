@@ -799,6 +799,15 @@ GqlValue evaluate_expression(const GqlRow& row, const Expression* expr) {
         }
         case ExpressionKind::EXISTS: {
             auto* exists = static_cast<const ExistsExpr*>(expr);
+            // Nested EXISTS (inside a subquery WHERE): the correlated precompute bound the answer per row
+            // as "_exists_<id>" because the semi-join rewrite does not reach a subquery's own WHERE.
+            if (exists->subquery_id >= 0) {
+                auto it = row.bindings.find("_exists_" + std::to_string(exists->subquery_id));
+                if (it != row.bindings.end()) {
+                    return GqlValue(it->second.is_truthy());
+                }
+                return GqlValue(false);
+            }
             if (!exists->target_variable.empty()) {
                 auto it = row.bindings.find(exists->target_variable);
                 if (it != row.bindings.end() && it->second.type != GqlValue::NIL) {

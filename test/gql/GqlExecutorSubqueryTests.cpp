@@ -148,3 +148,58 @@ TEST_CASE("GQL COUNT subquery applies far-node filter and works in LET", "[gql_e
 
     guard.stop();
 }
+
+// A COUNT{} whose own WHERE nests an EXISTS is a correlated subquery the far-node-blind degree rewrite
+// cannot touch and the base COUNT{} precompute skipped. The precompute now recurses: it traverses the
+// COUNT pattern anchored on the outer row (carrying p and foaf), then for each sub-row resolves the nested
+// EXISTS before filtering. This is the IC10 "common" shape -- count a friend-of-a-friend's posts whose tag
+// is also one the person is interested in. foaf created 3 posts (tags t1, t2, t1); the person is interested
+// only in t1, so common = 2.
+TEST_CASE("GQL COUNT{} with a nested EXISTS in its WHERE (IC10 common)", "[gql_executor_count_subquery]") {
+    auto graph = Graph("gql_test_common_subquery");
+    graph.Start().get();
+    graph.Clear();
+    GraphStopGuard guard(graph);
+
+    graph.shard.local().NodeTypeInsertPeered("Person").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "id", "integer").get();
+    graph.shard.local().NodeTypeInsertPeered("Post").get();
+    graph.shard.local().NodeTypeInsertPeered("Tag").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Tag", "id", "integer").get();
+    graph.shard.local().RelationshipTypeInsertPeered("HAS_CREATOR").get();
+    graph.shard.local().RelationshipTypeInsertPeered("HAS_TAG").get();
+    graph.shard.local().RelationshipTypeInsertPeered("HAS_INTEREST").get();
+
+    uint64_t p = graph.shard.local().NodeAddPeered("Person", "p1", "{\"id\": 1}").get();
+    uint64_t foaf = graph.shard.local().NodeAddPeered("Person", "p2", "{\"id\": 2}").get();
+    uint64_t t1 = graph.shard.local().NodeAddPeered("Tag", "t1", "{\"id\": 1}").get();
+    uint64_t t2 = graph.shard.local().NodeAddPeered("Tag", "t2", "{\"id\": 2}").get();
+
+    // The person is interested only in t1.
+    graph.shard.local().RelationshipAddPeered("HAS_INTEREST", p, t1, "{}").get();
+
+    // foaf created three posts, tagged t1, t2, t1 respectively.
+    uint64_t tags[3] = {t1, t2, t1};
+    for (int i = 0; i < 3; ++i) {
+        uint64_t post = graph.shard.local().NodeAddPeered("Post", "post" + std::to_string(i), "{}").get();
+        graph.shard.local().RelationshipAddPeered("HAS_CREATOR", post, foaf, "{}").get();
+        graph.shard.local().RelationshipAddPeered("HAS_TAG", post, tags[i], "{}").get();
+    }
+
+    auto run = [&graph](const std::string& q) {
+        auto query = GqlParser::parse(q);
+        GqlOptimizer::optimize(query);
+        return GqlExecutor::execute(graph, std::move(query)).get();
+    };
+
+    SECTION("posts whose tag the person shares (2 of 3)") {
+        std::string r = run(
+            "MATCH (p:Person {id: 1}) MATCH (foaf:Person {id: 2}) "
+            "RETURN COUNT { (foaf)<-[:HAS_CREATOR]-(post:Post) "
+            "               WHERE EXISTS { (post)-[:HAS_TAG]->(:Tag)<-[:HAS_INTEREST]-(p) } } AS common");
+        INFO("common: " << r);
+        REQUIRE(r.find("\"common\": 2") != std::string::npos);
+    }
+
+    guard.stop();
+}

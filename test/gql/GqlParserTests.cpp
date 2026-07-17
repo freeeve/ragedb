@@ -908,6 +908,17 @@ TEST_CASE("GQL scalar functions and CASE expressions (length/CASE/zoned_datetime
             "RETURN foaf.id AS personId, 2 * common - total AS commonInterestScore "
             "ORDER BY commonInterestScore DESC, personId ASC LIMIT 10"));
     }
+    SECTION("COUNT { } whose WHERE is an EXISTS keeps the nested subquery (IC10 common)") {
+        // The correlated precompute reduces a SizeExpr over its sub-rows and recurses into a WHERE that
+        // nests a further subquery; lock that the parser yields exactly that SIZE_OP -> EXISTS shape.
+        auto q = GqlParser::parse(
+            "MATCH (p:Person) RETURN COUNT { (p)-[:KNOWS]->(x:Person) "
+            "WHERE EXISTS { (x)-[:KNOWS]->(y:Person) } } AS c");
+        REQUIRE(q.returns[0].expr->kind == ExpressionKind::SIZE_OP);
+        auto* se = static_cast<SizeExpr*>(q.returns[0].expr.get());
+        REQUIRE(se->where_expr != nullptr);
+        REQUIRE(se->where_expr->kind == ExpressionKind::EXISTS);
+    }
     SECTION("collect_list(DISTINCT x) is a COLLECT aggregate") {
         auto q = GqlParser::parse("MATCH (t:Tag) RETURN collect_list(DISTINCT t) AS tags");
         REQUIRE(q.returns[0].expr->kind == ExpressionKind::AGGREGATION);

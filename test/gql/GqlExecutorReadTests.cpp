@@ -77,6 +77,17 @@ TEST_CASE("GQL Execution Read Tests", "[gql_executor_read]") {
         REQUIRE(results_json.find("35") != std::string::npos);
     }
 
+    SECTION("Node .key resolves to the external key, not a properties-map lookup") {
+        std::string query_str = "MATCH (p:Person) WHERE p.name = 'Alice' RETURN p.key AS k";
+        auto query = GqlParser::parse(query_str);
+        GqlOptimizer::optimize(query);
+
+        std::string results_json = GqlExecutor::execute(graph, std::move(query)).get();
+
+        // alice was added with key "alice"; .key must return it (previously null).
+        REQUIRE(results_json.find("alice") != std::string::npos);
+    }
+
     SECTION("Filtered match return properties") {
         std::string query_str = "MATCH (p:Person) WHERE p.name = 'Alice' RETURN p.name, p.age";
         auto query = GqlParser::parse(query_str);

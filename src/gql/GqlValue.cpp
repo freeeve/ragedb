@@ -992,6 +992,11 @@ GqlValue evaluate_expression(const GqlRow& row, const Expression* expr) {
             if (it != row.bindings.end()) {
                 const auto& val = it->second;
                 if (val.type == GqlValue::NODE) {
+                    // `key` is a distinct Node field (the external/business key), not a properties-map
+                    // entry, so it must resolve through getKey() rather than a properties lookup.
+                    if (prop_lookup->property == "key") {
+                        return GqlValue(property_type_t(val.node->getKey()));
+                    }
                     return GqlValue(val.node->getProperty(prop_lookup->property));
                 } else if (val.type == GqlValue::RELATIONSHIP) {
                     return GqlValue(val.relationship->getProperty(prop_lookup->property));

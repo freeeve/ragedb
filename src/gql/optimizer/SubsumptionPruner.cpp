@@ -249,10 +249,10 @@ void SubsumptionPruner::semantic_subsumption_pass(GqlQuery& query) {
         }
         
         for (auto it2 = query.matches.begin(); it2 != query.matches.end(); ++it2) {
-            if (it2->is_optional || it2->is_search) continue;
+            if (it2->is_optional || it2->is_search || it2->is_propagate) continue;
             
             for (auto it1 = query.matches.begin(); it1 != query.matches.end(); ++it1) {
-                if (it1 == it2 || it1->is_optional || it1->is_search) continue;
+                if (it1 == it2 || it1->is_optional || it1->is_search || it1->is_propagate) continue;
                 
                 const auto& m1 = *it1;
                 const auto& m2 = *it2;

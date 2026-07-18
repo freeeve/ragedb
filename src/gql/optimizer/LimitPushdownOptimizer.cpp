@@ -18,10 +18,12 @@
 #include "OptimizerUtils.h"
 #include "../GqlVirtualCatalog.h"
 #include "../GqlParser.h"
+#include "../executor/ExpressionEvaluator.h"
 #include <vector>
 #include <unordered_map>
 #include <set>
 #include <algorithm>
+#include <limits>
 
 namespace ragedb::gql {
 
@@ -90,8 +92,22 @@ void LimitPushdownOptimizer::limit_pushdown_pass(GqlQuery& query) {
     // live in has_post_scan_residual_predicate, shared with the executor's limit_val gate.
     if (has_post_scan_residual_predicate(query)) return;
 
+    // An aggregate folds the matched rows into far fewer result rows, so a LIMIT bounds the RESULT, not the
+    // scan. Pushing it down truncates the rows the aggregate folds over and silently answers with the limit
+    // instead of the aggregate: `RETURN count(f) LIMIT 1` returned 1 rather than the count. (The executor's
+    // own scan-limit gate already refuses this; the pushdown pass did not.)
+    for (const auto& item : query.returns) {
+        if (has_aggregates(item.expr.get())) return;
+    }
+
+    // Push the whole page window (offset + limit), not the bare limit: an OFFSET skips past the first rows
+    // of the result, so a scan bounded at `limit` would stop before reaching the rows the page returns.
+    const uint64_t skip = query.offset.value_or(0);
+    if (skip > std::numeric_limits<uint64_t>::max() - *query.limit) return;
+    const std::optional<uint64_t> window = skip + *query.limit;
+
     if (query.matches.size() == 1) {
-        query.matches[0].limit = query.limit;
+        query.matches[0].limit = window;
         return;
     }
 
@@ -114,7 +130,7 @@ void LimitPushdownOptimizer::limit_pushdown_pass(GqlQuery& query) {
     bool all_mandatory = true;
     for (size_t i = 1; i < query.matches.size(); ++i) {
         const auto& match = query.matches[i];
-        if (match.is_optional || match.is_search) {
+        if (match.is_optional || match.is_search || match.is_propagate) {
             all_mandatory = false;
             break;
         }
@@ -155,7 +171,7 @@ void LimitPushdownOptimizer::limit_pushdown_pass(GqlQuery& query) {
     }
 
     if (all_mandatory) {
-        query.matches[0].limit = query.limit;
+        query.matches[0].limit = window;
     }
 }
 

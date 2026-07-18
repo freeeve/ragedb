@@ -118,7 +118,7 @@ bool get_numeric_value(const Expression* expr, double& val) {
     if (expr->kind == ExpressionKind::LITERAL) {
         const auto* lit = static_cast<const LiteralExpr*>(expr);
         if (std::holds_alternative<int64_t>(lit->value)) {
-            val = std::get<int64_t>(lit->value);
+            val = static_cast<double>(std::get<int64_t>(lit->value));
             return true;
         } else if (std::holds_alternative<double>(lit->value)) {
             val = std::get<double>(lit->value);
@@ -242,7 +242,7 @@ std::vector<VarInfo> collect_query_vars(const GqlQuery& query) {
                 double val = 0;
                 bool is_numeric = false;
                 if (std::holds_alternative<int64_t>(val_type)) {
-                    val = std::get<int64_t>(val_type);
+                    val = static_cast<double>(std::get<int64_t>(val_type));
                     is_numeric = true;
                 } else if (std::holds_alternative<double>(val_type)) {
                     val = std::get<double>(val_type);
@@ -265,7 +265,7 @@ std::vector<VarInfo> collect_query_vars(const GqlQuery& query) {
                 double val = 0;
                 bool is_numeric = false;
                 if (std::holds_alternative<int64_t>(filter.value)) {
-                    val = std::get<int64_t>(filter.value);
+                    val = static_cast<double>(std::get<int64_t>(filter.value));
                     is_numeric = true;
                 } else if (std::holds_alternative<double>(filter.value)) {
                     val = std::get<double>(filter.value);
@@ -334,7 +334,7 @@ std::vector<VarInfo> collect_all_query_vars(const GqlQuery& query) {
                 double val = 0;
                 bool is_numeric = false;
                 if (std::holds_alternative<int64_t>(val_type)) {
-                    val = std::get<int64_t>(val_type);
+                    val = static_cast<double>(std::get<int64_t>(val_type));
                     is_numeric = true;
                 } else if (std::holds_alternative<double>(val_type)) {
                     val = std::get<double>(val_type);
@@ -357,7 +357,7 @@ std::vector<VarInfo> collect_all_query_vars(const GqlQuery& query) {
                 double val = 0;
                 bool is_numeric = false;
                 if (std::holds_alternative<int64_t>(filter.value)) {
-                    val = std::get<int64_t>(filter.value);
+                    val = static_cast<double>(std::get<int64_t>(filter.value));
                     is_numeric = true;
                 } else if (std::holds_alternative<double>(filter.value)) {
                     val = std::get<double>(filter.value);
@@ -417,7 +417,7 @@ std::vector<VarInfo> collect_all_query_vars(const GqlQuery& query) {
                 double val = 0;
                 bool is_numeric = false;
                 if (std::holds_alternative<int64_t>(val_type)) {
-                    val = std::get<int64_t>(val_type);
+                    val = static_cast<double>(std::get<int64_t>(val_type));
                     is_numeric = true;
                 } else if (std::holds_alternative<double>(val_type)) {
                     val = std::get<double>(val_type);
@@ -440,7 +440,7 @@ std::vector<VarInfo> collect_all_query_vars(const GqlQuery& query) {
                 double val = 0;
                 bool is_numeric = false;
                 if (std::holds_alternative<int64_t>(filter.value)) {
-                    val = std::get<int64_t>(filter.value);
+                    val = static_cast<double>(std::get<int64_t>(filter.value));
                     is_numeric = true;
                 } else if (std::holds_alternative<double>(filter.value)) {
                     val = std::get<double>(filter.value);
@@ -538,6 +538,44 @@ bool is_variable_referenced_outside_count(const Expression* expr, const std::str
             return is_variable_referenced_outside_count(in->value.get(), var_name) ||
                    is_variable_referenced_outside_count(in->list.get(), var_name);
         }
+        case ExpressionKind::CAST: {
+            return is_variable_referenced_outside_count(static_cast<const CastExpr*>(expr)->value.get(), var_name);
+        }
+        case ExpressionKind::IS_LABELED: {
+            return is_variable_referenced_outside_count(static_cast<const IsLabeledExpr*>(expr)->value.get(), var_name);
+        }
+        case ExpressionKind::IS_DIRECTED: {
+            return is_variable_referenced_outside_count(static_cast<const IsDirectedExpr*>(expr)->value.get(), var_name);
+        }
+        case ExpressionKind::IS_SOURCE_DEST: {
+            auto* s = static_cast<const IsSourceDestExpr*>(expr);
+            return is_variable_referenced_outside_count(s->value.get(), var_name) ||
+                   is_variable_referenced_outside_count(s->edge.get(), var_name);
+        }
+        case ExpressionKind::LIST_LITERAL: {
+            for (const auto& element : static_cast<const ListExpr*>(expr)->elements) {
+                if (is_variable_referenced_outside_count(element.get(), var_name)) return true;
+            }
+            return false;
+        }
+        case ExpressionKind::LIST_INDEX: {
+            auto* ie = static_cast<const IndexExpr*>(expr);
+            return is_variable_referenced_outside_count(ie->list.get(), var_name) ||
+                   is_variable_referenced_outside_count(ie->index.get(), var_name);
+        }
+        case ExpressionKind::LIST_COMPREHENSION: {
+            auto* lc = static_cast<const ListComprehensionExpr*>(expr);
+            return is_variable_referenced_outside_count(lc->list.get(), var_name) ||
+                   is_variable_referenced_outside_count(lc->filter.get(), var_name) ||
+                   is_variable_referenced_outside_count(lc->projection.get(), var_name);
+        }
+        case ExpressionKind::QUANTIFIED_PREDICATE: {
+            auto* qp = static_cast<const QuantifiedPredicateExpr*>(expr);
+            return is_variable_referenced_outside_count(qp->list.get(), var_name) ||
+                   is_variable_referenced_outside_count(qp->predicate.get(), var_name);
+        }
+        case ExpressionKind::TEMPORAL_FIELD:
+            return is_variable_referenced_outside_count(static_cast<const TemporalFieldExpr*>(expr)->value.get(), var_name);
         default:
             return false;
     }
@@ -768,9 +806,10 @@ void rewrite_khop_count_to_var(std::unique_ptr<Expression>& expr, const std::str
 
 void collect_variables_from_matches(const std::vector<MatchStatement>& matches, std::set<std::string>& vars) {
     for (const auto& match : matches) {
-        if (match.is_search) {
+        if (match.is_search || match.is_propagate) {
             if (!match.yield_var.empty()) vars.insert(match.yield_var);
             if (!match.yield_score_var.empty()) vars.insert(match.yield_score_var);
+            if (!match.yield_depth_var.empty()) vars.insert(match.yield_depth_var);
         } else {
             for (const auto& node : match.pattern.nodes) {
                 if (!node.variable.empty()) vars.insert(node.variable);

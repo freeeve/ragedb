@@ -119,7 +119,7 @@ void JoinEliminator::semantic_join_elimination_pass(GqlQuery& query) {
     if (mandatory.empty()) return;
     
     for (auto& match : query.matches) {
-        if (match.is_search || match.is_optional) continue;
+        if (match.is_search || match.is_propagate || match.is_optional) continue;
         auto& pattern = match.pattern;
         
         if (pattern.nodes.size() == 2 && pattern.edges.size() == 1) {

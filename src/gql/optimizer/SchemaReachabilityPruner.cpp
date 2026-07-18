@@ -39,7 +39,7 @@ void SchemaReachabilityPruner::schema_reachability_pass(GqlQuery& query) {
     if (allowed.empty()) return; // No schema rules registered, skip pruning
 
     for (const auto& match : query.matches) {
-        if (match.is_search || match.is_khop) continue;
+        if (match.is_search || match.is_propagate || match.is_khop) continue;
         const auto& pattern = match.pattern;
         
         for (size_t i = 0; i < pattern.edges.size(); ++i) {

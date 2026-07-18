@@ -11,6 +11,14 @@ target_compile_features(project_options INTERFACE cxx_std_23)
 set_property(TARGET project_options PROPERTY CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
+# Git SHA of the build, embedded so the running server can report which revision it is (GET /version).
+# Supplied at configure time (the Docker build passes -DRAGEDB_GIT_SHA=... from a build-arg); defaults to
+# "unknown" when not provided (e.g. local test builds), so the macro is always defined.
+if(NOT RAGEDB_GIT_SHA)
+  set(RAGEDB_GIT_SHA "unknown")
+endif()
+add_compile_definitions(RAGEDB_GIT_SHA="${RAGEDB_GIT_SHA}")
+
 # Workaround for Clang compiling with libstdc++ where hardware destructive/constructive size is not defined.
 if(CMAKE_CXX_COMPILER_ID MATCHES ".*Clang")
   add_compile_definitions(__GCC_DESTRUCTIVE_SIZE=64 __GCC_CONSTRUCTIVE_SIZE=64)
@@ -248,6 +256,7 @@ add_executable(ragedb src/main/main.cpp src/main/util/stop_signal.hh
         src/gql/executor/PlanBuilder.cpp src/gql/executor/PlanBuilder.h
         src/gql/executor/HoneycombExecutor.cpp src/gql/executor/HoneycombExecutor.h
         src/gql/executor/LftjExecutor.cpp src/gql/executor/LftjExecutor.h
+        src/gql/executor/StreamingAggregates.cpp src/gql/executor/ExecutorInternal.h
 
         src/gql/GqlCatalog.cpp src/gql/GqlCatalog.h
         src/gql/GqlTypechecker.cpp src/gql/GqlTypechecker.h

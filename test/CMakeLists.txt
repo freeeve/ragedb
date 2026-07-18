@@ -16,8 +16,11 @@ add_executable(tests tests.cpp shard/ShardIds.cpp shard/Ids.cpp shard/NodeTypes.
         shard/algorithms/Community.cpp
         shard/algorithms/Clustering.cpp
         shard/algorithms/Distance.cpp
+        shard/algorithms/Propagate.cpp
         Link.cpp Node.cpp Graph.cpp
         types/Date.cpp
+        types/NTriplesParserTests.cpp
+        types/NTriplesLoaderTests.cpp
         gql/GqlTokenizerTests.cpp
         gql/GqlParserTests.cpp
         gql/optimizer/BasicOptimizerTests.cpp
@@ -70,6 +73,10 @@ add_executable(tests tests.cpp shard/ShardIds.cpp shard/Ids.cpp shard/NodeTypes.
         gql/GqlExecutorWriteTests.cpp
         gql/GqlExecutorAggregationTests.cpp
         gql/GqlExecutorGroupedExpansionTests.cpp
+        gql/GqlExecutorPagingTests.cpp
+        gql/GqlExecutorCastLabelTests.cpp
+        gql/GqlExecutorForTests.cpp
+        gql/GqlExecutorScalarFunctionTests.cpp
         gql/GqlExecutorSchemaTests.cpp
         gql/GqlTypecheckerTests.cpp
         gql/GqlQueryCacheTests.cpp
@@ -132,6 +139,7 @@ add_executable(tests tests.cpp shard/ShardIds.cpp shard/Ids.cpp shard/NodeTypes.
         ../src/gql/executor/PlanBuilder.cpp ../src/gql/executor/PlanBuilder.h
         ../src/gql/executor/HoneycombExecutor.cpp ../src/gql/executor/HoneycombExecutor.h
         ../src/gql/executor/LftjExecutor.cpp ../src/gql/executor/LftjExecutor.h
+        ../src/gql/executor/StreamingAggregates.cpp ../src/gql/executor/ExecutorInternal.h
         ../src/gql/GqlCatalog.cpp ../src/gql/GqlCatalog.h
         ../src/gql/GqlTypechecker.cpp ../src/gql/GqlTypechecker.h
         ../src/gql/GqlValue.cpp ../src/gql/GqlValue.h
@@ -139,6 +147,9 @@ add_executable(tests tests.cpp shard/ShardIds.cpp shard/Ids.cpp shard/NodeTypes.
         ../src/gql/GqlAst.h
         )
 target_link_libraries(tests PRIVATE project_warnings project_options catch_main Graph Seastar::seastar)
+# lld links the tests binary in a fraction of GNU ld's peak memory (149 TUs statically linked against
+# seastar + iresearch), keeping the link under a 16GB box's budget where GNU ld OOM-killed it.
+target_link_options(tests PRIVATE -fuse-ld=lld)
 target_include_directories(tests PRIVATE
         ../src/graph
         ../src/graph/eve
@@ -225,6 +236,7 @@ add_executable(tests2 main/ConnectedHandler.cpp
         ../src/gql/executor/PlanBuilder.cpp ../src/gql/executor/PlanBuilder.h
         ../src/gql/executor/HoneycombExecutor.cpp ../src/gql/executor/HoneycombExecutor.h
         ../src/gql/executor/LftjExecutor.cpp ../src/gql/executor/LftjExecutor.h
+        ../src/gql/executor/StreamingAggregates.cpp ../src/gql/executor/ExecutorInternal.h
         ../src/gql/GqlCatalog.cpp ../src/gql/GqlCatalog.h
         ../src/gql/GqlTypechecker.cpp ../src/gql/GqlTypechecker.h
         ../src/gql/GqlValue.cpp ../src/gql/GqlValue.h

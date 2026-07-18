@@ -543,7 +543,7 @@ TEST_CASE("GQL Parser parses VIEW and CONSTRAINT DDL", "[gql_parser]") {
 
 
 
-TEST_CASE("NEXT projection items and reserved-word identifiers (task 019)", "[gql_parser][task019]") {
+TEST_CASE("NEXT projection items and reserved-word identifiers", "[gql_parser]") {
     SECTION("non-variable RETURN items before NEXT require an alias") {
         REQUIRE_THROWS_WITH(
             GqlParser::parse("MATCH (p:Person) RETURN p.name NEXT MATCH (q:Person) RETURN q"),
@@ -570,7 +570,7 @@ TEST_CASE("NEXT projection items and reserved-word identifiers (task 019)", "[gq
     }
 }
 
-TEST_CASE("ORDER BY resolves RETURN aliases into sort keys (task 027)", "[gql_parser][task027]") {
+TEST_CASE("ORDER BY resolves RETURN aliases into sort keys", "[gql_parser]") {
     SECTION("aggregate alias becomes the aggregate expression") {
         auto q = GqlParser::parse(
             "MATCH (t:Tag)<-[:HAS_TAG]-(post) RETURN t.name AS name, count(DISTINCT post) AS cnt "
@@ -606,7 +606,7 @@ TEST_CASE("ORDER BY resolves RETURN aliases into sort keys (task 027)", "[gql_pa
     }
 }
 
-TEST_CASE("EXISTS accepts an openCypher-style bare pattern subquery (task 018)", "[gql_parser][task018]") {
+TEST_CASE("EXISTS accepts an openCypher-style bare pattern subquery", "[gql_parser]") {
     auto q = GqlParser::parse(
         "MATCH (a:Person) WHERE EXISTS { (a)-[:KNOWS]->(b:Person) } RETURN a.name");
     REQUIRE(q.where_expr != nullptr);
@@ -617,7 +617,7 @@ TEST_CASE("EXISTS accepts an openCypher-style bare pattern subquery (task 018)",
     REQUIRE(q2.matches.size() == 2);
 }
 
-TEST_CASE("GQL interleaved MATCH ... WHERE ... MATCH within a segment (task 030)", "[gql_parser][task030]") {
+TEST_CASE("GQL interleaved MATCH ... WHERE ... MATCH within a segment", "[gql_parser]") {
     SECTION("single segment: MATCH WHERE MATCH RETURN") {
         auto q = GqlParser::parse(
             "MATCH (a:Person)-[:KNOWS]-(f:Person) WHERE f.id <> 1 "
@@ -639,7 +639,7 @@ TEST_CASE("GQL interleaved MATCH ... WHERE ... MATCH within a segment (task 030)
     }
 }
 
-TEST_CASE("GQL IN-list membership desugars to an OR chain (task 031)", "[gql_parser][task031]") {
+TEST_CASE("GQL IN-list membership desugars to an OR chain", "[gql_parser]") {
     auto q = GqlParser::parse(
         "MATCH (c:Country) WHERE c.name IN ['China', 'Germany'] RETURN c.name");
     REQUIRE(q.where_expr != nullptr);
@@ -666,7 +666,7 @@ TEST_CASE("GQL IN-list membership desugars to an OR chain (task 031)", "[gql_par
     }
 }
 
-TEST_CASE("GQL ISO linear-query NEXT/FILTER lowering (task 032)", "[gql_parser][task032]") {
+TEST_CASE("GQL ISO linear-query NEXT/FILTER lowering", "[gql_parser]") {
     SECTION("RETURN ... NEXT is a projection boundary that feeds the next statement") {
         auto next_q = GqlParser::parse(
             "MATCH (a:Person) RETURN a.id AS x NEXT MATCH (b:Person) WHERE b.id = x RETURN b.name");
@@ -712,12 +712,43 @@ TEST_CASE("GQL ISO linear-query NEXT/FILTER lowering (task 032)", "[gql_parser][
         REQUIRE(q.with_segments[0]->limit.value() == 20);
         REQUIRE(q.with_segments[0]->order_by.size() == 1);
     }
-    SECTION("openCypher WITH is rejected (pure GQL dialect, task 033)") {
+    SECTION("openCypher WITH is rejected (pure GQL dialect)") {
         REQUIRE_THROWS_WITH(
             GqlParser::parse("MATCH (a:Person) WITH a AS x RETURN x.name"),
             Catch::Contains("WITH is not GQL"));
     }
-    SECTION("standalone ORDER BY/LIMIT sort-page then RETURN pushes top-K to producer (IC2/IS2, task 034)") {
+    SECTION("an unimplemented function is a hard error, not a silent NULL") {
+        // These are still not implemented -- openCypher spellings (toInteger/toString/labels/type) and
+        // the Cypher-only shortestPath() function -- and used to parse, typecheck as ANY and evaluate to
+        // NULL, so a query calling them returned plausible-looking wrong answers instead of failing.
+        // (abs/upper/coalesce and friends ARE implemented now, so they are no longer here.)
+        for (const auto& call : { "toInteger(p.age)", "toString(p.age)", "labels(p)",
+                                  "keys(p)", "head(p.name)", "shortestPath(p)" }) {
+            INFO("call: " << call);
+            REQUIRE_THROWS_WITH(
+                GqlParser::parse(std::string("MATCH (p:Person) RETURN ") + call + " AS v"),
+                Catch::Contains("Unknown function"));
+        }
+    }
+    SECTION("the implemented scalar functions still parse") {
+        REQUIRE_NOTHROW(GqlParser::parse(
+            "MATCH p = ANY SHORTEST (a:Person)-[:KNOWS]-{1,3}(b:Person) RETURN length(p) AS d"));
+        REQUIRE_NOTHROW(GqlParser::parse(
+            "MATCH (m:Post) FILTER m.creationDate >= zoned_datetime('2011-07-01') RETURN count(m) AS n"));
+    }
+    SECTION("openCypher collect() is rejected in favour of collect_list()") {
+        REQUIRE_THROWS_WITH(
+            GqlParser::parse("MATCH (a:Person) RETURN collect(a.name) AS names"),
+            Catch::Contains("collect is not GQL"));
+        // The ISO GQL general set function still parses, DISTINCT and all.
+        auto q = GqlParser::parse("MATCH (a:Person) RETURN collect_list(DISTINCT a.name) AS names");
+        REQUIRE(q.returns.size() == 1);
+        REQUIRE(q.returns[0].expr->kind == ExpressionKind::AGGREGATION);
+        const auto* agg = static_cast<const AggregateExpr*>(q.returns[0].expr.get());
+        REQUIRE(agg->fn_kind == AggregateKind::COLLECT);
+        REQUIRE(agg->distinct);
+    }
+    SECTION("standalone ORDER BY/LIMIT sort-page then RETURN pushes top-K to producer (IC2/IS2)") {
         auto q = GqlParser::parse(
             "MATCH (p:Person {id: 1})<-[:HAS_CREATOR]-(m:Message) "
             "RETURN m.creationDate AS ms, m.id AS mid "
@@ -788,7 +819,7 @@ TEST_CASE("GQL ISO linear-query NEXT/FILTER lowering (task 032)", "[gql_parser][
     }
 }
 
-TEST_CASE("GQL scalar functions and CASE expressions (task 032 slice: length/CASE/zoned_datetime)", "[gql_parser][task032_expr]") {
+TEST_CASE("GQL scalar functions and CASE expressions (length/CASE/zoned_datetime)", "[gql_parser]") {
     SECTION("length(p) is a scalar function call") {
         auto q = GqlParser::parse(
             "MATCH p = ANY SHORTEST (a)-[:KNOWS]-{1,3}(f) RETURN length(p) AS d");
@@ -877,6 +908,17 @@ TEST_CASE("GQL scalar functions and CASE expressions (task 032 slice: length/CAS
             "RETURN foaf.id AS personId, 2 * common - total AS commonInterestScore "
             "ORDER BY commonInterestScore DESC, personId ASC LIMIT 10"));
     }
+    SECTION("COUNT { } whose WHERE is an EXISTS keeps the nested subquery (IC10 common)") {
+        // The correlated precompute reduces a SizeExpr over its sub-rows and recurses into a WHERE that
+        // nests a further subquery; lock that the parser yields exactly that SIZE_OP -> EXISTS shape.
+        auto q = GqlParser::parse(
+            "MATCH (p:Person) RETURN COUNT { (p)-[:KNOWS]->(x:Person) "
+            "WHERE EXISTS { (x)-[:KNOWS]->(y:Person) } } AS c");
+        REQUIRE(q.returns[0].expr->kind == ExpressionKind::SIZE_OP);
+        auto* se = static_cast<SizeExpr*>(q.returns[0].expr.get());
+        REQUIRE(se->where_expr != nullptr);
+        REQUIRE(se->where_expr->kind == ExpressionKind::EXISTS);
+    }
     SECTION("collect_list(DISTINCT x) is a COLLECT aggregate") {
         auto q = GqlParser::parse("MATCH (t:Tag) RETURN collect_list(DISTINCT t) AS tags");
         REQUIRE(q.returns[0].expr->kind == ExpressionKind::AGGREGATION);
@@ -908,4 +950,91 @@ TEST_CASE("GQL scalar functions and CASE expressions (task 032 slice: length/CAS
             "RETURN t.name AS tagName, count(DISTINCT post) AS postCount "
             "ORDER BY postCount DESC, tagName ASC LIMIT 10"));
     }
+}
+
+TEST_CASE("path mode is accepted after the path variable, not only before it", "[gql_parser]") {
+    SECTION("p = TRAIL (...) sets TRAIL (FinBench CR1 shape)") {
+        auto q = GqlParser::parse(
+            "MATCH p = TRAIL (a:Account)-[:transfer]->{1,3}(b:Account) RETURN p");
+        REQUIRE(q.matches[0].path_mode == PathMode::TRAIL);
+        REQUIRE(q.matches[0].path_variable == "p");
+    }
+    SECTION("p = ACYCLIC (...) sets ACYCLIC (FinBench CR5 shape)") {
+        auto q = GqlParser::parse(
+            "MATCH p = ACYCLIC (a:Account)-[:transfer]->{1,3}(b:Account) RETURN p");
+        REQUIRE(q.matches[0].path_mode == PathMode::ACYCLIC);
+    }
+    SECTION("the pre-assignment form TRAIL p = (...) still works") {
+        auto q = GqlParser::parse(
+            "MATCH TRAIL p = (a:Account)-[:transfer]->{1,3}(b:Account) RETURN p");
+        REQUIRE(q.matches[0].path_mode == PathMode::TRAIL);
+    }
+}
+
+TEST_CASE("CALL fts.search(...) YIELD translates to a search match statement", "[gql_parser]") {
+    // spb fts shape: a full-text search prefix binding a node variable, then a follow-on MATCH uses it.
+    auto q = GqlParser::parse(
+        "CALL fts.search('CreativeWork', 'title', 'policy') YIELD node AS w "
+        "MATCH (w)-[:about]->(x) RETURN w");
+    REQUIRE(q.matches.size() >= 2);
+    REQUIRE(q.matches[0].is_search);
+    REQUIRE(q.matches[0].search_type == "CreativeWork");
+    REQUIRE(q.matches[0].search_properties.size() == 1);
+    REQUIRE(q.matches[0].search_properties[0] == "title");
+    REQUIRE(q.matches[0].search_string == "policy");
+    REQUIRE(q.matches[0].yield_var == "w");
+    REQUIRE(q.matches[1].is_search == false);   // the follow-on MATCH
+}
+
+TEST_CASE("CALL algo.propagate(...) YIELD parses into a propagate match statement", "[gql_parser]") {
+    // finbench CR8 shape: a value-propagating first-claim BFS over correlated seed/value lists, then
+    // a follow-on RETURN reads the three yielded columns (node, value, depth).
+    auto q = GqlParser::parse(
+        "CALL algo.propagate(seeds, vals, ['transfer', 'withdraw'], 'out', 3, 'amount', 'asc', 10000) "
+        "YIELD node AS dst, value AS inflow, depth AS dist "
+        "RETURN dst.id AS dstId");
+    REQUIRE(q.matches.size() >= 1);
+    REQUIRE(q.matches[0].is_propagate);
+    REQUIRE(q.matches[0].is_search == false);
+    REQUIRE(q.matches[0].propagate_args.size() == 8);
+    REQUIRE(q.matches[0].yield_var == "dst");
+    REQUIRE(q.matches[0].yield_score_var == "inflow");
+    REQUIRE(q.matches[0].yield_depth_var == "dist");
+}
+
+TEST_CASE("CALL (imports) { subquery } parses a scoped subquery segment", "[gql_parser]") {
+    // bi q4 shape: import an outer variable into a nested UNION ALL subquery whose rows feed the segment.
+    auto q = GqlParser::parse(
+        "CALL (topForums) {"
+        "  FOR f IN topForums MATCH (f)-[:CONTAINER_OF]->(p:Post) RETURN p AS person, count(p) AS c"
+        "  UNION ALL"
+        "  FOR f IN topForums MATCH (x:Person)<-[:HAS_MEMBER]-(f) RETURN x AS person, 0 AS c"
+        "} "
+        "RETURN person, sum(c) AS total ORDER BY total DESC");
+    REQUIRE(q.call_import_vars.size() == 1);
+    REQUIRE(q.call_import_vars[0] == "topForums");
+    REQUIRE(q.call_subquery != nullptr);
+    REQUIRE(q.call_subquery->kind == QueryKind::UNION_ALL);
+    REQUIRE(q.returns.size() == 2);
+}
+
+TEST_CASE("CALL (imports) { subquery } accepts a single-branch body and multiple imports", "[gql_parser]") {
+    auto q = GqlParser::parse(
+        "CALL (xs, ys) { FOR x IN xs MATCH (p:Person) RETURN p AS person } RETURN person");
+    REQUIRE(q.call_import_vars.size() == 2);
+    REQUIRE(q.call_import_vars[0] == "xs");
+    REQUIRE(q.call_import_vars[1] == "ys");
+    REQUIRE(q.call_subquery != nullptr);
+    REQUIRE(q.call_subquery->kind == QueryKind::SINGLE);
+}
+
+TEST_CASE("CALL algo.propagate YIELD columns are order-independent and default to their names", "[gql_parser]") {
+    auto q = GqlParser::parse(
+        "CALL algo.propagate(s, v, ['t'], 'out', 2, 'amount', 'desc', 0) "
+        "YIELD depth, node, value "
+        "RETURN node");
+    REQUIRE(q.matches[0].is_propagate);
+    REQUIRE(q.matches[0].yield_var == "node");
+    REQUIRE(q.matches[0].yield_score_var == "value");
+    REQUIRE(q.matches[0].yield_depth_var == "depth");
 }

@@ -15,11 +15,13 @@
  */
 
 #include "GqlParser.h"
+#include "GqlValue.h"
 #include <stdexcept>
 #include <algorithm>
 #include <cctype>
 #include <limits>
 #include <memory>
+#include <optional>
 
 namespace ragedb::gql {
 
@@ -180,6 +182,47 @@ static std::unique_ptr<Expression> substitute_return_aliases(
             in->list = substitute_return_aliases(std::move(in->list), aliases);
             return expr;
         }
+        case ExpressionKind::CAST: {
+            auto* c = static_cast<CastExpr*>(expr.get());
+            c->value = substitute_return_aliases(std::move(c->value), aliases);
+            return expr;
+        }
+        case ExpressionKind::IS_LABELED: {
+            auto* l = static_cast<IsLabeledExpr*>(expr.get());
+            l->value = substitute_return_aliases(std::move(l->value), aliases);
+            return expr;
+        }
+        case ExpressionKind::LIST_LITERAL: {
+            auto* le = static_cast<ListExpr*>(expr.get());
+            for (auto& element : le->elements) {
+                element = substitute_return_aliases(std::move(element), aliases);
+            }
+            return expr;
+        }
+        case ExpressionKind::LIST_INDEX: {
+            auto* ie = static_cast<IndexExpr*>(expr.get());
+            ie->list = substitute_return_aliases(std::move(ie->list), aliases);
+            ie->index = substitute_return_aliases(std::move(ie->index), aliases);
+            return expr;
+        }
+        case ExpressionKind::LIST_COMPREHENSION: {
+            auto* lc = static_cast<ListComprehensionExpr*>(expr.get());
+            lc->list = substitute_return_aliases(std::move(lc->list), aliases);
+            if (lc->filter) lc->filter = substitute_return_aliases(std::move(lc->filter), aliases);
+            if (lc->projection) lc->projection = substitute_return_aliases(std::move(lc->projection), aliases);
+            return expr;
+        }
+        case ExpressionKind::QUANTIFIED_PREDICATE: {
+            auto* qp = static_cast<QuantifiedPredicateExpr*>(expr.get());
+            qp->list = substitute_return_aliases(std::move(qp->list), aliases);
+            if (qp->predicate) qp->predicate = substitute_return_aliases(std::move(qp->predicate), aliases);
+            return expr;
+        }
+        case ExpressionKind::TEMPORAL_FIELD: {
+            auto* tf = static_cast<TemporalFieldExpr*>(expr.get());
+            tf->value = substitute_return_aliases(std::move(tf->value), aliases);
+            return expr;
+        }
         default:
             return expr;
     }
@@ -187,7 +230,7 @@ static std::unique_ptr<Expression> substitute_return_aliases(
 
 /**
  * @brief Bind the RETURN/WITH projection's output aliases into the ORDER BY sort-key scope by
- *        substituting them with their defining expressions (task 027).
+ *        substituting them with their defining expressions.
  */
 static void resolve_order_by_aliases(GqlQuery& query) {
     if (query.order_by.empty() || query.returns.empty()) return;
@@ -201,6 +244,29 @@ static void resolve_order_by_aliases(GqlQuery& query) {
     for (auto& spec : query.order_by) {
         spec.expr = substitute_return_aliases(std::move(spec.expr), aliases);
     }
+}
+
+/**
+ * @brief Parse an optional ISO GQL `GROUP BY <var> (, <var>)*` clause into query.group_by. GROUP is a
+ *        keyword but the following BY is not, so it arrives as an identifier. Only fires when both are
+ *        present, so a bare GROUP elsewhere (e.g. SHORTEST k GROUP) is untouched.
+ */
+void GqlParser::parse_group_by(GqlQuery& query) {
+    if (!check(TokenType::GROUP_KW)) return;
+    Token by = peek(1);
+    std::string by_up = by.text;
+    std::transform(by_up.begin(), by_up.end(), by_up.begin(), [](unsigned char c){ return std::toupper(c); });
+    if (by.type != TokenType::NAME || by_up != "BY") return;
+    advance(); // GROUP
+    advance(); // BY
+    do {
+        if (!check(TokenType::NAME)) {
+            throw std::runtime_error("Expected a grouping variable after GROUP BY");
+        }
+        std::string var = peek().text;
+        advance();
+        query.group_by.push_back(std::make_unique<VariableExpr>(var));
+    } while (match(TokenType::COMMA));
 }
 
 /**
@@ -223,13 +289,23 @@ void GqlParser::parse_order_by(GqlQuery& query) {
 }
 
 /**
- * @brief Parse an optional LIMIT clause into query.limit.
+ * @brief Parse the optional OFFSET and LIMIT page clauses into query.offset / query.limit. Either order is
+ *        accepted, so both `OFFSET 10 LIMIT 5` and `LIMIT 5 OFFSET 10` parse.
  */
 void GqlParser::parse_limit(GqlQuery& query) {
-    if (!match(TokenType::LIMIT)) return;
-    std::string num_str = peek().text;
-    consume(TokenType::NUMBER, "Expected integer limit value");
-    query.limit = std::stoull(num_str);
+    for (;;) {
+        if (match(TokenType::LIMIT)) {
+            std::string num_str = peek().text;
+            consume(TokenType::NUMBER, "Expected integer limit value");
+            query.limit = std::stoull(num_str);
+        } else if (match(TokenType::OFFSET)) {
+            std::string num_str = peek().text;
+            consume(TokenType::NUMBER, "Expected integer offset value");
+            query.offset = std::stoull(num_str);
+        } else {
+            return;
+        }
+    }
 }
 
 static void validate_insert_label_expr(const std::shared_ptr<LabelExpression>& expr) {
@@ -261,11 +337,142 @@ GqlQuery GqlParser::parse_single_query() {
     if (pending_having) {
         query.where_expr = std::move(pending_having);
     }
+
+    // ISO GQL scoped subquery: `CALL (v1, v2, ...) { <subquery incl UNION ALL> }`. This sources the
+    // segment: the named outer variables are imported into a nested subquery, which is run and whose
+    // result rows are piped into this segment's projection (in place of a MATCH). The '(' immediately
+    // after CALL distinguishes it from a procedure call (CALL fts.search / CALL algo.propagate).
+    if (check(TokenType::CALL) && peek(1).type == TokenType::LPAREN) {
+        advance(); // CALL
+        consume(TokenType::LPAREN, "Expected '(' after CALL");
+        std::vector<std::string> imports;
+        if (!check(TokenType::RPAREN)) {
+            do {
+                imports.push_back(peek().text);
+                consume(TokenType::NAME, "Expected a variable name in the CALL import list");
+            } while (match(TokenType::COMMA));
+        }
+        consume(TokenType::RPAREN, "Expected ')' after the CALL import list");
+        consume(TokenType::LBRACE, "Expected '{' to open the CALL subquery");
+        GqlQuery sub = parse_union();
+        consume(TokenType::RBRACE, "Expected '}' to close the CALL subquery");
+        query.call_import_vars = std::move(imports);
+        query.call_subquery = std::make_shared<GqlQuery>(std::move(sub));
+    }
+
     // Parse MATCH/OPTIONAL MATCH clauses. A WHERE may sit between MATCH groups
     // (MATCH ... WHERE ... MATCH ... RETURN): after each group we take an optional WHERE and loop
     // back so a following MATCH keeps extending the same segment.
     while (true) {
-    while (check(TokenType::MATCH) || (check(TokenType::OPTIONAL) && peek(1).type == TokenType::MATCH)) {
+    while (check(TokenType::MATCH) || (check(TokenType::OPTIONAL) && peek(1).type == TokenType::MATCH) ||
+           check(TokenType::CALL)) {
+        // CALL fts.search('Type', 'prop', 'query') YIELD node [AS v] [, score [AS s]] -- a full-text search
+        // query prefix. Translate to the same search MatchStatement the `<v> IN SEARCH (...)` syntax builds
+        // (shared executor path); a follow-on MATCH/RETURN then references the yielded variable.
+        if (check(TokenType::CALL)) {
+            advance(); // CALL
+            // Procedure name namespace.name. `search` lexes as the SEARCH keyword (like the IN SEARCH form),
+            // so accept SEARCH or NAME for each part, and compare case-insensitively.
+            auto lower = [](std::string s) {
+                std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                return s;
+            };
+            std::string ns = lower(peek().text);
+            if (!check(TokenType::NAME) && !check(TokenType::SEARCH))
+                throw std::runtime_error("Expected a procedure namespace after CALL");
+            advance();
+            consume(TokenType::DOT, "Expected '.' in procedure name");
+            std::string proc = lower(peek().text);
+            if (!check(TokenType::NAME) && !check(TokenType::SEARCH))
+                throw std::runtime_error("Expected a procedure name after '.'");
+            advance();
+            // CALL algo.propagate(seeds, values, relTypes, direction, maxDepth, valueProp, order, cap)
+            //   YIELD node [AS a], value [AS b], depth [AS c]
+            // A value-propagating first-claim BFS. The arguments are correlated expressions (the seed
+            // list and value list are bound upstream), so parse each as a full expression; the executor
+            // evaluates them per incoming row. The three output columns are fixed (node, value, depth).
+            if (ns == "algo" && proc == "propagate") {
+                MatchStatement prop_stmt;
+                prop_stmt.is_propagate = true;
+                consume(TokenType::LPAREN, "Expected '(' after algo.propagate");
+                while (!check(TokenType::RPAREN)) {
+                    prop_stmt.propagate_args.push_back(std::shared_ptr<Expression>(parse_expression().release()));
+                    if (!match(TokenType::COMMA)) break;
+                }
+                consume(TokenType::RPAREN, "Expected ')' after algo.propagate arguments");
+                consume(TokenType::YIELD, "Expected 'YIELD' after algo.propagate(...)");
+                // Fixed output columns node/value/depth, order-independent, each optionally aliased with AS.
+                // 'node' lexes as the NODE keyword; 'value' and 'depth' lex as NAME.
+                bool got_col = false;
+                while (true) {
+                    std::string col;
+                    if (check(TokenType::NODE)) { col = "node"; advance(); }
+                    else if (check(TokenType::NAME)) { col = peek().text; advance(); }
+                    else break;
+                    std::string lcol = lower(col);
+                    std::string bindv = col;
+                    if (match(TokenType::AS)) {
+                        bindv = peek().text;
+                        consume(TokenType::NAME, "Expected alias after AS");
+                    }
+                    if (lcol == "node") prop_stmt.yield_var = bindv;
+                    else if (lcol == "value") prop_stmt.yield_score_var = bindv;
+                    else if (lcol == "depth") prop_stmt.yield_depth_var = bindv;
+                    else throw std::runtime_error("Unknown algo.propagate YIELD column: " + col);
+                    got_col = true;
+                    if (!match(TokenType::COMMA)) break;
+                }
+                if (!got_col)
+                    throw std::runtime_error("Expected YIELD columns after algo.propagate(...)");
+                prop_stmt.id = match_id_counter++;
+                query.matches.push_back(std::move(prop_stmt));
+                continue;
+            }
+            if (ns != "fts" || proc != "search") {
+                throw std::runtime_error("Unsupported CALL procedure: " + ns + "." + proc +
+                                         " (only fts.search or algo.propagate are supported)");
+            }
+            MatchStatement search_stmt;
+            search_stmt.is_search = true;
+            consume(TokenType::LPAREN, "Expected '(' after fts.search");
+            search_stmt.search_type = peek().text;
+            consume(TokenType::STRING_LIT, "Expected node type name string in fts.search");
+            consume(TokenType::COMMA, "Expected ',' after fts.search type");
+            search_stmt.search_properties.push_back(peek().text);
+            consume(TokenType::STRING_LIT, "Expected property name string in fts.search");
+            consume(TokenType::COMMA, "Expected ',' after fts.search property");
+            search_stmt.search_string = peek().text;
+            consume(TokenType::STRING_LIT, "Expected query string in fts.search");
+            consume(TokenType::RPAREN, "Expected ')' after fts.search arguments");
+            consume(TokenType::YIELD, "Expected 'YIELD' after fts.search(...)");
+            // YIELD node [AS v] [, score [AS s]] -- the node column binds to v (or itself); score is
+            // optional. `node` lexes as the NODE keyword, `score` as a NAME, so accept either token here.
+            std::string ycol = peek().text;
+            if (!check(TokenType::NODE) && !check(TokenType::NAME))
+                throw std::runtime_error("Expected a yield column after YIELD");
+            advance();
+            if (match(TokenType::AS)) {
+                search_stmt.yield_var = peek().text;
+                consume(TokenType::NAME, "Expected alias after AS");
+            } else {
+                search_stmt.yield_var = ycol;
+            }
+            if (match(TokenType::COMMA)) {
+                std::string scol = peek().text;
+                if (!check(TokenType::NODE) && !check(TokenType::NAME))
+                    throw std::runtime_error("Expected a second yield column");
+                advance();
+                if (match(TokenType::AS)) {
+                    search_stmt.yield_score_var = peek().text;
+                    consume(TokenType::NAME, "Expected alias after AS");
+                } else {
+                    search_stmt.yield_score_var = scol;
+                }
+            }
+            search_stmt.id = match_id_counter++;
+            query.matches.push_back(std::move(search_stmt));
+            continue;
+        }
         MatchStatement stmt;
         if (match(TokenType::OPTIONAL)) {
             stmt.is_optional = true;
@@ -309,6 +516,18 @@ GqlQuery GqlParser::parse_single_query() {
             advance(); // Consume variable
             advance(); // Consume '='
 
+            // GQL also allows the path mode after the assignment (e.g. p = TRAIL (...)), not only
+            // before it (TRAIL p = ...). The executor honors either position.
+            if (match(TokenType::TRAIL_KW)) {
+                stmt.path_mode = PathMode::TRAIL;
+            } else if (match(TokenType::ACYCLIC_KW)) {
+                stmt.path_mode = PathMode::ACYCLIC;
+            } else if (match(TokenType::SIMPLE_KW)) {
+                stmt.path_mode = PathMode::SIMPLE;
+            } else if (match(TokenType::WALK_KW)) {
+                stmt.path_mode = PathMode::WALK;
+            }
+
             // Parse shortest path selectors:
             // 1. ALL SHORTEST paths or ALL CHEAPEST paths
             if (check(TokenType::ALL_KW) && peek(1).type == TokenType::SHORTEST_KW) {
@@ -339,7 +558,7 @@ GqlQuery GqlParser::parse_single_query() {
                 advance(); // consume SHORTEST
                 uint64_t k = 1;
                 if (check(TokenType::NUMBER)) {
-                    k = peek().int_value;
+                    k = static_cast<uint64_t>(peek().int_value);
                     advance();
                 }
                 stmt.shortest_path_k = k;
@@ -352,7 +571,7 @@ GqlQuery GqlParser::parse_single_query() {
             } else if (match(TokenType::CHEAPEST_KW)) {
                 uint64_t k = 1;
                 if (check(TokenType::NUMBER)) {
-                    k = peek().int_value;
+                    k = static_cast<uint64_t>(peek().int_value);
                     advance();
                     stmt.shortest_path_kind = ShortestPathKind::CHEAPEST_K;
                     stmt.shortest_path_k = k;
@@ -452,8 +671,11 @@ GqlQuery GqlParser::parse_single_query() {
                 }
                 if (current_stmt.shortest_path_kind == ShortestPathKind::CHEAPEST ||
                     current_stmt.shortest_path_kind == ShortestPathKind::ALL_CHEAPEST ||
-                    current_stmt.shortest_path_kind == ShortestPathKind::CHEAPEST_K) {
-                    // Backwards compatibility for old-style COST clause placed outside the path pattern
+                    current_stmt.shortest_path_kind == ShortestPathKind::CHEAPEST_K ||
+                    current_stmt.shortest_path_kind == ShortestPathKind::ANY) {
+                    // A COST clause after the pattern (LDBC form: ANY SHORTEST (a)-[r]-{1,}(b) COST r.w)
+                    // selects the cheapest-by-weight path; the executor routes ANY+cost through the
+                    // weighted search. Also the legacy CHEAPEST-family placement.
                     if (match(TokenType::COST_KW)) {
                         auto expr = parse_expression();
                         if (!current_stmt.pattern.edges.empty()) {
@@ -486,11 +708,22 @@ GqlQuery GqlParser::parse_single_query() {
             item.expr = parse_expression();
             query.let_bindings.push_back(std::move(item));
         } while (match(TokenType::COMMA));
+    } else if (match(TokenType::FOR)) {
+        // ISO GQL FOR expands a list into one row per element (the standard's UNWIND). Unlike LET, which
+        // adds a column, FOR multiplies the working table's rows.
+        do {
+            ForBinding binding;
+            binding.variable = consume_identifier("Expected variable name after 'FOR'");
+            consume(TokenType::IN_KW, "Expected 'IN' after FOR variable");
+            binding.list_expr = parse_expression();
+            query.for_bindings.push_back(std::move(binding));
+        } while (match(TokenType::COMMA));
     }
-    // A segment is a free sequence of simple statements (MATCH / FILTER / LET); keep extending it while
-    // more of them follow. MATCH ... WHERE ... MATCH ... and FILTER ... MATCH ... both round-trip here.
+    // A segment is a free sequence of simple statements (MATCH / FILTER / LET / FOR); keep extending it
+    // while more of them follow. MATCH ... WHERE ... MATCH ... and FILTER ... MATCH ... both round-trip here.
     if (check(TokenType::MATCH) || (check(TokenType::OPTIONAL) && peek(1).type == TokenType::MATCH) ||
-        check(TokenType::WHERE) || check(TokenType::FILTER_KW) || check(TokenType::LET_KW)) {
+        check(TokenType::WHERE) || check(TokenType::FILTER_KW) || check(TokenType::LET_KW) ||
+        check(TokenType::FOR)) {
         continue;
     }
     break;
@@ -562,14 +795,17 @@ GqlQuery GqlParser::parse_single_query() {
     }
 
     // Verify we have at least one MATCH or write operation (a continuation segment after WITH may
-    // have neither--it operates on the rows piped in from the previous segment).
-    if (query.matches.empty() && query.writes.empty() && with_segments.empty()) {
+    // have neither--it operates on the rows piped in from the previous segment). A FOR statement is
+    // also a row source in its own right: `FOR x IN [1, 2, 3] RETURN x` matches nothing but still
+    // produces rows. A scoped subquery `CALL (imports) { ... }` is likewise a row source for the segment.
+    if (query.matches.empty() && query.writes.empty() && with_segments.empty() &&
+        query.for_bindings.empty() && !query.call_subquery) {
         throw std::runtime_error("Query must contain at least one MATCH or write clause");
     }
 
     // ISO GQL standalone ordering/paging statement: a segment may begin with ORDER BY [LIMIT] operating
     // on the working table piped in from the previous segment (no MATCH/RETURN of its own yet).
-    if ((check(TokenType::ORDER_BY) || check(TokenType::LIMIT)) &&
+    if ((check(TokenType::ORDER_BY) || check(TokenType::LIMIT) || check(TokenType::OFFSET)) &&
         query.matches.empty() && query.returns.empty() && query.let_bindings.empty() &&
         !with_segments.empty()) {
         parse_order_by(query);
@@ -597,7 +833,7 @@ GqlQuery GqlParser::parse_single_query() {
         }
         // Otherwise a RETURN follows and re-projects the ordered/paged rows. Push the ORDER BY/LIMIT
         // into the producing (previous) segment so its streaming top-K bounds the sort during the
-        // traversal, instead of materialising the whole intermediate to sort it here (task 034). Valid
+        // traversal, instead of materialising the whole intermediate to sort it here. Valid
         // because the order keys are the previous segment's output columns and this segment only
         // re-projects; only push when that segment has no ordering/paging of its own to clobber.
         auto& producer = with_segments.back();
@@ -612,7 +848,7 @@ GqlQuery GqlParser::parse_single_query() {
 
     // openCypher WITH is not ISO GQL. RageDB is a pure GQL dialect: reject WITH with guidance toward
     // the linear-query equivalents (RETURN ... NEXT for a projection boundary, LET for a value binding,
-    // FILTER for a post-projection predicate). See task 033.
+    // FILTER for a post-projection predicate).
     if (check(TokenType::WITH)) {
         throw std::runtime_error(
             "WITH is not GQL: use 'RETURN ... NEXT' for a projection boundary, 'LET x = ...' for a "
@@ -625,6 +861,7 @@ GqlQuery GqlParser::parse_single_query() {
             query.distinct = true;
         }
         parse_return_items(query, false);
+        parse_group_by(query);
 
         // ISO GQL: `RETURN ... [ORDER BY ...] [LIMIT ...] NEXT` is an intermediate projection that
         // feeds the next linear-query statement -- the same pipeline boundary as openCypher WITH.
@@ -685,8 +922,10 @@ GqlQuery GqlParser::parse_query() {
         }
     }
 
-    // 2. Parse special CALL CLEAR CACHE utility command
-    if (match(TokenType::CALL)) {
+    // 2. Parse special CALL CLEAR CACHE utility command. Other CALL forms (CALL fts.search(...)) are query
+    // prefixes handled in parse_single_query's statement loop, so only intercept CLEAR CACHE here.
+    if (check(TokenType::CALL) && peek(1).type == TokenType::CLEAR) {
+        advance(); // consume CALL
         consume(TokenType::CLEAR, "Expected 'CLEAR' after 'CALL'");
         consume(TokenType::CACHE, "Expected 'CACHE' after 'CLEAR'");
         GqlQuery query;
@@ -943,16 +1182,27 @@ GqlQuery GqlParser::parse_query() {
 }
 
 GqlQuery GqlParser::parse_union() {
+    // UNION and EXCEPT share precedence (both bind looser than INTERSECT), so a single left-to-right loop
+    // handles them. Each accepts the ISO GQL set quantifier ALL | DISTINCT; DISTINCT is the default, so a
+    // bare UNION and UNION DISTINCT mean the same thing.
     GqlQuery query = parse_intersect();
-    while (match(TokenType::UNION)) {
+    while (check(TokenType::UNION) || check(TokenType::EXCEPT)) {
+        const bool is_except = check(TokenType::EXCEPT);
+        advance();
         bool all = false;
         if (match(TokenType::ALL_KW)) {
             all = true;
+        } else {
+            match(TokenType::DISTINCT);   // optional explicit DISTINCT, the default
         }
         GqlQuery right = parse_intersect();
 
         GqlQuery combined;
-        combined.kind = all ? QueryKind::UNION_ALL : QueryKind::UNION;
+        if (is_except) {
+            combined.kind = all ? QueryKind::EXCEPT_ALL : QueryKind::EXCEPT;
+        } else {
+            combined.kind = all ? QueryKind::UNION_ALL : QueryKind::UNION;
+        }
         combined.left = std::make_unique<GqlQuery>(std::move(query));
         combined.right = std::make_unique<GqlQuery>(std::move(right));
         query = std::move(combined);
@@ -966,6 +1216,8 @@ GqlQuery GqlParser::parse_intersect() {
         bool all = false;
         if (match(TokenType::ALL_KW)) {
             all = true;
+        } else {
+            match(TokenType::DISTINCT);   // optional explicit DISTINCT, the default
         }
         GqlQuery right = parse_single_query();
 
@@ -991,13 +1243,13 @@ void GqlParser::parse_edge_details(PatternEdge& edge) {
         edge.min_hops = 1;
         edge.max_hops = std::numeric_limits<uint64_t>::max();
         if (check(TokenType::NUMBER)) {
-            uint64_t val = peek().int_value;
+            uint64_t val = static_cast<uint64_t>(peek().int_value);
             advance();
             if (match(TokenType::DOT)) {
                 consume(TokenType::DOT, "Expected '..' for repetition range");
                 edge.min_hops = val;
                 if (check(TokenType::NUMBER)) {
-                    edge.max_hops = peek().int_value;
+                    edge.max_hops = static_cast<uint64_t>(peek().int_value);
                     advance();
                 }
             } else {
@@ -1008,13 +1260,13 @@ void GqlParser::parse_edge_details(PatternEdge& edge) {
             consume(TokenType::DOT, "Expected '..' for repetition range");
             edge.min_hops = 1;
             if (check(TokenType::NUMBER)) {
-                edge.max_hops = peek().int_value;
+                edge.max_hops = static_cast<uint64_t>(peek().int_value);
                 advance();
             }
         }
     }
     if (check(TokenType::LBRACE)) {
-        edge.properties = parse_properties();
+        edge.properties = parse_properties(&edge.property_exprs);
     }
     if (match(TokenType::WHERE)) {
         edge.where_expr = parse_expression();
@@ -1078,12 +1330,12 @@ PathPattern GqlParser::parse_path_pattern() {
             } else if (match(TokenType::LBRACE)) {
                 edge.is_variable_length = true;
                 if (check(TokenType::NUMBER)) {
-                    uint64_t val = peek().int_value;
+                    uint64_t val = static_cast<uint64_t>(peek().int_value);
                     consume(TokenType::NUMBER, "Expected number");
                     if (match(TokenType::COMMA)) {
                         edge.min_hops = val;
                         if (check(TokenType::NUMBER)) {
-                            edge.max_hops = peek().int_value;
+                            edge.max_hops = static_cast<uint64_t>(peek().int_value);
                             consume(TokenType::NUMBER, "Expected number");
                         } else {
                             edge.max_hops = std::numeric_limits<uint64_t>::max();
@@ -1094,7 +1346,7 @@ PathPattern GqlParser::parse_path_pattern() {
                     }
                 } else if (match(TokenType::COMMA)) {
                     edge.min_hops = 0;
-                    edge.max_hops = peek().int_value;
+                    edge.max_hops = static_cast<uint64_t>(peek().int_value);
                     consume(TokenType::NUMBER, "Expected maximum hops");
                 } else {
                     throw std::runtime_error("Invalid quantifier format inside '{}'");
@@ -1120,12 +1372,12 @@ PathPattern GqlParser::parse_path_pattern() {
             } else if (match(TokenType::LBRACE)) {
                 edge.is_variable_length = true;
                 if (check(TokenType::NUMBER)) {
-                    uint64_t val = peek().int_value;
+                    uint64_t val = static_cast<uint64_t>(peek().int_value);
                     consume(TokenType::NUMBER, "Expected number");
                     if (match(TokenType::COMMA)) {
                         edge.min_hops = val;
                         if (check(TokenType::NUMBER)) {
-                            edge.max_hops = peek().int_value;
+                            edge.max_hops = static_cast<uint64_t>(peek().int_value);
                             consume(TokenType::NUMBER, "Expected number");
                         } else {
                             edge.max_hops = std::numeric_limits<uint64_t>::max();
@@ -1136,7 +1388,7 @@ PathPattern GqlParser::parse_path_pattern() {
                     }
                 } else if (match(TokenType::COMMA)) {
                     edge.min_hops = 0;
-                    edge.max_hops = peek().int_value;
+                    edge.max_hops = static_cast<uint64_t>(peek().int_value);
                     consume(TokenType::NUMBER, "Expected maximum hops");
                 } else {
                     throw std::runtime_error("Invalid quantifier format inside '{}'");
@@ -1159,13 +1411,13 @@ PathPattern GqlParser::parse_path_pattern() {
             bool is_range = false;
 
             if (check(TokenType::NUMBER)) {
-                uint64_t val = peek().int_value;
+                uint64_t val = static_cast<uint64_t>(peek().int_value);
                 consume(TokenType::NUMBER, "Expected number");
                 if (match(TokenType::COMMA)) {
                     min_hops = val;
                     is_range = true;
                     if (check(TokenType::NUMBER)) {
-                        max_hops = peek().int_value;
+                        max_hops = static_cast<uint64_t>(peek().int_value);
                         consume(TokenType::NUMBER, "Expected number");
                     } else {
                         max_hops = std::numeric_limits<uint64_t>::max();
@@ -1176,7 +1428,7 @@ PathPattern GqlParser::parse_path_pattern() {
                 }
             } else if (match(TokenType::COMMA)) {
                 min_hops = 0;
-                max_hops = peek().int_value;
+                max_hops = static_cast<uint64_t>(peek().int_value);
                 consume(TokenType::NUMBER, "Expected maximum hops");
                 is_range = true;
             } else {
@@ -1241,7 +1493,7 @@ PatternNode GqlParser::parse_node_pattern() {
         node.label_expr = parse_label_expression();
     }
     if (check(TokenType::LBRACE)) {
-        node.properties = parse_properties();
+        node.properties = parse_properties(&node.property_exprs);
     }
     if (match(TokenType::WHERE)) {
         node.where_expr = parse_expression();
@@ -1256,7 +1508,8 @@ PatternNode GqlParser::parse_node_pattern() {
  * 
  * @return std::map<std::string, property_type_t> The map of parsed keys to typed literal values.
  */
-std::map<std::string, property_type_t> GqlParser::parse_properties() {
+std::map<std::string, property_type_t> GqlParser::parse_properties(
+        std::map<std::string, std::shared_ptr<Expression>>* property_exprs) {
     std::map<std::string, property_type_t> props;
     consume(TokenType::LBRACE, "Expected '{' to start property map");
     if (!check(TokenType::RBRACE)) {
@@ -1273,22 +1526,27 @@ std::map<std::string, property_type_t> GqlParser::parse_properties() {
             } else if (check(TokenType::FLOAT_LIT)) {
                 value = is_negative ? -peek().float_value : peek().float_value;
                 advance();
-            } else {
+            } else if (!is_negative && match(TokenType::TRUE_KW)) {
+                value = true;
+            } else if (!is_negative && match(TokenType::FALSE_KW)) {
+                value = false;
+            } else if (!is_negative && match(TokenType::NULL_KW)) {
+                value = std::monostate{};
+            } else if (!is_negative && check(TokenType::STRING_LIT)) {
+                value = peek().text;
+                advance();
+            } else if (property_exprs) {
+                // A property map value is a general value expression, not only a literal: a variable
+                // bound by an earlier segment, a LET binding or any computed expression is legal here
+                // and is resolved against the current row before the node is looked up. Step back over
+                // a consumed '-' so the expression parser sees the whole term.
                 if (is_negative) {
-                    throw std::runtime_error("Expected numeric literal after '-' in property map");
+                    --pos;
                 }
-                if (match(TokenType::TRUE_KW)) {
-                    value = true;
-                } else if (match(TokenType::FALSE_KW)) {
-                    value = false;
-                } else if (match(TokenType::NULL_KW)) {
-                    value = std::monostate{};
-                } else if (check(TokenType::STRING_LIT)) {
-                    value = peek().text;
-                    advance();
-                } else {
-                    throw std::runtime_error("Expected literal value for property map");
-                }
+                (*property_exprs)[key] = parse_expression();
+                continue;
+            } else {
+                throw std::runtime_error("Expected literal value for property map");
             }
 
             props[key] = value;
@@ -1350,7 +1608,44 @@ std::unique_ptr<Expression> GqlParser::parse_comparison() {
             if (match(TokenType::NOT)) {
                 is_not = true;
             }
-            consume(TokenType::NULL_KW, "Expected 'NULL' after 'IS [NOT]'");
+            // `x IS [NOT] LABELED <labelExpression>` -- the label side is the same grammar as a pattern's,
+            // so AND/OR/NOT compose there exactly as they do inside a pattern.
+            if (match(TokenType::LABELED)) {
+                // Symbolic label operators only: a trailing `OR`/`AND` here belongs to the enclosing
+                // boolean expression, not to the label.
+                expr = std::make_unique<IsLabeledExpr>(std::move(expr), parse_label_expression(false), is_not);
+                continue;
+            }
+            // `e IS [NOT] DIRECTED` and `n IS [NOT] (SOURCE | DESTINATION) OF e`. DIRECTED/SOURCE/
+            // DESTINATION/OF are not reserved words, so they arrive as identifiers here.
+            if (check(TokenType::NAME)) {
+                std::string kw = peek().text;
+                std::transform(kw.begin(), kw.end(), kw.begin(), [](unsigned char c){ return std::toupper(c); });
+                if (kw == "DIRECTED") {
+                    advance();
+                    expr = std::make_unique<IsDirectedExpr>(std::move(expr), is_not);
+                    continue;
+                }
+                if (kw == "SOURCE" || kw == "DESTINATION") {
+                    bool is_source = (kw == "SOURCE");
+                    advance();
+                    std::string of_tok = check(TokenType::NAME) ? peek().text : "";
+                    std::transform(of_tok.begin(), of_tok.end(), of_tok.begin(), [](unsigned char c){ return std::toupper(c); });
+                    if (of_tok != "OF") {
+                        throw std::runtime_error("Expected 'OF' after IS [NOT] SOURCE/DESTINATION");
+                    }
+                    advance(); // consume OF
+                    if (!check(TokenType::NAME)) {
+                        throw std::runtime_error("Expected a relationship variable after 'OF'");
+                    }
+                    std::string edge_var = peek().text;
+                    advance();
+                    expr = std::make_unique<IsSourceDestExpr>(std::move(expr),
+                        std::make_unique<VariableExpr>(edge_var), is_source, is_not);
+                    continue;
+                }
+            }
+            consume(TokenType::NULL_KW, "Expected 'NULL' or 'LABELED' after 'IS [NOT]'");
             expr = std::make_unique<IsNullExpr>(std::move(expr), is_not);
             continue;
         }
@@ -1467,7 +1762,35 @@ std::unique_ptr<Expression> GqlParser::parse_unary() {
         auto right = parse_unary();
         return std::make_unique<UnaryOpExpr>(UnaryOpKind::NEG, std::move(right));
     }
-    return parse_primary();
+    auto expr = parse_primary();
+    // Postfix operators after a primary: list subscript expr[index] (a '[' at the head of a primary is a
+    // list literal, handled in parse_primary; a '[' after a primary is an element access), and a temporal
+    // component accessor expr.year/.month/.day/... -- a second '.' following a property lookup, restricted
+    // to known temporal field names so an ordinary chained '.' is unaffected.
+    auto is_temporal_field = [](const std::string& n) {
+        std::string ln;
+        for (char c : n) ln += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return ln == "year" || ln == "month" || ln == "day" ||
+               ln == "hour" || ln == "minute" || ln == "second";
+    };
+    while (true) {
+        if (check(TokenType::LBRACKET)) {
+            advance(); // consume '['
+            auto index = parse_expression();
+            consume(TokenType::RBRACKET, "Expected ']' after list index");
+            expr = std::make_unique<IndexExpr>(std::move(expr), std::move(index));
+        } else if (check(TokenType::DOT) && peek(1).type == TokenType::NAME &&
+                   is_temporal_field(peek(1).text)) {
+            advance(); // '.'
+            std::string field;
+            for (char c : peek().text) field += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            advance(); // field name
+            expr = std::make_unique<TemporalFieldExpr>(std::move(expr), std::move(field));
+        } else {
+            break;
+        }
+    }
+    return expr;
 }
 
 /**
@@ -1588,6 +1911,96 @@ std::unique_ptr<Expression> GqlParser::parse_primary() {
         parse_braced_subquery(matches, sub_where);
         return std::make_unique<ExistsExpr>(std::move(matches), std::move(sub_where));
     }
+    // Quantified list predicates: all|any|none|single(x IN list WHERE pred). `all`/`any` are keywords
+    // (ALL_KW is also `ALL SHORTEST`, disambiguated here by the following '('); `none`/`single` are names.
+    {
+        bool is_quant = false;
+        QuantifiedPredicateExpr::Quantifier q = QuantifiedPredicateExpr::ALL;
+        if (check(TokenType::ALL_KW) && peek(1).type == TokenType::LPAREN) { q = QuantifiedPredicateExpr::ALL; is_quant = true; }
+        else if (check(TokenType::ANY_KW) && peek(1).type == TokenType::LPAREN) { q = QuantifiedPredicateExpr::ANY; is_quant = true; }
+        else if (check(TokenType::NAME) && peek(1).type == TokenType::LPAREN) {
+            std::string ln = peek().text;
+            std::transform(ln.begin(), ln.end(), ln.begin(), [](unsigned char c) { return std::tolower(c); });
+            if (ln == "none") { q = QuantifiedPredicateExpr::NONE; is_quant = true; }
+            else if (ln == "single") { q = QuantifiedPredicateExpr::SINGLE; is_quant = true; }
+        }
+        if (is_quant) {
+            advance(); // consume all/any/none/single
+            consume(TokenType::LPAREN, "Expected '(' after quantified predicate");
+            std::string qvar = peek().text;
+            consume(TokenType::NAME, "Expected variable name in quantified predicate");
+            consume(TokenType::IN_KW, "Expected 'IN' in quantified predicate");
+            auto qlist = parse_expression();
+            consume(TokenType::WHERE, "Expected 'WHERE' in quantified predicate");
+            auto qpred = parse_expression();
+            consume(TokenType::RPAREN, "Expected ')' after quantified predicate");
+            return std::make_unique<QuantifiedPredicateExpr>(q, std::move(qvar), std::move(qlist), std::move(qpred));
+        }
+    }
+    // List literal: [a, b, c]. (The `x IN [a, b]` form is desugared to OR earlier, so it never reaches
+    // here; this is the standalone list value -- what FOR expands and what a list-typed binding holds.)
+    if (match(TokenType::LBRACKET)) {
+        // List comprehension: [x IN list [WHERE pred] [| projection]]. Detected by the `<name> IN` head;
+        // '|' is not a value-expression operator (only a label-alternation), so it delimits the projection.
+        if (check(TokenType::NAME) && peek(1).type == TokenType::IN_KW) {
+            std::string cvar = peek().text;
+            advance(); // variable
+            advance(); // IN
+            auto clist = parse_expression();
+            std::unique_ptr<Expression> cfilter = nullptr;
+            if (match(TokenType::WHERE)) cfilter = parse_expression();
+            std::unique_ptr<Expression> cproj = nullptr;
+            if (match(TokenType::PIPE)) cproj = parse_expression();
+            consume(TokenType::RBRACKET, "Expected ']' to close list comprehension");
+            return std::make_unique<ListComprehensionExpr>(std::move(cvar), std::move(clist),
+                                                           std::move(cfilter), std::move(cproj));
+        }
+        std::vector<std::unique_ptr<Expression>> elements;
+        if (!check(TokenType::RBRACKET)) {
+            do {
+                elements.push_back(parse_expression());
+            } while (match(TokenType::COMMA));
+        }
+        consume(TokenType::RBRACKET, "Expected ']' to close list literal");
+        return std::make_unique<ListExpr>(std::move(elements));
+    }
+    // CAST(<expr> AS <type>). The primitive type names are lexed as their own keywords (they are also
+    // schema-DDL types), so accept those tokens as well as the spellings that arrive as plain names.
+    if (match(TokenType::CAST)) {
+        consume(TokenType::LPAREN, "Expected '(' after CAST");
+        auto value = parse_expression();
+        consume(TokenType::AS, "Expected 'AS' in CAST");
+
+        std::optional<CastType> target;
+        if (match(TokenType::STRING_KW)) {
+            target = CastType::STRING;
+        } else if (match(TokenType::INTEGER_KW)) {
+            target = CastType::INTEGER;
+        } else if (match(TokenType::DOUBLE_KW)) {
+            target = CastType::FLOAT;
+        } else if (match(TokenType::BOOLEAN_KW)) {
+            target = CastType::BOOLEAN;
+        } else if (check(TokenType::NAME)) {
+            std::string type_name = peek().text;
+            advance();
+            std::transform(type_name.begin(), type_name.end(), type_name.begin(),
+                           [](unsigned char c) { return std::toupper(c); });
+            if (type_name == "VARCHAR" || type_name == "TEXT") {
+                target = CastType::STRING;
+            } else if (type_name == "BIGINT") {
+                target = CastType::INTEGER;
+            } else if (type_name == "FLOAT" || type_name == "REAL") {
+                target = CastType::FLOAT;
+            } else {
+                throw std::runtime_error("Unsupported CAST target type: " + type_name);
+            }
+        } else {
+            throw std::runtime_error("Expected a type name after 'AS' in CAST");
+        }
+
+        consume(TokenType::RPAREN, "Expected ')' to close CAST");
+        return std::make_unique<CastExpr>(std::move(value), *target);
+    }
     // ISO GQL COUNT { <pattern subquery> } counts subquery matches (distinct from the count(x)
     // aggregate). It shares the braced-subquery body with EXISTS and reuses SizeExpr (a match count).
     if (check(TokenType::NAME) && peek(1).type == TokenType::LBRACE) {
@@ -1656,8 +2069,15 @@ std::unique_ptr<Expression> GqlParser::parse_primary() {
         if (peek(1).type == TokenType::LPAREN) {
             std::string upper_name = var;
             std::transform(upper_name.begin(), upper_name.end(), upper_name.begin(), [](unsigned char c){ return std::toupper(c); });
+            // `collect(x)` is the openCypher spelling; ISO GQL's general set function is `collect_list(x)`.
+            // The dialect is pure GQL (WITH was removed for the same reason), so reject it rather than
+            // quietly accepting a Cypher-ism.
+            if (upper_name == "COLLECT") {
+                throw std::runtime_error(
+                    "collect is not GQL: use collect_list(...)");
+            }
             if (upper_name == "COUNT" || upper_name == "SUM" || upper_name == "AVG" || upper_name == "MIN" || upper_name == "MAX" ||
-                upper_name == "COLLECT" || upper_name == "COLLECT_LIST") {
+                upper_name == "COLLECT_LIST" || upper_name == "STDDEV_POP" || upper_name == "STDDEV_SAMP") {
                 advance(); // consume function name
                 consume(TokenType::LPAREN, "Expected '(' after aggregate function");
                 
@@ -1680,14 +2100,41 @@ std::unique_ptr<Expression> GqlParser::parse_primary() {
                 else if (upper_name == "SUM") fn = AggregateKind::SUM;
                 else if (upper_name == "AVG") fn = AggregateKind::AVG;
                 else if (upper_name == "MIN") fn = AggregateKind::MIN;
-                else if (upper_name == "COLLECT" || upper_name == "COLLECT_LIST") fn = AggregateKind::COLLECT;
+                else if (upper_name == "COLLECT_LIST") fn = AggregateKind::COLLECT;
+                else if (upper_name == "STDDEV_POP") fn = AggregateKind::STDDEV_POP;
+                else if (upper_name == "STDDEV_SAMP") fn = AggregateKind::STDDEV_SAMP;
                 else fn = AggregateKind::MAX;
 
                 return std::make_unique<AggregateExpr>(fn, std::move(arg), distinct);
+            } else if (upper_name == "PERCENTILE_CONT" || upper_name == "PERCENTILE_DISC") {
+                // ISO GQL binary set function: PERCENTILE_CONT(value, fraction). The second argument
+                // is the percentile in [0,1]; the first is the value expression to rank.
+                advance(); // consume function name
+                consume(TokenType::LPAREN, "Expected '(' after percentile function");
+                bool distinct = match(TokenType::DISTINCT);
+                std::unique_ptr<Expression> value = parse_expression();
+                consume(TokenType::COMMA, "Expected ',' between percentile value and fraction");
+                std::unique_ptr<Expression> fraction = parse_expression();
+                consume(TokenType::RPAREN, "Expected ')' after percentile arguments");
+                AggregateKind fn = upper_name == "PERCENTILE_CONT"
+                    ? AggregateKind::PERCENTILE_CONT : AggregateKind::PERCENTILE_DISC;
+                auto agg = std::make_unique<AggregateExpr>(fn, std::move(value), distinct);
+                agg->arg2 = std::move(fraction);
+                return agg;
             } else if (upper_name == "SIZE") {
                 advance(); // consume "size"
                 consume(TokenType::LPAREN, "Expected '(' after size");
-                
+
+                // size((pattern)) counts pattern matches (SizeExpr). size(<value expr>) -- a list or
+                // string -- is the element/character count and aliases cardinality(). A path pattern
+                // begins with a node '('; anything else at this position is a value expression.
+                if (!check(TokenType::LPAREN)) {
+                    std::vector<std::unique_ptr<Expression>> cargs;
+                    cargs.push_back(parse_expression());
+                    consume(TokenType::RPAREN, "Expected ')' after size argument");
+                    return std::make_unique<FunctionCallExpr>("cardinality", std::move(cargs));
+                }
+
                 std::vector<MatchStatement> matches;
                 MatchStatement stmt;
                 stmt.pattern = parse_path_pattern();
@@ -1701,6 +2148,51 @@ std::unique_ptr<Expression> GqlParser::parse_primary() {
                 
                 consume(TokenType::RPAREN, "Expected ')' after size expression");
                 return std::make_unique<SizeExpr>(std::move(matches), std::move(sub_where));
+            } else if (upper_name == "DURATION") {
+                advance(); // consume "duration"
+                consume(TokenType::LPAREN, "Expected '(' after duration");
+                if (check(TokenType::LBRACE)) {
+                    // Map form duration({hours: 4, minutes: 30, ...}): fixed unit keys and numeric-literal
+                    // values, so fold to a millisecond count at parse time (the string form is evaluated at
+                    // runtime; both yield an integer count of milliseconds).
+                    advance(); // '{'
+                    int64_t ms = 0;
+                    if (!check(TokenType::RBRACE)) {
+                        do {
+                            std::string unit = peek().text;
+                            std::transform(unit.begin(), unit.end(), unit.begin(),
+                                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                            consume(TokenType::NAME, "Expected a duration unit key");
+                            consume(TokenType::COLON, "Expected ':' after a duration unit");
+                            bool neg = match(TokenType::MINUS);
+                            double num;
+                            if (check(TokenType::NUMBER)) { num = static_cast<double>(peek().int_value); advance(); }
+                            else if (check(TokenType::FLOAT_LIT)) { num = peek().float_value; advance(); }
+                            else throw std::runtime_error("Expected a numeric value for duration unit '" + unit + "'");
+                            if (neg) num = -num;
+                            double unit_ms;
+                            if (unit == "years") unit_ms = 365.0 * 86400000.0;
+                            else if (unit == "months") unit_ms = 30.0 * 86400000.0;
+                            else if (unit == "weeks") unit_ms = 7.0 * 86400000.0;
+                            else if (unit == "days") unit_ms = 86400000.0;
+                            else if (unit == "hours") unit_ms = 3600000.0;
+                            else if (unit == "minutes") unit_ms = 60000.0;
+                            else if (unit == "seconds") unit_ms = 1000.0;
+                            else if (unit == "milliseconds") unit_ms = 1.0;
+                            else throw std::runtime_error("Unknown duration unit '" + unit + "'");
+                            ms += static_cast<int64_t>(num * unit_ms);
+                        } while (match(TokenType::COMMA));
+                    }
+                    consume(TokenType::RBRACE, "Expected '}' to close the duration map");
+                    consume(TokenType::RPAREN, "Expected ')' after duration");
+                    return std::make_unique<LiteralExpr>(ms);
+                }
+                // String form duration('P100D'): evaluated at runtime by the duration scalar function.
+                auto darg = parse_expression();
+                consume(TokenType::RPAREN, "Expected ')' after duration argument");
+                std::vector<std::unique_ptr<Expression>> dargs;
+                dargs.push_back(std::move(darg));
+                return std::make_unique<FunctionCallExpr>("duration", std::move(dargs));
             } else {
                 // Generic scalar function call: name ( arg, ... ) -- e.g. length(p),
                 // zoned_datetime('2010-01-01'). Dispatched by name in the evaluator/typechecker.
@@ -1716,6 +2208,16 @@ std::unique_ptr<Expression> GqlParser::parse_primary() {
                 std::string lname = var;
                 std::transform(lname.begin(), lname.end(), lname.begin(),
                                [](unsigned char c) { return std::tolower(c); });
+
+                // Only names the evaluator actually implements may parse. Anything else used to build a
+                // FunctionCallExpr that typechecked as ANY and evaluated to NULL, so a query calling an
+                // unimplemented function -- abs(), toInteger(), labels(), coalesce(), shortestPath() --
+                // silently produced NULLs and plausible-looking wrong answers instead of failing. Reject
+                // it here, where the name is known and the error can name it.
+                if (!is_supported_scalar_function(lname)) {
+                    throw std::runtime_error("Unknown function: " + var + "(). Supported scalar functions: " +
+                                             supported_scalar_function_list());
+                }
                 return std::make_unique<FunctionCallExpr>(std::move(lname), std::move(args));
             }
         }
@@ -1771,15 +2273,15 @@ GqlQuery GqlParser::parse(const std::string& query) {
     return parser.parse_query();
 }
 
-std::shared_ptr<LabelExpression> GqlParser::parse_label_expression() {
-    return parse_label_or();
+std::shared_ptr<LabelExpression> GqlParser::parse_label_expression(bool allow_keyword_ops) {
+    return parse_label_or(allow_keyword_ops);
 }
 
-std::shared_ptr<LabelExpression> GqlParser::parse_label_or() {
-    auto left = parse_label_and();
-    while (check(TokenType::PIPE) || check(TokenType::OR)) {
+std::shared_ptr<LabelExpression> GqlParser::parse_label_or(bool allow_keyword_ops) {
+    auto left = parse_label_and(allow_keyword_ops);
+    while (check(TokenType::PIPE) || (allow_keyword_ops && check(TokenType::OR))) {
         advance(); // consume '|' or 'OR'
-        auto right = parse_label_and();
+        auto right = parse_label_and(allow_keyword_ops);
         auto node = std::make_shared<LabelExpression>();
         node->kind = LabelExprKind::OR;
         node->left = std::move(left);
@@ -1789,11 +2291,11 @@ std::shared_ptr<LabelExpression> GqlParser::parse_label_or() {
     return left;
 }
 
-std::shared_ptr<LabelExpression> GqlParser::parse_label_and() {
-    auto left = parse_label_factor();
-    while (check(TokenType::AMP) || check(TokenType::AND)) {
+std::shared_ptr<LabelExpression> GqlParser::parse_label_and(bool allow_keyword_ops) {
+    auto left = parse_label_factor(allow_keyword_ops);
+    while (check(TokenType::AMP) || (allow_keyword_ops && check(TokenType::AND))) {
         advance(); // consume '&' or 'AND'
-        auto right = parse_label_factor();
+        auto right = parse_label_factor(allow_keyword_ops);
         auto node = std::make_shared<LabelExpression>();
         node->kind = LabelExprKind::AND;
         node->left = std::move(left);
@@ -1803,16 +2305,17 @@ std::shared_ptr<LabelExpression> GqlParser::parse_label_and() {
     return left;
 }
 
-std::shared_ptr<LabelExpression> GqlParser::parse_label_factor() {
-    if (match(TokenType::BANG) || match(TokenType::NOT)) {
-        auto expr = parse_label_factor();
+std::shared_ptr<LabelExpression> GqlParser::parse_label_factor(bool allow_keyword_ops) {
+    if (match(TokenType::BANG) || (allow_keyword_ops && match(TokenType::NOT))) {
+        auto expr = parse_label_factor(allow_keyword_ops);
         auto node = std::make_shared<LabelExpression>();
         node->kind = LabelExprKind::NOT;
         node->expr = std::move(expr);
         return node;
     }
     if (match(TokenType::LPAREN)) {
-        auto expr = parse_label_expression();
+        // Parenthesised: a ')' delimits it, so the keyword spellings are unambiguous again inside.
+        auto expr = parse_label_expression(true);
         consume(TokenType::RPAREN, "Expected ')' to close label expression");
         return expr;
     }

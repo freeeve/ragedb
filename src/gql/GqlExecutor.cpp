@@ -1023,7 +1023,12 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
         std::string var_name = "";
         std::string prop_name = "";
         bool ok = false;
-        
+        // A bare variable orders by element identity, which the start-node scan can satisfy by scanning
+        // in node-id order -- but only when the variable IS the start node. Ordering by any other bare
+        // variable (a LET column, a piped column, a FOR variable, a later pattern node) has nothing to do
+        // with the traversal order, so the flags must stay off and the ordinary sort must run.
+        bool orders_by_element_identity = false;
+
         if (spec.expr->kind == ExpressionKind::PROPERTY_LOOKUP) {
             auto* pl = static_cast<const PropertyLookupExpr*>(spec.expr.get());
             var_name = pl->variable;
@@ -1033,9 +1038,9 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
             auto* ve = static_cast<const VariableExpr*>(spec.expr.get());
             var_name = ve->name;
             ok = true;
-            sort_by_id = true;
+            orders_by_element_identity = true;
         }
-        
+
         if (ok) {
             const auto& first_match = query_ptr->matches[0];
             if (!first_match.pattern.nodes.empty()) {
@@ -1043,6 +1048,7 @@ static seastar::future<QueryResult> execute_query_internal(ragedb::Graph& graph,
                 if (start_var == var_name || (start_var.empty() && var_name == "_n_0_user_empty")) {
                     sort_property = prop_name;
                     sort_ascending = spec.ascending;
+                    sort_by_id = orders_by_element_identity;
                 }
             }
         }

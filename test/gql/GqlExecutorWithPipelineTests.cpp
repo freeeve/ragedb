@@ -276,6 +276,23 @@ TEST_CASE("standalone ORDER BY/LIMIT before RETURN pages the working table", "[g
         REQUIRE(res.find("\"c\": 2") != std::string::npos);
     }
 
+    SECTION("ordering by a bare variable that is not the start node is not traversal order") {
+        // The start-node scan can answer ORDER BY <start node> by scanning in id order, but a bare
+        // variable bound anywhere else says nothing about traversal order. Claiming otherwise silently
+        // replaced the sort with "start-node id ascending", discarding the key and the direction.
+        std::string asc = GqlExecutor::execute(graph,
+            std::string("MATCH (p:Person) LET score = p.likes * 2 "
+                        "RETURN p.name AS n ORDER BY score ASC")).get();
+        INFO("asc: " << asc);
+        REQUIRE(asc.find("[{\"n\": \"Carol\"}, {\"n\": \"Bob\"}, {\"n\": \"Alice\"}]") != std::string::npos);
+
+        std::string desc = GqlExecutor::execute(graph,
+            std::string("MATCH (p:Person) LET score = p.likes * 2 "
+                        "RETURN p.name AS n ORDER BY score DESC")).get();
+        INFO("desc: " << desc);
+        REQUIRE(desc.find("[{\"n\": \"Alice\"}, {\"n\": \"Bob\"}, {\"n\": \"Carol\"}]") != std::string::npos);
+    }
+
     SECTION("a NEXT segment of only primitive query statements forwards its working table") {
         // The middle segment binds a value and hands its rows on without a result statement of its
         // own; the total must survive into the final segment's projection.

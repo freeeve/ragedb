@@ -939,10 +939,33 @@ GqlQuery GqlParser::parse_single_query() {
             with_segments.push_back(std::make_shared<GqlQuery>(std::move(query)));
             continue;
         }
-    } else {
-        if (query.writes.empty()) {
+    } else if (query.writes.empty()) {
+        // ISO GQL: a linear query statement composed with NEXT need not end in a result statement --
+        // a segment made only of primitive query statements (LET / FILTER / MATCH / FOR) hands its
+        // working table to the statement after the NEXT. Close it with a passthrough projection of
+        // everything in scope so the projection pipeline carries the bindings, including the columns
+        // the LETs just added, forward. Without a NEXT there is nothing to hand the rows to, so an
+        // unterminated query is still an error.
+        if (!check(TokenType::NEXT_KW)) {
             throw std::runtime_error("Query must contain either a RETURN clause or at least one write clause");
         }
+        const GqlQuery* piped = with_segments.empty() ? nullptr : with_segments.back().get();
+        for (const auto& col : segment_output_columns(query, piped)) {
+            ReturnItem pass;
+            pass.expr = std::make_unique<VariableExpr>(col);
+            pass.alias = col;
+            query.returns.push_back(std::move(pass));
+        }
+        if (query.returns.empty()) {
+            throw std::runtime_error("Query must contain either a RETURN clause or at least one write clause");
+        }
+        consume(TokenType::NEXT_KW, "Expected 'NEXT'");
+        // A FILTER/WHERE right after NEXT is a HAVING predicate on the forwarded rows.
+        if (match(TokenType::FILTER_KW) || match(TokenType::WHERE)) {
+            pending_having = parse_expression();
+        }
+        with_segments.push_back(std::make_shared<GqlQuery>(std::move(query)));
+        continue;
     }
 
     query.with_segments = std::move(with_segments);

@@ -276,6 +276,26 @@ TEST_CASE("standalone ORDER BY/LIMIT before RETURN pages the working table", "[g
         REQUIRE(res.find("\"c\": 2") != std::string::npos);
     }
 
+    SECTION("a NEXT segment of only primitive query statements forwards its working table") {
+        // The middle segment binds a value and hands its rows on without a result statement of its
+        // own; the total must survive into the final segment's projection.
+        std::string res = GqlExecutor::execute(graph,
+            std::string("MATCH (p:Person) RETURN count(p) AS totalInt "
+                        "NEXT LET total = CAST(totalInt AS FLOAT) "
+                        "NEXT RETURN total")).get();
+        INFO("result: " << res);
+        REQUIRE(res.find("\"total\": 3") != std::string::npos);
+    }
+
+    SECTION("a FILTER-only NEXT segment forwards only the surviving rows") {
+        std::string res = GqlExecutor::execute(graph,
+            std::string("MATCH (p:Person) RETURN p.name AS n, p.likes AS likes "
+                        "NEXT FILTER likes > 15 "
+                        "NEXT RETURN n ORDER BY n ASC")).get();
+        INFO("result: " << res);
+        REQUIRE(res.find("[{\"n\": \"Alice\"}, {\"n\": \"Bob\"}]") != std::string::npos);
+    }
+
     graph.Stop().get();
 }
 

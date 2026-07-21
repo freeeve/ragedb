@@ -676,6 +676,38 @@ TEST_CASE("GQL ISO linear-query NEXT/FILTER lowering", "[gql_parser]") {
         REQUIRE(next_q.matches.size() == 1); // the post-NEXT MATCH is the final segment
         REQUIRE(next_q.returns.size() == 1);
     }
+    SECTION("a NEXT segment of only primitive query statements needs no result statement (BI Q1)") {
+        auto q = GqlParser::parse(
+            "MATCH (m:Message) RETURN count(m) AS totalInt "
+            "NEXT "
+            "LET total = CAST(totalInt AS FLOAT) "
+            "NEXT "
+            "MATCH (m:Message) RETURN total, count(m) AS c");
+        // The LET-only segment closes with a passthrough carrying the piped column and the new one.
+        REQUIRE(q.with_segments.size() == 2);
+        REQUIRE(q.with_segments[1]->let_bindings.size() == 1);
+        REQUIRE(q.with_segments[1]->returns.size() == 2);
+        REQUIRE(q.with_segments[1]->returns[0].alias == "totalInt");
+        REQUIRE(q.with_segments[1]->returns[1].alias == "total");
+        REQUIRE(q.matches.size() == 1);
+    }
+    SECTION("a FILTER-only NEXT segment forwards the surviving rows") {
+        auto q = GqlParser::parse(
+            "MATCH (p:Person) RETURN p.age AS age NEXT FILTER age > 3 NEXT RETURN age");
+        REQUIRE(q.with_segments.size() == 2);
+        REQUIRE(q.with_segments[1]->where_expr != nullptr);
+        REQUIRE(q.with_segments[1]->returns.size() == 1);
+        REQUIRE(q.with_segments[1]->returns[0].alias == "age");
+    }
+    SECTION("a query with no result statement and no NEXT is still rejected") {
+        REQUIRE_THROWS_WITH(GqlParser::parse("MATCH (p:Person)"),
+                            Catch::Contains("RETURN clause"));
+        REQUIRE_THROWS_WITH(GqlParser::parse("MATCH (p:Person) LET x = 1"),
+                            Catch::Contains("RETURN clause"));
+        // The last linear query statement has to produce a result, NEXT or not.
+        REQUIRE_THROWS_WITH(GqlParser::parse("MATCH (p:Person) RETURN p.age AS a NEXT FILTER a > 3"),
+                            Catch::Contains("RETURN clause"));
+    }
     SECTION("RETURN DISTINCT ... NEXT carries the distinct projection forward") {
         auto q = GqlParser::parse(
             "MATCH (p:Person {id: 1})-[:KNOWS]-(f:Person) WHERE f.id <> 1 "

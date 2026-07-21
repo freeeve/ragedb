@@ -18,6 +18,21 @@
 
 namespace ragedb::gql {
 
+/**
+ * @brief Registers the properties a subquery's own pattern reads through its inline WHERE filters, so
+ *        they survive pruning alongside the ones its residual WHERE reads.
+ */
+static void collect_accessed_properties_in_match(const MatchStatement& match,
+                                                 std::map<std::string, std::set<std::string>>& accessed_props,
+                                                 std::set<std::string>& whole_objects) {
+    for (const auto& node : match.pattern.nodes) {
+        collect_accessed_properties(node.where_expr.get(), accessed_props, whole_objects);
+    }
+    for (const auto& edge : match.pattern.edges) {
+        collect_accessed_properties(edge.where_expr.get(), accessed_props, whole_objects);
+    }
+}
+
 void collect_accessed_properties(const Expression* expr,
                                  std::map<std::string, std::set<std::string>>& accessed_props,
                                  std::set<std::string>& whole_objects) {
@@ -138,6 +153,29 @@ void collect_accessed_properties(const Expression* expr,
             }
             collect_accessed_properties(s->value.get(), accessed_props, whole_objects);
             collect_accessed_properties(s->edge.get(), accessed_props, whole_objects);
+            break;
+        }
+        case ExpressionKind::EXISTS: {
+            // A subquery predicate reads properties too. When the semi-join rewrite lifts the subquery's
+            // pattern into the outer match list, its residual WHERE stays here and is evaluated against
+            // the joined row, so anything it reads has to survive pruning -- otherwise the predicate sees
+            // a null property and silently drops rows. Only literal comparisons become scan filters, so
+            // without this an unpushable predicate (an OR, a NOT, a property-to-property comparison) is
+            // the difference between a correct answer and an empty one.
+            auto* ee = static_cast<const ExistsExpr*>(expr);
+            collect_accessed_properties(ee->where_expr.get(), accessed_props, whole_objects);
+            for (const auto& match : ee->matches) {
+                collect_accessed_properties_in_match(match, accessed_props, whole_objects);
+            }
+            break;
+        }
+        case ExpressionKind::SIZE_OP: {
+            // COUNT { ... } carries the same shape as EXISTS.
+            auto* se = static_cast<const SizeExpr*>(expr);
+            collect_accessed_properties(se->where_expr.get(), accessed_props, whole_objects);
+            for (const auto& match : se->matches) {
+                collect_accessed_properties_in_match(match, accessed_props, whole_objects);
+            }
             break;
         }
         case ExpressionKind::LITERAL:

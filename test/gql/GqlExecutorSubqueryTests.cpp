@@ -216,7 +216,7 @@ TEST_CASE("GQL COUNT{} with a nested EXISTS in its WHERE (IC10 common)", "[gql_e
     guard.stop();
 }
 
-TEST_CASE("a positive EXISTS filter is a semi-join, not a row multiplier", "[gql_executor_count_subquery]") {
+TEST_CASE("a positive EXISTS filter is a semi-join rather than a row multiplier", "[gql_executor_count_subquery]") {
     // A positive EXISTS in a WHERE is unnested into an OPTIONAL MATCH, which yields one row per
     // subquery match. Left as-is that multiplies the outer rows, so a work matching the subquery
     // twice would be counted twice -- the SPB a5 shape. The rows are deduplicated on the outer
@@ -257,6 +257,33 @@ TEST_CASE("a positive EXISTS filter is a semi-join, not a row multiplier", "[gql
         return GqlExecutor::execute(graph, std::move(query)).get();
     };
 
+    SECTION("the outer pattern alone sees every work (data control)") {
+        std::string r = run("MATCH (w:CreativeWork)-[:about]->(e:Thing) RETURN count(w) AS n");
+        INFO("control: " << r);
+        REQUIRE(r.find("\"n\": 3") != std::string::npos);
+    }
+
+    SECTION("EXISTS with a pushable equality predicate") {
+        // A literal comparison becomes a scan filter on the lifted pattern, so it does not depend on
+        // the subquery's properties surviving projection pruning.
+        std::string r = run(
+            "MATCH (w:CreativeWork)-[:about]->(e:Thing) "
+            "WHERE EXISTS { MATCH (w)-[:category]->(c) WHERE c.uri = 'cat/Company' } "
+            "RETURN count(w) AS n");
+        INFO("pushable: " << r);
+        REQUIRE(r.find("\"n\": 2") != std::string::npos);   // w1 and w2
+    }
+
+    SECTION("EXISTS with an unpushable NOT predicate") {
+        // Not an OR: isolates "the predicate cannot become a scan filter" from anything OR-specific.
+        std::string r = run(
+            "MATCH (w:CreativeWork)-[:about]->(e:Thing) "
+            "WHERE EXISTS { MATCH (w)-[:category]->(c) WHERE NOT (c.uri = 'cat/Other') } "
+            "RETURN count(w) AS n");
+        INFO("unpushable NOT: " << r);
+        REQUIRE(r.find("\"n\": 2") != std::string::npos);   // w1 and w2
+    }
+
     SECTION("a work matching the EXISTS twice is counted once (SPB a5 shape)") {
         std::string r = run(
             "MATCH (w:CreativeWork)-[:about]->(e:Thing) "
@@ -267,7 +294,7 @@ TEST_CASE("a positive EXISTS filter is a semi-join, not a row multiplier", "[gql
         REQUIRE(r.find("\"n\": 2") != std::string::npos);   // w1 and w2, not 3
     }
 
-    SECTION("the same filter without an aggregate yields one row per work, not per category") {
+    SECTION("the same filter without an aggregate yields one row per work rather than per category") {
         std::string r = run(
             "MATCH (w:CreativeWork)-[:about]->(e:Thing) "
             "WHERE EXISTS { MATCH (w)-[:category]->(c) "

@@ -1,0 +1,118 @@
+/*
+ * Copyright RageDB Contributors. All Rights Reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// The candidate check is pinned in StarJoinCandidateTests; this exercises the executor half --
+// execute_match_chain_factorized -- against a real graph. A star query joins independent branches on
+// their shared centre, and the hazard is a branch that joins on the wrong key: the branches would
+// cross-multiply across centres instead of pairing within each centre. That is silent -- the answer is
+// just a larger or smaller set of plausible rows -- so the guard is an exact row-set assertion on a
+// graph where the two failure modes give visibly different counts.
+
+#include <catch2/catch.hpp>
+#include <Graph.h>
+#include "../../src/gql/GqlParser.h"
+#include "../../src/gql/GqlOptimizer.h"
+#include "../../src/gql/GqlExecutor.h"
+
+using namespace ragedb;
+using namespace ragedb::gql;
+
+namespace {
+struct StopGuard {
+    Graph& g;
+    ~StopGuard() { g.Stop().get(); }
+};
+}  // namespace
+
+TEST_CASE("a star query pairs branches within each centre, not across centres", "[gql_honeycomb]") {
+    auto graph = Graph("gql_test_star_join_exec");
+    graph.Start().get();
+    graph.Clear();
+    StopGuard guard{graph};
+
+    graph.shard.local().NodeTypeInsertPeered("Person").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "name", "string").get();
+    graph.shard.local().RelationshipTypeInsertPeered("KNOWS").get();
+    graph.shard.local().RelationshipTypeInsertPeered("LIKES").get();
+
+    auto person = [&](const std::string& name) {
+        return graph.shard.local().NodeAddPeered("Person", name, "{\"name\": \"" + name + "\"}").get();
+    };
+    // Two independent stars. hub_a: 2 friends x 1 liked = 2 rows. hub_b: 1 friend x 2 liked = 2 rows.
+    // Correct total is 4. A branch joined on the wrong key would cross the hubs -- (3 friends) x
+    // (3 liked) = 9 -- so the count alone separates right from wrong.
+    uint64_t hub_a = person("HubA");
+    uint64_t hub_b = person("HubB");
+    uint64_t f1 = person("F1");
+    uint64_t f2 = person("F2");
+    uint64_t f3 = person("F3");
+    uint64_t i1 = person("I1");
+    uint64_t i2 = person("I2");
+    uint64_t i3 = person("I3");
+
+    graph.shard.local().RelationshipAddPeered("KNOWS", hub_a, f1, "{}").get();
+    graph.shard.local().RelationshipAddPeered("KNOWS", hub_a, f2, "{}").get();
+    graph.shard.local().RelationshipAddPeered("LIKES", hub_a, i1, "{}").get();
+    graph.shard.local().RelationshipAddPeered("KNOWS", hub_b, f3, "{}").get();
+    graph.shard.local().RelationshipAddPeered("LIKES", hub_b, i2, "{}").get();
+    graph.shard.local().RelationshipAddPeered("LIKES", hub_b, i3, "{}").get();
+
+    auto run = [&](const std::string& q) {
+        auto query = GqlParser::parse(q);
+        GqlOptimizer::optimize(query);
+        return GqlExecutor::execute(graph, std::move(query)).get();
+    };
+
+    SECTION("two branches sharing the centre yield the per-centre cross product") {
+        std::string res = run(
+            "MATCH (h:Person)-[:KNOWS]->(f:Person) "
+            "MATCH (h)-[:LIKES]->(m:Person) "
+            "RETURN h.name AS hn, f.name AS fn, m.name AS mn");
+        INFO("result: " << res);
+
+        // hub_a: (F1,I1),(F2,I1). hub_b: (F3,I2),(F3,I3). Exactly four rows, all sharing their hub.
+        REQUIRE(res.find("\"hn\": \"HubA\", \"fn\": \"F1\", \"mn\": \"I1\"") != std::string::npos);
+        REQUIRE(res.find("\"hn\": \"HubA\", \"fn\": \"F2\", \"mn\": \"I1\"") != std::string::npos);
+        REQUIRE(res.find("\"hn\": \"HubB\", \"fn\": \"F3\", \"mn\": \"I2\"") != std::string::npos);
+        REQUIRE(res.find("\"hn\": \"HubB\", \"fn\": \"F3\", \"mn\": \"I3\"") != std::string::npos);
+
+        // No row crosses a hub: HubA never pairs with I2/I3, HubB never pairs with F1/F2.
+        REQUIRE(res.find("\"hn\": \"HubA\", \"fn\": \"F1\", \"mn\": \"I2\"") == std::string::npos);
+        REQUIRE(res.find("\"hn\": \"HubB\", \"fn\": \"F1\"") == std::string::npos);
+
+        // Count check via count(*) so a stray extra row cannot hide among the four.
+        std::string cnt = run(
+            "MATCH (h:Person)-[:KNOWS]->(f:Person) "
+            "MATCH (h)-[:LIKES]->(m:Person) "
+            "RETURN count(*) AS n");
+        INFO("count: " << cnt);
+        REQUIRE(cnt.find("\"n\": 4") != std::string::npos);
+    }
+
+    SECTION("a third branch on the same centre still pairs within the centre") {
+        // Add a self-anchored third arm; hub_a now has an extra outgoing KNOWS to itself-labelled arm
+        // via a distinct rel so the star has three branches. Uses the same rels but a third pattern
+        // that re-reads KNOWS friends, so hub_a contributes 2x1x2 and hub_b 1x2x1.
+        std::string cnt = run(
+            "MATCH (h:Person)-[:KNOWS]->(f:Person) "
+            "MATCH (h)-[:LIKES]->(m:Person) "
+            "MATCH (h)-[:KNOWS]->(g:Person) "
+            "RETURN count(*) AS n");
+        INFO("count: " << cnt);
+        // hub_a: 2 (f) x 1 (m) x 2 (g) = 4; hub_b: 1 x 2 x 1 = 2; total 6.
+        REQUIRE(cnt.find("\"n\": 6") != std::string::npos);
+    }
+}

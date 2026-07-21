@@ -68,6 +68,9 @@ enable_doxygen()
 # allow for static analysis options
 include(cmake/StaticAnalyzers.cmake)
 
+# coverage instrumentation scoped to the GQL sources (see the module for why it is not the whole binary)
+include(cmake/GqlCoverage.cmake)
+
 option(BUILD_SHARED_LIBS "Enable compilation of shared libraries" OFF)
 option(ENABLE_TESTING "Enable Test Builds" ON)
 option(ENABLE_FUZZING "Enable Fuzzing Builds" OFF)
@@ -294,6 +297,13 @@ target_link_libraries(
         project_warnings
         Graph
 )
+
+# Instrument the GQL translation units when GQL_COVERAGE is on. Source-file properties are
+# directory-scoped, so this one call covers every target defined here that compiles them.
+file(GLOB_RECURSE RAGEDB_GQL_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/gql/*.cpp")
+ragedb_instrument_gql_sources(${RAGEDB_GQL_SOURCES})
+ragedb_link_gql_coverage(ragedb)
+ragedb_link_gql_coverage(Graph)
 
 if(ENABLE_TESTING)
   message("Building Tests. Be sure to check out test/constexpr_tests for constexpr testing")

@@ -152,6 +152,11 @@ target_link_libraries(tests PRIVATE project_warnings project_options catch_main 
 # lld links the tests binary in a fraction of GNU ld's peak memory (149 TUs statically linked against
 # seastar + iresearch), keeping the link under a 16GB box's budget where GNU ld OOM-killed it.
 target_link_options(tests PRIVATE -fuse-ld=lld)
+# Coverage is measured for the GQL sources only, so only those are instrumented -- the test binary
+# compiles them from this directory, which is a separate source-property scope from the root list.
+file(GLOB_RECURSE RAGEDB_TEST_GQL_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../src/gql/*.cpp")
+ragedb_instrument_gql_sources(${RAGEDB_TEST_GQL_SOURCES})
+ragedb_link_gql_coverage(tests)
 target_include_directories(tests PRIVATE
         ../src/graph
         ../src/graph/eve

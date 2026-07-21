@@ -245,12 +245,17 @@ TEST_CASE("standalone ORDER BY/LIMIT before RETURN pages the working table", "[g
     graph.shard.local().NodePropertyTypeAddPeered("Person", "likes", "integer").get();
 
     auto person = [&](const std::string& key, const std::string& name, int64_t likes) {
-        graph.shard.local().NodeAddPeered("Person", key,
+        return graph.shard.local().NodeAddPeered("Person", key,
             "{\"name\": \"" + name + "\", \"likes\": " + std::to_string(likes) + "}").get();
     };
-    person("alice", "Alice", 30);
-    person("bob", "Bob", 20);
-    person("carol", "Carol", 10);
+    uint64_t alice = person("alice", "Alice", 30);
+    uint64_t bob = person("bob", "Bob", 20);
+    uint64_t carol = person("carol", "Carol", 10);
+    // Alice knows Bob then Carol, so the non-start variable's id order is the opposite of the order
+    // the DESC test below asks for.
+    graph.shard.local().RelationshipTypeInsertPeered("KNOWS").get();
+    graph.shard.local().RelationshipAddPeered("KNOWS", alice, bob, "{}").get();
+    graph.shard.local().RelationshipAddPeered("KNOWS", alice, carol, "{}").get();
 
     SECTION("ordering and paging apply to the matched rows, and the RETURN re-projects them") {
         std::string res = GqlExecutor::execute(graph,
@@ -291,6 +296,27 @@ TEST_CASE("standalone ORDER BY/LIMIT before RETURN pages the working table", "[g
                         "RETURN p.name AS n ORDER BY score DESC")).get();
         INFO("desc: " << desc);
         REQUIRE(desc.find("[{\"n\": \"Alice\"}, {\"n\": \"Bob\"}, {\"n\": \"Carol\"}]") != std::string::npos);
+    }
+
+    SECTION("ordering by a later pattern variable is not the start node's id order") {
+        // `f` is bound by the second node of the pattern, so its id order says nothing about the scan
+        // order of `p`. Alice knows Bob (id 2) and Carol (id 3): DESC must put Carol first.
+        std::string res = GqlExecutor::execute(graph,
+            std::string("MATCH (p:Person {name: 'Alice'})-[:KNOWS]->(f:Person) "
+                        "RETURN f.name AS n ORDER BY f DESC")).get();
+        INFO("result: " << res);
+        REQUIRE(res.find("[{\"n\": \"Carol\"}, {\"n\": \"Bob\"}]") != std::string::npos);
+    }
+
+    SECTION("ordering by a column piped into a segment that has its own MATCH") {
+        // The sort key is a column carried in from the previous segment, not this segment's start
+        // node, so the traversal order cannot stand in for it.
+        std::string res = GqlExecutor::execute(graph,
+            std::string("MATCH (p:Person) RETURN p.name AS pn, p.likes AS pl "
+                        "NEXT MATCH (q:Person {name: 'Alice'}) "
+                        "RETURN pn ORDER BY pl ASC")).get();
+        INFO("result: " << res);
+        REQUIRE(res.find("[{\"pn\": \"Carol\"}, {\"pn\": \"Bob\"}, {\"pn\": \"Alice\"}]") != std::string::npos);
     }
 
     SECTION("a NEXT segment of only primitive query statements forwards its working table") {

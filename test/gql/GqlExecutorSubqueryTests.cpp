@@ -215,3 +215,67 @@ TEST_CASE("GQL COUNT{} with a nested EXISTS in its WHERE (IC10 common)", "[gql_e
 
     guard.stop();
 }
+
+TEST_CASE("a positive EXISTS filter is a semi-join, not a row multiplier", "[gql_executor_count_subquery]") {
+    // A positive EXISTS in a WHERE is unnested into an OPTIONAL MATCH, which yields one row per
+    // subquery match. Left as-is that multiplies the outer rows, so a work matching the subquery
+    // twice would be counted twice -- the SPB a5 shape. The rows are deduplicated on the outer
+    // variables after the filter; this pins that, since nothing else covers the many-valued case.
+    auto graph = Graph("gql_test_exists_semijoin");
+    graph.Start().get();
+    graph.Clear();
+    GraphStopGuard guard(graph);
+
+    graph.shard.local().NodeTypeInsertPeered("CreativeWork").get();
+    graph.shard.local().NodeTypeInsertPeered("Thing").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Thing", "uri", "string").get();
+    graph.shard.local().NodeTypeInsertPeered("Category").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Category", "uri", "string").get();
+    graph.shard.local().RelationshipTypeInsertPeered("about").get();
+    graph.shard.local().RelationshipTypeInsertPeered("category").get();
+
+    uint64_t thing = graph.shard.local().NodeAddPeered("Thing", "t1", "{\"uri\": \"thing/1\"}").get();
+    uint64_t company = graph.shard.local().NodeAddPeered("Category", "company", "{\"uri\": \"cat/Company\"}").get();
+    uint64_t event = graph.shard.local().NodeAddPeered("Category", "event", "{\"uri\": \"cat/Event\"}").get();
+    uint64_t other = graph.shard.local().NodeAddPeered("Category", "other", "{\"uri\": \"cat/Other\"}").get();
+
+    // w1 matches the EXISTS twice (both categories), w2 once, w3 not at all.
+    uint64_t w1 = graph.shard.local().NodeAddPeered("CreativeWork", "w1", "{}").get();
+    graph.shard.local().RelationshipAddPeered("category", w1, company, "{}").get();
+    graph.shard.local().RelationshipAddPeered("category", w1, event, "{}").get();
+    uint64_t w2 = graph.shard.local().NodeAddPeered("CreativeWork", "w2", "{}").get();
+    graph.shard.local().RelationshipAddPeered("category", w2, company, "{}").get();
+    uint64_t w3 = graph.shard.local().NodeAddPeered("CreativeWork", "w3", "{}").get();
+    graph.shard.local().RelationshipAddPeered("category", w3, other, "{}").get();
+    for (uint64_t w : {w1, w2, w3}) {
+        graph.shard.local().RelationshipAddPeered("about", w, thing, "{}").get();
+    }
+
+    auto run = [&graph](const std::string& q) {
+        auto query = GqlParser::parse(q);
+        GqlOptimizer::optimize(query);
+        return GqlExecutor::execute(graph, std::move(query)).get();
+    };
+
+    SECTION("a work matching the EXISTS twice is counted once (SPB a5 shape)") {
+        std::string r = run(
+            "MATCH (w:CreativeWork)-[:about]->(e:Thing) "
+            "WHERE EXISTS { MATCH (w)-[:category]->(c) "
+            "               WHERE c.uri = 'cat/Company' OR c.uri = 'cat/Event' } "
+            "RETURN e.uri AS k, count(*) AS n");
+        INFO("counts: " << r);
+        REQUIRE(r.find("\"n\": 2") != std::string::npos);   // w1 and w2, not 3
+    }
+
+    SECTION("the same filter without an aggregate yields one row per work, not per category") {
+        std::string r = run(
+            "MATCH (w:CreativeWork)-[:about]->(e:Thing) "
+            "WHERE EXISTS { MATCH (w)-[:category]->(c) "
+            "               WHERE c.uri = 'cat/Company' OR c.uri = 'cat/Event' } "
+            "RETURN count(w) AS n");
+        INFO("rows: " << r);
+        REQUIRE(r.find("\"n\": 2") != std::string::npos);
+    }
+
+    guard.stop();
+}

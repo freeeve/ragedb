@@ -236,6 +236,49 @@ TEST_CASE("ORDER BY over RETURN aliases executes correctly", "[gql_executor_with
     graph.Stop().get();
 }
 
+TEST_CASE("standalone ORDER BY/LIMIT before RETURN pages the working table", "[gql_executor_with]") {
+    auto graph = Graph("gql_standalone_order_page_test");
+    graph.Start().get();
+    graph.Clear();
+    graph.shard.local().NodeTypeInsertPeered("Person").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "name", "string").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Person", "likes", "integer").get();
+
+    auto person = [&](const std::string& key, const std::string& name, int64_t likes) {
+        graph.shard.local().NodeAddPeered("Person", key,
+            "{\"name\": \"" + name + "\", \"likes\": " + std::to_string(likes) + "}").get();
+    };
+    person("alice", "Alice", 30);
+    person("bob", "Bob", 20);
+    person("carol", "Carol", 10);
+
+    SECTION("ordering and paging apply to the matched rows, and the RETURN re-projects them") {
+        std::string res = GqlExecutor::execute(graph,
+            std::string("MATCH (p:Person) ORDER BY p.likes DESC LIMIT 2 RETURN p.name AS n")).get();
+        INFO("result: " << res);
+        REQUIRE(res.find("[{\"n\": \"Alice\"}, {\"n\": \"Bob\"}]") != std::string::npos);
+    }
+
+    SECTION("the sort key may be a LET binding that the RETURN never projects") {
+        std::string res = GqlExecutor::execute(graph,
+            std::string("MATCH (p:Person) LET score = p.likes * 2 "
+                        "ORDER BY score ASC LIMIT 2 RETURN p.name AS n")).get();
+        INFO("result: " << res);
+        REQUIRE(res.find("[{\"n\": \"Carol\"}, {\"n\": \"Bob\"}]") != std::string::npos);
+    }
+
+    SECTION("a page before an aggregating RETURN bounds the rows fed to the aggregate") {
+        // LIMIT 2 pages the three matched people, so the count is of the page, not of the whole
+        // label -- and not a limit on the single aggregate row.
+        std::string res = GqlExecutor::execute(graph,
+            std::string("MATCH (p:Person) ORDER BY p.likes DESC LIMIT 2 RETURN count(p) AS c")).get();
+        INFO("result: " << res);
+        REQUIRE(res.find("\"c\": 2") != std::string::npos);
+    }
+
+    graph.Stop().get();
+}
+
 TEST_CASE("count over an empty expansion is 0 even when rewritten to a degree sum", "[gql_executor_with]") {
     auto graph = Graph("gql_count_to_sum_empty_test");
     graph.Start().get();

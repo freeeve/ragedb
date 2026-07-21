@@ -247,6 +247,43 @@ static void resolve_order_by_aliases(GqlQuery& query) {
 }
 
 /**
+ * @brief Names every column the working table carries at the end of a segment: the columns piped in
+ *        from the previous segment, the variables this segment's patterns bind, and the columns its
+ *        FOR and LET statements add.
+ *
+ * Used to synthesize the passthrough projection that closes a segment whose ordering, paging or value
+ * binding has to take effect before the following statement re-projects. Order is significant only for
+ * readability of the resulting plan; duplicates are dropped.
+ */
+static std::vector<std::string> segment_output_columns(const GqlQuery& query, const GqlQuery* piped) {
+    std::vector<std::string> columns;
+    std::set<std::string> seen;
+    auto add = [&](const std::string& name) {
+        if (name.empty() || !seen.insert(name).second) return;
+        columns.push_back(name);
+    };
+    if (piped) {
+        for (const auto& item : piped->returns) {
+            if (item.alias) {
+                add(*item.alias);
+            } else if (item.expr && item.expr->kind == ExpressionKind::VARIABLE) {
+                add(static_cast<VariableExpr*>(item.expr.get())->name);
+            }
+        }
+    }
+    for (const auto& match : query.matches) {
+        for (const auto& node : match.pattern.nodes) add(node.variable);
+        for (const auto& edge : match.pattern.edges) add(edge.variable);
+        add(match.path_variable);
+    }
+    for (const auto& binding : query.for_bindings) add(binding.variable);
+    for (const auto& let : query.let_bindings) {
+        if (let.alias) add(*let.alias);
+    }
+    return columns;
+}
+
+/**
  * @brief Parse an optional ISO GQL `GROUP BY <var> (, <var>)*` clause into query.group_by. GROUP is a
  *        keyword but the following BY is not, so it arrives as an identifier. Only fires when both are
  *        present, so a bare GROUP elsewhere (e.g. SHORTEST k GROUP) is untouched.
@@ -803,39 +840,44 @@ GqlQuery GqlParser::parse_single_query() {
         throw std::runtime_error("Query must contain at least one MATCH or write clause");
     }
 
-    // ISO GQL standalone ordering/paging statement: a segment may begin with ORDER BY [LIMIT] operating
-    // on the working table piped in from the previous segment (no MATCH/RETURN of its own yet).
-    if ((check(TokenType::ORDER_BY) || check(TokenType::LIMIT) || check(TokenType::OFFSET)) &&
-        query.matches.empty() && query.returns.empty() && query.let_bindings.empty() &&
-        !with_segments.empty()) {
+    // ISO GQL standalone ordering/paging statement: `<order by and page statement>` is a primitive query
+    // statement, so ORDER BY [OFFSET] [LIMIT] may stand on its own before the RETURN, sorting and paging
+    // the working table that the RETURN then re-projects. The table it sorts may come from a preceding
+    // NEXT segment, from this segment's own MATCH/FOR, or from its LET bindings.
+    if (check(TokenType::ORDER_BY) || check(TokenType::LIMIT) || check(TokenType::OFFSET)) {
+        const bool sorts_piped_rows_only = query.matches.empty() && query.let_bindings.empty() &&
+                                           query.for_bindings.empty() && !query.call_subquery &&
+                                           !with_segments.empty();
         parse_order_by(query);
         parse_limit(query);
-        // If a MATCH follows, the sort/page is a segment boundary: it must forward the sorted+limited
-        // working table to the next MATCH. Synthesize a passthrough projection of the previous segment's
-        // output columns so the existing projection pipeline carries every binding forward.
-        if (check(TokenType::MATCH) || (check(TokenType::OPTIONAL) && peek(1).type == TokenType::MATCH)) {
-            for (const auto& item : with_segments.back()->returns) {
-                std::string col = item.alias
-                    ? *item.alias
-                    : (item.expr && item.expr->kind == ExpressionKind::VARIABLE
-                           ? static_cast<VariableExpr*>(item.expr.get())->name
-                           : std::string());
-                if (!col.empty()) {
-                    ReturnItem pass;
-                    pass.expr = std::make_unique<VariableExpr>(col);
-                    pass.alias = col;
-                    query.returns.push_back(std::move(pass));
-                }
+        // Sorting rows this segment produced itself, or paging rows a following statement re-projects,
+        // is a segment boundary: the ordering has to take effect before the next statement runs. Close
+        // the segment with a passthrough projection of everything in scope so the projection pipeline
+        // carries every binding forward, and let the RETURN (or MATCH) start a fresh segment. Doing this
+        // unconditionally also keeps `ORDER BY ... LIMIT n RETURN count(*)` honest: the page bounds the
+        // rows fed to the aggregate rather than the single row it produces.
+        const bool match_follows =
+            check(TokenType::MATCH) || (check(TokenType::OPTIONAL) && peek(1).type == TokenType::MATCH);
+        auto close_segment_with_passthrough = [&]() {
+            const GqlQuery* piped = with_segments.empty() ? nullptr : with_segments.back().get();
+            for (const auto& col : segment_output_columns(query, piped)) {
+                ReturnItem pass;
+                pass.expr = std::make_unique<VariableExpr>(col);
+                pass.alias = col;
+                query.returns.push_back(std::move(pass));
             }
             resolve_order_by_aliases(query);
             with_segments.push_back(std::make_shared<GqlQuery>(std::move(query)));
+        };
+        if (!sorts_piped_rows_only || match_follows) {
+            close_segment_with_passthrough();
             continue;
         }
-        // Otherwise a RETURN follows and re-projects the ordered/paged rows. Push the ORDER BY/LIMIT
-        // into the producing (previous) segment so its streaming top-K bounds the sort during the
-        // traversal, instead of materialising the whole intermediate to sort it here. Valid
-        // because the order keys are the previous segment's output columns and this segment only
-        // re-projects; only push when that segment has no ordering/paging of its own to clobber.
+        // The segment only re-projects rows piped in from the previous one, so push the ORDER BY/LIMIT
+        // into that producing segment instead: its streaming top-K then bounds the sort during the
+        // traversal rather than materialising the whole intermediate to sort it here. Valid because the
+        // order keys are the producer's own output columns; only push when the producer has no
+        // ordering/paging of its own to clobber, otherwise close the segment as above.
         auto& producer = with_segments.back();
         if (producer->order_by.empty() && !producer->limit.has_value()) {
             producer->order_by = std::move(query.order_by);
@@ -843,6 +885,9 @@ GqlQuery GqlParser::parse_single_query() {
             query.order_by.clear();
             query.limit.reset();
             resolve_order_by_aliases(*producer);
+        } else {
+            close_segment_with_passthrough();
+            continue;
         }
     }
 

@@ -780,6 +780,67 @@ TEST_CASE("GQL ISO linear-query NEXT/FILTER lowering", "[gql_parser]") {
         REQUIRE(q.with_segments[1]->returns.size() == 1); // passthrough of m
         REQUIRE(q.matches.size() == 1);                    // the post-sort MATCH
     }
+    SECTION("standalone ORDER BY/LIMIT after this segment's own MATCH sorts before the RETURN") {
+        auto q = GqlParser::parse(
+            "MATCH (p:Person) "
+            "ORDER BY p.age DESC LIMIT 10 "
+            "RETURN p.name AS name");
+        // The sort/page closes the segment: it must take effect on the matched rows, not on the
+        // projection, so the MATCH plus a passthrough of `p` becomes the producing segment.
+        REQUIRE(q.with_segments.size() == 1);
+        REQUIRE(q.with_segments[0]->matches.size() == 1);
+        REQUIRE(q.with_segments[0]->order_by.size() == 1);
+        REQUIRE(q.with_segments[0]->limit.value() == 10);
+        REQUIRE(q.with_segments[0]->returns.size() == 1);
+        REQUIRE(q.with_segments[0]->returns[0].alias == "p");
+        REQUIRE(q.matches.empty());
+        REQUIRE(q.order_by.empty());
+        REQUIRE(!q.limit.has_value());
+    }
+    SECTION("standalone ORDER BY/LIMIT sorts on a LET binding of the same segment") {
+        auto q = GqlParser::parse(
+            "MATCH (p:Person) "
+            "LET score = p.likes / 2 "
+            "ORDER BY score DESC LIMIT 5 "
+            "RETURN p.id AS personId");
+        REQUIRE(q.with_segments.size() == 1);
+        REQUIRE(q.with_segments[0]->let_bindings.size() == 1);
+        REQUIRE(q.with_segments[0]->order_by.size() == 1);
+        REQUIRE(q.with_segments[0]->limit.value() == 5);
+        // The passthrough carries both the pattern variable and the LET column forward.
+        REQUIRE(q.with_segments[0]->returns.size() == 2);
+        REQUIRE(q.with_segments[0]->returns[0].alias == "p");
+        REQUIRE(q.with_segments[0]->returns[1].alias == "score");
+        REQUIRE(q.returns.size() == 1);
+        REQUIRE(q.returns[0].alias == "personId");
+    }
+    SECTION("standalone ORDER BY/LIMIT on piped rows with a LET closes the segment (BI Q13 tail)") {
+        auto q = GqlParser::parse(
+            "MATCH (z:Person) RETURN z AS zombie, count(z) AS likes "
+            "NEXT "
+            "LET zombieScore = likes / 2 "
+            "ORDER BY zombieScore DESC, zombie.id ASC LIMIT 100 "
+            "RETURN zombie.id AS zombieId, likes");
+        // Producer projection, then the LET+sort/page segment, then the final re-projection. The
+        // ordering cannot be pushed into the producer: its key is this segment's LET column.
+        REQUIRE(q.with_segments.size() == 2);
+        REQUIRE(q.with_segments[0]->order_by.empty());
+        REQUIRE(q.with_segments[1]->let_bindings.size() == 1);
+        REQUIRE(q.with_segments[1]->order_by.size() == 2);
+        REQUIRE(q.with_segments[1]->limit.value() == 100);
+        REQUIRE(q.with_segments[1]->returns.size() == 3); // zombie, likes, zombieScore
+        REQUIRE(q.returns.size() == 2);
+    }
+    SECTION("a page before an aggregating RETURN bounds the rows fed to the aggregate") {
+        auto q = GqlParser::parse(
+            "MATCH (p:Person) ORDER BY p.age DESC LIMIT 10 RETURN count(p) AS c");
+        // The LIMIT belongs to the producing segment, not to the one-row aggregate result.
+        REQUIRE(q.with_segments.size() == 1);
+        REQUIRE(q.with_segments[0]->limit.value() == 10);
+        REQUIRE(!q.limit.has_value());
+        REQUIRE(q.returns.size() == 1);
+        REQUIRE(q.returns[0].expr->kind == ExpressionKind::AGGREGATION);
+    }
     SECTION("LET binds a computed column usable by a later FILTER/RETURN") {
         auto q = GqlParser::parse(
             "MATCH (p:Person) LET fullName = p.firstName || ' ' || p.lastName "

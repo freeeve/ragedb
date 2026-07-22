@@ -136,3 +136,65 @@ TEST_CASE("has_post_scan_residual_predicate flags rows a later filter still drop
         REQUIRE(residual("MATCH (p:Person)-[:KNOWS]->(f:Person {name: 'Bob'}) RETURN p"));
     }
 }
+
+TEST_CASE("is_equivalent_pattern compares nodes and edges position by position", "[gql_optimizer]") {
+    auto pat = [](const std::string& p) {
+        return GqlParser::parse("MATCH " + p + " RETURN a").matches[0].pattern;
+    };
+    REQUIRE(is_equivalent_pattern(pat("(a:P)-[:R]->(b:P)"), pat("(a:P)-[:R]->(b:P)")));
+    // Different target variable, same shape -- not equivalent (subsumption handles that case separately).
+    REQUIRE_FALSE(is_equivalent_pattern(pat("(a:P)-[:R]->(b:P)"), pat("(a:P)-[:R]->(c:P)")));
+    // Different relationship type.
+    REQUIRE_FALSE(is_equivalent_pattern(pat("(a:P)-[:R]->(b:P)"), pat("(a:P)-[:S]->(b:P)")));
+    // Different edge direction.
+    REQUIRE_FALSE(is_equivalent_pattern(pat("(a:P)-[:R]->(b:P)"), pat("(a:P)<-[:R]-(b:P)")));
+    // Different node count.
+    REQUIRE_FALSE(is_equivalent_pattern(pat("(a:P)"), pat("(a:P)-[:R]->(b:P)")));
+}
+
+TEST_CASE("is_label_subsumed treats an absent label as a wildcard", "[gql_optimizer]") {
+    auto lbl = [](const std::string& node) {
+        return GqlParser::parse("MATCH " + node + " RETURN a").matches[0].pattern.nodes[0].label_expr;
+    };
+    auto labeled = lbl("(a:P)");
+    auto unlabeled = lbl("(a)");
+    // A specific label is subsumed by an absent (wildcard) one.
+    REQUIRE(is_label_subsumed(labeled, unlabeled));
+    // A wildcard is NOT subsumed by a specific label.
+    REQUIRE_FALSE(is_label_subsumed(unlabeled, labeled));
+    // Same label subsumes; a different one does not.
+    REQUIRE(is_label_subsumed(labeled, lbl("(a:P)")));
+    REQUIRE_FALSE(is_label_subsumed(labeled, lbl("(a:Q)")));
+}
+
+TEST_CASE("extract_filters pushes conjuncts but never descends into an OR", "[gql_optimizer]") {
+    auto where = [](const std::string& w) {
+        return GqlParser::parse("MATCH (a:Person) WHERE " + w + " RETURN a").where_expr;
+    };
+    SECTION("an AND of literal comparisons pushes both") {
+        std::map<std::string, std::vector<PropertyFilter>> pd;
+        auto w = where("a.x = 1 AND a.y > 2");
+        extract_filters(w.get(), pd);
+        REQUIRE(pd["a"].size() == 2);
+    }
+    SECTION("an OR pushes nothing (unsound to push a disjunct as a scan filter)") {
+        std::map<std::string, std::vector<PropertyFilter>> pd;
+        auto w = where("a.x = 1 OR a.y = 2");
+        extract_filters(w.get(), pd);
+        REQUIRE(pd.empty());
+    }
+}
+
+TEST_CASE("collect_variables_from_matches gathers node and edge variables", "[gql_optimizer]") {
+    auto q = GqlParser::parse("MATCH (a:P)-[e:R]->(b:P) RETURN a");
+    std::set<std::string> vars;
+    collect_variables_from_matches(q.matches, vars);
+    REQUIRE(vars.count("a") == 1);
+    REQUIRE(vars.count("b") == 1);
+    REQUIRE(vars.count("e") == 1);
+}
+
+TEST_CASE("query_has_distinct_aggregate detects count(DISTINCT ...)", "[gql_optimizer]") {
+    REQUIRE(query_has_distinct_aggregate(GqlParser::parse("MATCH (a:P) RETURN count(DISTINCT a) AS n")));
+    REQUIRE_FALSE(query_has_distinct_aggregate(GqlParser::parse("MATCH (a:P) RETURN count(a) AS n")));
+}

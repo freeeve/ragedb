@@ -38,6 +38,7 @@ add_executable(tests tests.cpp shard/ShardIds.cpp shard/Ids.cpp shard/NodeTypes.
         gql/optimizer/IrreflexiveContradictionPrunerTests.cpp
         gql/optimizer/EdgeContradictionPrunerTests.cpp
         gql/optimizer/OptionalNoOpPruningTests.cpp
+        gql/optimizer/TransitiveFilterPropagatorTests.cpp
         gql/optimizer/DomainConstraintReasonerTests.cpp
         gql/optimizer/TransitiveReachabilityPrunerTests.cpp
         gql/optimizer/FunctionalDependencyPrunerTests.cpp

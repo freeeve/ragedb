@@ -37,7 +37,12 @@ struct StopGuard {
 };
 }  // namespace
 
-TEST_CASE("a star query pairs branches within each centre, not across centres", "[gql_honeycomb]") {
+// Own tag, deliberately not [gql_honeycomb]: the per-tag verification runs one tag per process, and
+// this builds a graph. Sharing the graph-heavy honeycomb tag (whose WCOJ cases construct and tear down
+// 1000-node graphs) tips the process over the known seastar multi-graph-teardown limit and it SIGSEGVs
+// during a later section -- an artifact of running too many graph lifecycles in one process, not of the
+// query, which runs clean in isolation.
+TEST_CASE("a star query pairs branches within each centre, not across centres", "[gql_star_exec]") {
     auto graph = Graph("gql_test_star_join_exec");
     graph.Start().get();
     graph.Clear();
@@ -102,7 +107,16 @@ TEST_CASE("a star query pairs branches within each centre, not across centres", 
         REQUIRE(cnt.find("\"n\": 4") != std::string::npos);
     }
 
-    // A three-branch star over the same data SIGSEGVs the executor -- a separate crash bug, tracked
-    // on its own; the repro lived here as a fourth section and was pulled out to StarJoinCrashProbe
-    // for characterization rather than committed as a passing test.
+    SECTION("a third branch on the same centre still pairs within the centre") {
+        // Three MATCH clauses share h; the two KNOWS arms are independent clauses (no cross-clause edge
+        // uniqueness), so each hub contributes the product of its three arms.
+        std::string cnt = run(
+            "MATCH (h:Person)-[:KNOWS]->(f:Person) "
+            "MATCH (h)-[:LIKES]->(m:Person) "
+            "MATCH (h)-[:KNOWS]->(g:Person) "
+            "RETURN count(*) AS n");
+        INFO("count: " << cnt);
+        // hub_a: 2 (f) x 1 (m) x 2 (g) = 4; hub_b: 1 x 2 x 1 = 2; total 6.
+        REQUIRE(cnt.find("\"n\": 6") != std::string::npos);
+    }
 }

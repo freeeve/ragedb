@@ -204,8 +204,8 @@ struct EdgeAggAccumulator {
     bool distinct = false;        // DISTINCT aggregate: fold over the distinct-value set instead
     bool count_to_sum = false;    // COUNT rewritten to a degree SUM: empty input yields 0, not null
     int64_t count = 0;
-    int64_t sum_int = 0;
-    double sum_double = 0.0;
+    __int128 sum_int = 0;         // exact integer subtotal, kept separate from the float subtotal
+    double sum_double = 0.0;      // subtotal of the double-typed values only
     bool has_double = false;
     int64_t val_count = 0;
     GqlValue extreme{};
@@ -258,13 +258,15 @@ struct EdgeAggAccumulator {
         GqlValue v = evaluate_expression(row, expr);
         if (kind == AggregateKind::SUM || kind == AggregateKind::AVG) {
             if (v.type == GqlValue::PROPERTY) {
+                // Integers accumulate exactly in a 128-bit subtotal; doubles accumulate separately. They
+                // are combined only at finalize, so a mix like 2^60 + 1.5 - 2^60 keeps the 1.5 instead of
+                // cancelling to 0 the way a single float64 running total does once a large int rounds it.
                 if (std::holds_alternative<int64_t>(v.property)) {
-                    if (has_double) sum_double += static_cast<double>(std::get<int64_t>(v.property));
-                    else sum_int += std::get<int64_t>(v.property);
+                    sum_int += static_cast<__int128>(std::get<int64_t>(v.property));
                     val_count++;
                 } else if (std::holds_alternative<double>(v.property)) {
-                    if (!has_double) { sum_double = static_cast<double>(sum_int); has_double = true; }
                     sum_double += std::get<double>(v.property);
+                    has_double = true;
                     val_count++;
                 }
             }
@@ -289,12 +291,16 @@ struct EdgeAggAccumulator {
         }
         if (kind == AggregateKind::SUM) {
             if (val_count == 0) return count_to_sum ? GqlValue(static_cast<int64_t>(0)) : GqlValue();
-            return has_double ? GqlValue(sum_double) : GqlValue(sum_int);
+            if (has_double) return GqlValue(static_cast<double>(sum_int) + sum_double);
+            if (sum_int >= std::numeric_limits<int64_t>::min() && sum_int <= std::numeric_limits<int64_t>::max())
+                return GqlValue(static_cast<int64_t>(sum_int));
+            return GqlValue(static_cast<double>(sum_int));   // exceeds int64: widen rather than overflow
         }
         if (kind == AggregateKind::AVG) {
             if (val_count == 0) return GqlValue();
-            return has_double ? GqlValue(sum_double / static_cast<double>(val_count))
-                              : GqlValue(static_cast<double>(sum_int) / static_cast<double>(val_count));
+            double total = has_double ? (static_cast<double>(sum_int) + sum_double)
+                                      : static_cast<double>(sum_int);
+            return GqlValue(total / static_cast<double>(val_count));
         }
         if (kind == AggregateKind::COLLECT) return GqlValue(collect_vals);
         if (kind == AggregateKind::STDDEV_POP || kind == AggregateKind::STDDEV_SAMP) {
@@ -327,25 +333,29 @@ struct EdgeAggAccumulator {
             for (const auto& v : distinct_vals) collect_numeric(v, vals);
             return percentile_of(vals, percentile_fraction, kind == AggregateKind::PERCENTILE_DISC);
         }
-        int64_t s_int = 0;
+        __int128 s_int = 0;         // exact integer subtotal, kept separate from the float subtotal
         double s_double = 0.0;
         bool dbl = false;
         int64_t n = 0;
         for (const auto& v : distinct_vals) {
             if (v.type != GqlValue::PROPERTY) continue;
             if (std::holds_alternative<int64_t>(v.property)) {
-                if (dbl) s_double += static_cast<double>(std::get<int64_t>(v.property));
-                else s_int += std::get<int64_t>(v.property);
+                s_int += static_cast<__int128>(std::get<int64_t>(v.property));
                 n++;
             } else if (std::holds_alternative<double>(v.property)) {
-                if (!dbl) { s_double = static_cast<double>(s_int); dbl = true; }
                 s_double += std::get<double>(v.property);
+                dbl = true;
                 n++;
             }
         }
         if (n == 0) return GqlValue();
-        if (kind == AggregateKind::SUM) return dbl ? GqlValue(s_double) : GqlValue(s_int);
-        double total = dbl ? s_double : static_cast<double>(s_int);
+        if (kind == AggregateKind::SUM) {
+            if (dbl) return GqlValue(static_cast<double>(s_int) + s_double);
+            if (s_int >= std::numeric_limits<int64_t>::min() && s_int <= std::numeric_limits<int64_t>::max())
+                return GqlValue(static_cast<int64_t>(s_int));
+            return GqlValue(static_cast<double>(s_int));
+        }
+        double total = dbl ? (static_cast<double>(s_int) + s_double) : static_cast<double>(s_int);
         return GqlValue(total / static_cast<double>(n));
     }
 };

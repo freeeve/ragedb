@@ -252,3 +252,30 @@ TEST_CASE("GQL Execution Aggregation and Set Tests", "[gql_executor_aggregation]
 
     graph.Stop().get();
 }
+
+// A mixed integer/float SUM must keep the integer subtotal exact. A single float64 running total rounds
+// once a large integer enters it, so a following float is lost and cancelling integers zero the result.
+TEST_CASE("SUM keeps an exact integer subtotal across a mixed int/float aggregate", "[gql_executor_aggregation]") {
+    auto graph = Graph("gql_test");
+    graph.Start().get();
+    graph.Clear();
+
+    graph.shard.local().NodeTypeInsertPeered("Num").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Num", "i", "integer").get();
+    graph.shard.local().NodePropertyTypeAddPeered("Num", "f", "double").get();
+
+    // 2^60 and -2^60 cancel exactly as integers; the 1.5 is the only real contribution. A float64 running
+    // total rounds 2^60 + 1.5 back to 2^60, then subtracts to 0 and drops the 1.5.
+    graph.shard.local().NodeAddPeered("Num", "big",  "{\"i\": 1152921504606846976, \"f\": 0.0}").get();
+    graph.shard.local().NodeAddPeered("Num", "frac", "{\"i\": 0, \"f\": 1.5}").get();
+    graph.shard.local().NodeAddPeered("Num", "nbig", "{\"i\": -1152921504606846976, \"f\": 0.0}").get();
+
+    // CASE routes each row to its integer or its float value, so the aggregate sees a genuine int/float mix.
+    std::string query = "MATCH (n:Num) RETURN sum(CASE WHEN n.f > 0 THEN n.f ELSE n.i END) AS s";
+    std::string res = GqlExecutor::execute(graph, GqlParser::parse(query)).get();
+
+    REQUIRE(res.find("\"s\": 1.500000") != std::string::npos);
+    REQUIRE(res.find("\"s\": 0.000000") == std::string::npos);
+
+    graph.Stop().get();
+}

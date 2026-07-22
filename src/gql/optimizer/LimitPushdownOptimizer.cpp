@@ -143,22 +143,33 @@ void LimitPushdownOptimizer::limit_pushdown_pass(GqlQuery& query) {
             const auto& end_node = pattern.nodes[1];
             
             if (active_vars.count(start_node.variable) && edge.direction == EdgeDirection::RIGHT && !edge.is_variable_length &&
-                start_node.label_expr && start_node.label_expr->kind == LabelExprKind::LITERAL &&
                 end_node.label_expr && end_node.label_expr->kind == LabelExprKind::LITERAL &&
                 edge.label_expr && edge.label_expr->kind == LabelExprKind::LITERAL) {
-                
-                std::string s_label = start_node.label_expr->name;
+
+                // The start node anchors on an already-active variable. Its label is read off this
+                // pattern when spelled, otherwise -- when an earlier match bound the variable with a
+                // label and this join re-uses it bare -- recovered from the variable-to-label map.
+                std::string s_label;
+                if (start_node.label_expr && start_node.label_expr->kind == LabelExprKind::LITERAL) {
+                    s_label = start_node.label_expr->name;
+                } else {
+                    auto it = var_to_label.find(start_node.variable);
+                    if (it != var_to_label.end()) s_label = it->second;
+                }
+
                 std::string t_label = end_node.label_expr->name;
                 std::string r_type = edge.label_expr->name;
-                
+
                 bool match_mandatory = false;
-                for (const auto& rel : mandatory) {
-                    if (rel.source_label == s_label && rel.rel_type == r_type && rel.target_label == t_label) {
-                        match_mandatory = true;
-                        break;
+                if (!s_label.empty()) {
+                    for (const auto& rel : mandatory) {
+                        if (rel.source_label == s_label && rel.rel_type == r_type && rel.target_label == t_label) {
+                            match_mandatory = true;
+                            break;
+                        }
                     }
                 }
-                
+
                 if (match_mandatory) {
                     if (!end_node.variable.empty()) active_vars.insert(end_node.variable);
                     continue;

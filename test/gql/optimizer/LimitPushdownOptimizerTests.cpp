@@ -118,17 +118,30 @@ TEST_CASE("limit pushdown needs every join after the first to be mandatory", "[g
         GqlVirtualCatalog::local().clear();
     }
 
-    SECTION("the mandatory join must spell the label out, even on an already-bound variable") {
-        // Matching the constraint reads the label off the pattern, so re-using a variable bound by an
-        // earlier match without repeating its label leaves the join unproven and the scan unbounded.
-        // Conservative, so it costs a bounded scan rather than correctness -- pinned because the pass
-        // builds a variable-to-label map for exactly this case and then never reads it.
+    SECTION("an earlier match's label is recovered for a bare re-use of the variable, proving the join") {
+        // The join re-uses `s` without repeating its label. The pass recovers `s`'s label (Shipment)
+        // from the variable-to-label map it builds over every match, matches the mandatory constraint,
+        // and bounds the scan -- the same result as spelling the label out.
         GqlVirtualCatalog::local().clear();
         GqlVirtualCatalog::local().add_constraint(
             "MandatoryShippedFrom",
             "MATCH (s:Shipment) WHERE NOT EXISTS { MATCH (s)-[:SHIPPED_FROM]->(l:Location) } RETURN s");
         auto q = optimized(
             "MATCH (s:Shipment) MATCH (s)-[:SHIPPED_FROM]->(l:Location) RETURN s LIMIT 5");
+        REQUIRE(q.matches[0].limit.has_value());
+        REQUIRE(q.matches[0].limit.value() == 5);
+        GqlVirtualCatalog::local().clear();
+    }
+
+    SECTION("a start variable never bound with a label anywhere leaves the join unproven") {
+        // No match spells `s`'s label, so the constraint cannot be checked and the scan stays unbounded.
+        // This is the genuine boundary of the recovery -- conservative, not wrong.
+        GqlVirtualCatalog::local().clear();
+        GqlVirtualCatalog::local().add_constraint(
+            "MandatoryShippedFrom",
+            "MATCH (s:Shipment) WHERE NOT EXISTS { MATCH (s)-[:SHIPPED_FROM]->(l:Location) } RETURN s");
+        auto q = optimized(
+            "MATCH (s) MATCH (s)-[:SHIPPED_FROM]->(l:Location) RETURN s LIMIT 5");
         REQUIRE_FALSE(q.matches[0].limit.has_value());
         GqlVirtualCatalog::local().clear();
     }

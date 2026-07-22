@@ -586,6 +586,9 @@ void DomainConstraintReasoner::domain_constraint_reasoning_pass(GqlQuery& query)
     }
     
     for (const auto& match : query.matches) {
+        // Inline filters on an OPTIONAL pattern only constrain that optional binding; if unsatisfiable the
+        // optional pattern null-extends rather than emptying the query, so they must not join the formula.
+        if (match.is_optional) continue;
         for (const auto& node : match.pattern.nodes) {
             if (node.variable.empty()) continue;
             if (node.where_expr) {
@@ -621,6 +624,7 @@ void DomainConstraintReasoner::domain_constraint_reasoning_pass(GqlQuery& query)
                 
                 // Inspect all variables in the query to see if their label matches
                 for (const auto& match : query.matches) {
+                    if (match.is_optional) continue;   // an optional node null-extends; the constraint is vacuous there
                     for (const auto& node : match.pattern.nodes) {
                         if (node.variable.empty()) continue;
                         std::string q_label;

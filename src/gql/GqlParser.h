@@ -68,6 +68,7 @@ private:
     std::unique_ptr<Expression> parse_expression();
     std::unique_ptr<Expression> parse_or();
     std::unique_ptr<Expression> parse_and();
+    std::unique_ptr<Expression> parse_not();
     std::unique_ptr<Expression> parse_comparison();
     std::unique_ptr<Expression> parse_add_sub();
     std::unique_ptr<Expression> parse_mul_div();

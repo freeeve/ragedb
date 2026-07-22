@@ -60,12 +60,26 @@ std::unique_ptr<Expression> GqlParser::parse_or() {
  * @return std::unique_ptr<Expression> Parsed expression node.
  */
 std::unique_ptr<Expression> GqlParser::parse_and() {
-    auto expr = parse_comparison();
+    auto expr = parse_not();
     while (match(TokenType::AND)) {
-        auto right = parse_comparison();
+        auto right = parse_not();
         expr = std::make_unique<BinaryOpExpr>(BinaryOpKind::AND, std::move(expr), std::move(right));
     }
     return expr;
+}
+
+/**
+ * @brief Parses boolean NOT. Precedence sits BELOW comparisons/predicates but ABOVE AND, so
+ *        `NOT a = b` is `NOT (a = b)` and `NOT x IS NULL` is `NOT (x IS NULL)` -- matching ISO GQL/SQL,
+ *        not `(NOT a) = b`. (NOT is a boolean operator; it is not part of the unary arithmetic level.)
+ *
+ * @return std::unique_ptr<Expression> Parsed expression node.
+ */
+std::unique_ptr<Expression> GqlParser::parse_not() {
+    if (match(TokenType::NOT)) {
+        return std::make_unique<UnaryOpExpr>(UnaryOpKind::NOT, parse_not());
+    }
+    return parse_comparison();
 }
 
 /**
@@ -222,15 +236,14 @@ std::unique_ptr<Expression> GqlParser::parse_mul_div() {
 }
 
 /**
- * @brief Parses unary prefix expressions: NOT and - (negative)
+ * @brief Parses the unary arithmetic prefix: - (negation). Boolean NOT is not here -- it is a looser
+ *        operator handled at parse_not.
  *
  * @return std::unique_ptr<Expression> Parsed expression node.
  */
 std::unique_ptr<Expression> GqlParser::parse_unary() {
-    if (match(TokenType::NOT)) {
-        auto right = parse_unary();
-        return std::make_unique<UnaryOpExpr>(UnaryOpKind::NOT, std::move(right));
-    }
+    // Boolean NOT is handled at parse_not (below comparisons, above AND); only arithmetic negation lives
+    // at this unary level.
     if (match(TokenType::MINUS)) {
         auto right = parse_unary();
         return std::make_unique<UnaryOpExpr>(UnaryOpKind::NEG, std::move(right));

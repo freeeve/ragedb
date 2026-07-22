@@ -98,12 +98,37 @@ TEST_CASE("GQL Optimizer Phase 6: Subsumption & Query Containment Pruning", "[gq
     SECTION("Case 4: Target variables are identical -> handled by redundant join pruning, but let's test empty filters") {
         std::string query_str = "MATCH (a:Person)-[:FRIEND]->(b:Person), (a)-[:FRIEND]->(c:Person) RETURN a.name";
         auto query = GqlParser::parse(query_str);
-        
+
         REQUIRE(query.matches.size() == 2);
-        
+
         GqlOptimizer::optimize(query);
-        
+
         // One should be subsumed by the other because filters are empty (vacuous implication)
         REQUIRE(query.matches.size() == 1);
+    }
+
+    SECTION("count(*) with two subsumable matches does not crash the dead-end walk (SIGSEGV)") {
+        // count(*) is an aggregate with a NULL argument; the subsumption dead-end walk pushed that null
+        // child and dereferenced it. It only fired when two structurally equivalent matches made the
+        // pruner examine the projection -- here the two KNOWS branches around h.
+        std::string query_str =
+            "MATCH (h:Person)-[:KNOWS]->(f:Person) "
+            "MATCH (h)-[:KNOWS]->(g:Person) "
+            "RETURN count(*) AS n";
+        auto query = GqlParser::parse(query_str);
+        REQUIRE(query.matches.size() == 2);
+        // Must not segfault. The subsumption pass may or may not prune; the point is it returns.
+        GqlOptimizer::optimize(query);
+        SUCCEED("optimize returned without crashing");
+    }
+
+    SECTION("an aggregate with a null argument is walked safely in ORDER BY too") {
+        std::string query_str =
+            "MATCH (h:Person)-[:KNOWS]->(f:Person) "
+            "MATCH (h)-[:KNOWS]->(g:Person) "
+            "RETURN h.name AS name, count(*) AS n ORDER BY count(*) DESC";
+        auto query = GqlParser::parse(query_str);
+        GqlOptimizer::optimize(query);
+        SUCCEED("optimize returned without crashing");
     }
 }

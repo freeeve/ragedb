@@ -36,6 +36,9 @@ bool is_var_referenced_in_query_except_match(const GqlQuery& query, const std::s
         while (!stack.empty()) {
             const auto* curr = stack.back();
             stack.pop_back();
+            // A child pushed below can be null: count(*) is an AggregateExpr with no argument, and a
+            // malformed binary/unary op can carry a null operand. Skip it rather than dereference kind.
+            if (!curr) continue;
             if (curr->kind == ExpressionKind::VARIABLE) {
                 if (static_cast<const VariableExpr*>(curr)->name == var) return true;
             } else if (curr->kind == ExpressionKind::PROPERTY_LOOKUP) {

@@ -110,6 +110,8 @@ add_executable(tests tests.cpp shard/ShardIds.cpp shard/Ids.cpp shard/NodeTypes.
         ../src/gql/GqlParser.cpp ../src/gql/GqlParser.h
         ../src/gql/GqlParserPrimary.cpp
         ../src/gql/GqlParserPatterns.cpp
+        ../src/gql/GqlParserExpressions.cpp
+        ../src/gql/GqlParserStatements.cpp
         ../src/gql/GqlOptimizer.cpp ../src/gql/GqlOptimizer.h
         ../src/gql/optimizer/OptimizerUtils.cpp ../src/gql/optimizer/OptimizerUtils.h
         ../src/gql/optimizer/ContradictionPruner.cpp ../src/gql/optimizer/ContradictionPruner.h
@@ -214,6 +216,8 @@ add_executable(tests2 main/ConnectedHandler.cpp
         ../src/gql/GqlParser.cpp ../src/gql/GqlParser.h
         ../src/gql/GqlParserPrimary.cpp
         ../src/gql/GqlParserPatterns.cpp
+        ../src/gql/GqlParserExpressions.cpp
+        ../src/gql/GqlParserStatements.cpp
         ../src/gql/GqlOptimizer.cpp ../src/gql/GqlOptimizer.h
         ../src/gql/optimizer/OptimizerUtils.cpp ../src/gql/optimizer/OptimizerUtils.h
         ../src/gql/optimizer/ContradictionPruner.cpp ../src/gql/optimizer/ContradictionPruner.h

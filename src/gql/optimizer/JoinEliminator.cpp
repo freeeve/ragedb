@@ -23,6 +23,41 @@ namespace ragedb::gql {
 
 namespace {
 
+/// Whether an expression tree contains an aggregate anywhere. File-local so the optimizer keeps no
+/// dependency on the executor's evaluator (SubsumptionPruner carries the same helper; a future cleanup
+/// could hoist both into OptimizerUtils).
+static bool je_expr_has_aggregate(const Expression* expr) {
+    if (!expr) return false;
+    std::vector<const Expression*> stack = { expr };
+    while (!stack.empty()) {
+        const auto* curr = stack.back();
+        stack.pop_back();
+        if (!curr) continue;
+        if (curr->kind == ExpressionKind::AGGREGATION) return true;
+        if (curr->kind == ExpressionKind::UNARY_OP) {
+            stack.push_back(static_cast<const UnaryOpExpr*>(curr)->expr.get());
+        } else if (curr->kind == ExpressionKind::BINARY_OP) {
+            const auto* bin = static_cast<const BinaryOpExpr*>(curr);
+            stack.push_back(bin->left.get());
+            stack.push_back(bin->right.get());
+        }
+    }
+    return false;
+}
+
+/// Set semantics: a DISTINCT projection with no aggregate. Only then is dropping a mandatory-but-not-
+/// functional edge invisible -- the DISTINCT dedups the rows the edge multiplies in.
+static bool je_query_is_set_semantic(const GqlQuery& q) {
+    if (!q.distinct) return false;
+    for (const auto& item : q.returns) {
+        if (je_expr_has_aggregate(item.expr.get())) return false;
+    }
+    for (const auto& spec : q.order_by) {
+        if (je_expr_has_aggregate(spec.expr.get())) return false;
+    }
+    return true;
+}
+
 struct MandatoryRelation {
     std::string source_label;
     std::string rel_type;
@@ -161,7 +196,13 @@ void JoinEliminator::semantic_join_elimination_pass(GqlQuery& query) {
                     bool target_has_filters = !end_node.properties.empty() || !end_node.property_filters.empty() || end_node.where_expr;
                     bool edge_has_filters = !edge.properties.empty() || !edge.property_filters.empty() || edge.where_expr;
                     
-                    if (!target_referenced && !edge_referenced && !target_has_filters && !edge_has_filters) {
+                    // The mandatory constraint is at-least-one, not exactly-one: s may have several R
+                    // edges. Stripping the edge drops the rows they multiply in, so it is sound only
+                    // under set semantics (DISTINCT, no aggregate), where the multiplication is deduped.
+                    // A genuinely 1:1 relation is stripped by UniqueJoinEliminator via its unique
+                    // cardinality constraint instead.
+                    if (!target_referenced && !edge_referenced && !target_has_filters && !edge_has_filters
+                        && je_query_is_set_semantic(query)) {
                         pattern.nodes.pop_back();
                         pattern.edges.clear();
                     }

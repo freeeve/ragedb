@@ -224,8 +224,10 @@ void DisjointConceptPruner::disjoint_concept_pruning_pass(GqlQuery& query) {
     auto equalities = collect_query_equalities(query);
     
     for (const auto& match : query.matches) {
-        if (match.is_search || match.is_propagate) continue;
-        
+        // An OPTIONAL match with an impossible (disjoint-endpoint) traversal null-extends the anchor rows
+        // rather than emptying the query, so it must not mark the whole query no_op.
+        if (match.is_optional || match.is_search || match.is_propagate) continue;
+
         size_t num_nodes = match.pattern.nodes.size();
         size_t num_edges = match.pattern.edges.size();
         if (num_nodes < 2 || num_edges < 1) continue;

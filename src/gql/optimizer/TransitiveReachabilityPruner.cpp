@@ -201,7 +201,9 @@ void TransitiveReachabilityPruner::transitive_reachability_pruning_pass(GqlQuery
     auto q_eqs = collect_query_equalities(query);
     
     for (auto& match : query.matches) {
-        if (match.is_search || match.is_propagate) continue;
+        // An OPTIONAL match whose transitive reachability is impossible null-extends the anchor rows rather
+        // than emptying the query, so it must not mark the whole query no_op.
+        if (match.is_optional || match.is_search || match.is_propagate) continue;
         auto& pattern = match.pattern;
         
         for (size_t i = 0; i < pattern.edges.size(); ++i) {

@@ -40,6 +40,28 @@ bool optimizes_to_noop(const std::string& q, bool register_schema = false) {
     GqlVirtualCatalog::local().clear();
     return no_op;
 }
+
+bool optimizes_to_noop_disjoint(const std::string& q) {
+    GqlVirtualCatalog::local().clear();
+    GqlVirtualCatalog::local().add_disjoint_labels("X", "Y");   // X and Y are disjoint concepts
+    GqlQuery query = GqlParser::parse(q);
+    GqlOptimizer::optimize(query);
+    bool no_op = query.no_op;
+    GqlVirtualCatalog::local().clear();
+    return no_op;
+}
+
+bool optimizes_to_noop_taxonomy(const std::string& q) {
+    GqlVirtualCatalog::local().clear();
+    // A value hierarchy on Cat.code: 'a' -SUBCAT-> 'b' -SUBCAT-> 'c', so 'a' reaches 'c' only in two hops.
+    GqlVirtualCatalog::local().add_constraint("h1", "MATCH (x:Cat {code: 'a'})-[:SUBCAT]->(y:Cat {code: 'b'}) RETURN x");
+    GqlVirtualCatalog::local().add_constraint("h2", "MATCH (x:Cat {code: 'b'})-[:SUBCAT]->(y:Cat {code: 'c'}) RETURN x");
+    GqlQuery query = GqlParser::parse(q);
+    GqlOptimizer::optimize(query);
+    bool no_op = query.no_op;
+    GqlVirtualCatalog::local().clear();
+    return no_op;
+}
 }  // namespace
 
 TEST_CASE("an impossible REQUIRED pattern is still pruned to no_op", "[gql_optimizer]") {
@@ -55,6 +77,12 @@ TEST_CASE("an impossible REQUIRED pattern is still pruned to no_op", "[gql_optim
     SECTION("a required anchor contradiction still fires when an optional match is also present") {
         REQUIRE(optimizes_to_noop(
             "MATCH (a:N WHERE a.age > 5 AND a.age < 2) OPTIONAL MATCH (a)-[:R]->(b:M) RETURN a"));
+    }
+    SECTION("a required variable-length edge between disjoint labels empties the query") {
+        REQUIRE(optimizes_to_noop_disjoint("MATCH (a:X)-[:R*1..2]->(b:Y) RETURN a"));
+    }
+    SECTION("a required edge whose value hierarchy is unreachable in one hop empties the query") {
+        REQUIRE(optimizes_to_noop_taxonomy("MATCH (x:Cat {code: 'a'})-[:SUBCAT]->(y:Cat {code: 'c'}) RETURN x"));
     }
 }
 
@@ -72,5 +100,12 @@ TEST_CASE("an impossible OPTIONAL pattern null-extends and is never pruned to no
     SECTION("an empty attribute range on an optional edge") {
         REQUIRE_FALSE(optimizes_to_noop(
             "MATCH (a:N) OPTIONAL MATCH (a)-[r:KNOWS WHERE r.weight > 5 AND r.weight < 2]->(b:M) RETURN a"));
+    }
+    SECTION("an optional variable-length edge between disjoint labels") {
+        REQUIRE_FALSE(optimizes_to_noop_disjoint("MATCH (n:N) OPTIONAL MATCH (a:X)-[:R*1..2]->(b:Y) RETURN n"));
+    }
+    SECTION("an optional edge whose value hierarchy is unreachable in one hop") {
+        REQUIRE_FALSE(optimizes_to_noop_taxonomy(
+            "MATCH (n:N) OPTIONAL MATCH (x:Cat {code: 'a'})-[:SUBCAT]->(y:Cat {code: 'c'}) RETURN n"));
     }
 }

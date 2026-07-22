@@ -224,6 +224,7 @@ add_executable(ragedb src/main/main.cpp src/main/util/stop_signal.hh
         src/gql/GqlParser.cpp src/gql/GqlParser.h
         src/gql/GqlParserPrimary.cpp
         src/gql/GqlParserPatterns.cpp
+        src/gql/GqlParserExpressions.cpp
         src/gql/GqlOptimizer.cpp src/gql/GqlOptimizer.h
         src/gql/optimizer/OptimizerUtils.cpp src/gql/optimizer/OptimizerUtils.h
         src/gql/optimizer/ContradictionPruner.cpp src/gql/optimizer/ContradictionPruner.h

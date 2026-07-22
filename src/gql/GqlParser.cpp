@@ -27,7 +27,7 @@ namespace ragedb::gql {
 
 /**
  * @brief Peek at a token in the stream without advancing the cursor.
- * 
+ *
  * @param offset The number of tokens ahead of the current position to inspect.
  * @return const Token& The token at the specified offset, or the EOF/last token if out of bounds.
  */
@@ -40,7 +40,7 @@ const Token& GqlParser::peek(size_t offset) const {
 
 /**
  * @brief Consume the current token and advance the stream position.
- * 
+ *
  * @return const Token& The token that was current before advancing.
  */
 const Token& GqlParser::advance() {
@@ -52,7 +52,7 @@ const Token& GqlParser::advance() {
 
 /**
  * @brief Check if the current token matches the specified type.
- * 
+ *
  * @param type The token type to compare against.
  * @return true If the current token's type matches.
  * @return false Otherwise.
@@ -63,7 +63,7 @@ bool GqlParser::check(TokenType type) const {
 
 /**
  * @brief If the current token matches the specified type, consume it and return true.
- * 
+ *
  * @param type The token type to match.
  * @return true If the token was matched and consumed.
  * @return false If the token did not match, leaving the cursor unchanged.
@@ -79,7 +79,7 @@ bool GqlParser::match(TokenType type) {
 /**
  * @brief Assert that the current token matches the expected type and consume it.
  *        Throws an exception if the token type does not match.
- * 
+ *
  * @param type The expected token type.
  * @param error_message The descriptive message to include in the thrown exception.
  * @throws std::runtime_error If the current token type does not match.
@@ -354,11 +354,11 @@ static void validate_insert_label_expr(const std::shared_ptr<LabelExpression>& e
 
 /**
  * @brief Parses a complete GQL query into a GqlQuery AST object.
- * 
+ *
  * Main entry point of the recursive descent parser. Processes MATCH, OPTIONAL MATCH,
  * global WHERE, write operations (INSERT, SET, REMOVE, DELETE, DETACH DELETE),
  * and RETURN clauses with sorting and limits.
- * 
+ *
  * @return GqlQuery The constructed query AST object.
  * @throws std::runtime_error If syntax errors are encountered.
  */
@@ -629,7 +629,7 @@ GqlQuery GqlParser::parse_single_query() {
             consume(TokenType::NAME, "Expected variable name before 'IN'");
             consume(TokenType::IN_KW, "Expected 'IN'");
             consume(TokenType::SEARCH, "Expected 'SEARCH'");
-            
+
             if (match(TokenType::LPAREN)) {
                 do {
                     std::string type_name = peek().text;
@@ -637,7 +637,7 @@ GqlQuery GqlParser::parse_single_query() {
                     consume(TokenType::DOT, "Expected '.'");
                     std::string prop_name = peek().text;
                     consume(TokenType::NAME, "Expected property name");
-                    
+
                     stmt.search_type = type_name;
                     stmt.search_properties.push_back(prop_name);
                 } while (match(TokenType::COMMA));
@@ -648,15 +648,15 @@ GqlQuery GqlParser::parse_single_query() {
                 consume(TokenType::DOT, "Expected '.'");
                 std::string prop_name = peek().text;
                 consume(TokenType::NAME, "Expected property name");
-                
+
                 stmt.search_type = type_name;
                 stmt.search_properties.push_back(prop_name);
             }
-            
+
             consume(TokenType::FOR, "Expected 'FOR'");
             stmt.search_string = peek().text;
             consume(TokenType::STRING_LIT, "Expected query string literal after 'FOR'");
-            
+
             if (match(TokenType::OPTIONS)) {
                 consume(TokenType::LBRACE, "Expected '{' after OPTIONS");
                 if (!check(TokenType::RBRACE)) {
@@ -664,7 +664,7 @@ GqlQuery GqlParser::parse_single_query() {
                         std::string opt_key = peek().text;
                         consume(TokenType::NAME, "Expected option key identifier");
                         consume(TokenType::COLON, "Expected ':' after option key");
-                        
+
                         std::string opt_val;
                         if (check(TokenType::STRING_LIT)) {
                             opt_val = peek().text;
@@ -686,7 +686,7 @@ GqlQuery GqlParser::parse_single_query() {
                 }
                 consume(TokenType::RBRACE, "Expected '}' to close OPTIONS");
             }
-            
+
             consume(TokenType::YIELD, "Expected 'YIELD'");
             stmt.yield_var = peek().text;
             consume(TokenType::NAME, "Expected variable name to bind search result");
@@ -1008,31 +1008,31 @@ GqlQuery GqlParser::parse_query() {
     if (check(TokenType::CREATE) || check(TokenType::DROP) || check(TokenType::ALTER) || check(TokenType::SHOW)) {
         GqlQuery query;
         SchemaOperation schema;
-        
+
         if (match(TokenType::CREATE)) {
             // CREATE VIEW
             if (check(TokenType::NAME) && (peek().text == "view" || peek().text == "VIEW")) {
                 advance(); // consume "VIEW"
                 std::string view_name = peek().text;
                 consume(TokenType::NAME, "Expected view name identifier");
-                
+
                 // Consume optional or keyword 'AS'
                 if (check(TokenType::NAME) && (peek().text == "AS" || peek().text == "as")) {
                     advance();
                 } else {
                     consume(TokenType::AS, "Expected 'AS' keyword");
                 }
-                
+
                 // Parse the view definition query and reconstruct its string representation from tokens
                 std::string view_query_str;
                 size_t start_pos = pos;
                 GqlQuery view_query = parse_union();
-                
+
                 for (size_t i = start_pos; i < pos; ++i) {
                     if (!view_query_str.empty()) view_query_str += " ";
                     view_query_str += tokens[i].text;
                 }
-                
+
                 schema.op = SchemaOperation::Op::CREATE_VIEW;
                 schema.name = view_name;
                 schema.query_string = view_query_str;
@@ -1041,24 +1041,24 @@ GqlQuery GqlParser::parse_query() {
                 advance(); // consume "CONSTRAINT"
                 std::string constraint_name = peek().text;
                 consume(TokenType::NAME, "Expected constraint name identifier");
-                
+
                 // Consume optional or keyword 'AS'
                 if (check(TokenType::NAME) && (peek().text == "AS" || peek().text == "as")) {
                     advance();
                 } else {
                     consume(TokenType::AS, "Expected 'AS' keyword");
                 }
-                
+
                 // Parse the constraint query and reconstruct its string representation
                 std::string constraint_query_str;
                 size_t start_pos = pos;
                 GqlQuery constraint_query = parse_union();
-                
+
                 for (size_t i = start_pos; i < pos; ++i) {
                     if (!constraint_query_str.empty()) constraint_query_str += " ";
                     constraint_query_str += tokens[i].text;
                 }
-                
+
                 schema.op = SchemaOperation::Op::CREATE_CONSTRAINT;
                 schema.name = constraint_name;
                 schema.query_string = constraint_query_str;
@@ -1093,19 +1093,19 @@ GqlQuery GqlParser::parse_query() {
                     throw std::runtime_error("Expected 'NODE', 'RELATIONSHIP', 'REL', 'VIEW', 'CONSTRAINT', or 'INDEX' after 'CREATE'");
                 }
                 consume(TokenType::TYPE, "Expected 'TYPE' keyword");
-                
+
                 std::string type_name = peek().text;
                 consume(TokenType::NAME, "Expected type name identifier");
-                
+
                 schema.op = is_node ? SchemaOperation::Op::CREATE_NODE_TYPE : SchemaOperation::Op::CREATE_REL_TYPE;
                 schema.name = type_name;
-                
+
                 // Parse optional properties
                 if (match(TokenType::LPAREN)) {
                     do {
                         std::string prop_name = peek().text;
                         consume(TokenType::NAME, "Expected property name identifier");
-                        
+
                         std::string data_type;
                         if (match(TokenType::STRING_KW)) data_type = "string";
                         else if (match(TokenType::INTEGER_KW)) data_type = "integer";
@@ -1118,7 +1118,7 @@ GqlQuery GqlParser::parse_query() {
                         else {
                             throw std::runtime_error("Expected datatype (STRING, INTEGER, DOUBLE, BOOLEAN, or list variants) for property '" + prop_name + "'");
                         }
-                        
+
                         schema.properties.push_back({prop_name, data_type});
                     } while (match(TokenType::COMMA));
                     consume(TokenType::RPAREN, "Expected ')' to close property list");
@@ -1157,10 +1157,10 @@ GqlQuery GqlParser::parse_query() {
                     throw std::runtime_error("Expected 'NODE', 'RELATIONSHIP', 'REL', 'VIEW', 'CONSTRAINT', or 'INDEX' after 'DROP'");
                 }
                 consume(TokenType::TYPE, "Expected 'TYPE' keyword");
-                
+
                 std::string type_name = peek().text;
                 consume(TokenType::NAME, "Expected type name identifier");
-                
+
                 schema.op = is_node ? SchemaOperation::Op::DROP_NODE_TYPE : SchemaOperation::Op::DROP_REL_TYPE;
                 schema.name = type_name;
             }
@@ -1175,18 +1175,18 @@ GqlQuery GqlParser::parse_query() {
                 throw std::runtime_error("Expected 'NODE' or 'RELATIONSHIP' / 'REL' after 'ALTER'");
             }
             consume(TokenType::TYPE, "Expected 'TYPE' keyword");
-            
+
             std::string type_name = peek().text;
             consume(TokenType::NAME, "Expected type name identifier");
-            
+
             schema.op = is_node ? SchemaOperation::Op::ALTER_NODE_TYPE : SchemaOperation::Op::ALTER_REL_TYPE;
             schema.name = type_name;
-            
+
             if (match(TokenType::ADD)) {
                 schema.alter_op = SchemaOperation::AlterOp::ADD;
                 std::string prop_name = peek().text;
                 consume(TokenType::NAME, "Expected property name identifier");
-                
+
                 std::string data_type;
                 if (match(TokenType::STRING_KW)) data_type = "string";
                 else if (match(TokenType::INTEGER_KW)) data_type = "integer";
@@ -1223,7 +1223,7 @@ GqlQuery GqlParser::parse_query() {
                 schema.name = "";
             }
         }
-        
+
         query.schema_op = std::move(schema);
         query.explain = explain;
         query.profile = profile;
@@ -1300,7 +1300,7 @@ GqlQuery GqlParser::parse_intersect() {
 
 /**
  * @brief Class helper method to tokenize and parse a GQL query string into its AST.
- * 
+ *
  * @param query The GQL query string to process.
  * @return GqlQuery The parsed AST query object.
  */

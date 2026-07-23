@@ -287,3 +287,74 @@ TEST_CASE("extract_intervals_from_expr ignores predicates outside the target var
         REQUIRE(intervals_for("x.name > 'foo'").empty());
     }
 }
+
+namespace {
+const VarInfo* find_var(const std::vector<VarInfo>& vs, const std::string& name) {
+    for (const auto& v : vs) {
+        if (v.variable == name) return &v;
+    }
+    return nullptr;
+}
+}  // namespace
+
+TEST_CASE("collect_query_vars gathers node variables but excludes edges", "[gql_optimizer]") {
+    auto vs = collect_query_vars(GqlParser::parse("MATCH (a:Person)-[e:KNOWS]->(b:Person) RETURN a"));
+    REQUIRE(vs.size() == 2);
+    REQUIRE(find_var(vs, "a") != nullptr);
+    REQUIRE(find_var(vs, "b") != nullptr);
+    REQUIRE(find_var(vs, "e") == nullptr);          // the edge variable is a node-only pass concern
+    REQUIRE(find_var(vs, "a")->label == "Person");
+}
+
+TEST_CASE("collect_all_query_vars also gathers edge variables", "[gql_optimizer]") {
+    auto vs = collect_all_query_vars(GqlParser::parse("MATCH (a:Person)-[e:KNOWS]->(b:Person) RETURN a"));
+    REQUIRE(vs.size() == 3);
+    const VarInfo* e = find_var(vs, "e");
+    REQUIRE(e != nullptr);
+    REQUIRE(e->label == "KNOWS");
+}
+
+TEST_CASE("collect_query_vars skips anonymous nodes and edges", "[gql_optimizer]") {
+    auto vs = collect_query_vars(GqlParser::parse("MATCH (a:Person)-[:KNOWS]->() RETURN a"));
+    REQUIRE(vs.size() == 1);
+    REQUIRE(vs[0].variable == "a");
+}
+
+TEST_CASE("collect_query_vars records a label only for a plain literal label", "[gql_optimizer]") {
+    SECTION("a single label is captured") {
+        auto vs = collect_query_vars(GqlParser::parse("MATCH (a:Person) RETURN a"));
+        REQUIRE(find_var(vs, "a")->label == "Person");
+    }
+    SECTION("a composite label expression leaves the label empty (subsumption handles it elsewhere)") {
+        auto vs = collect_query_vars(GqlParser::parse("MATCH (a:Person&Employee) RETURN a"));
+        REQUIRE(find_var(vs, "a")->label.empty());
+    }
+}
+
+TEST_CASE("collect_query_vars folds property constraints into a variable's intervals", "[gql_optimizer]") {
+    auto interval_of = [](const std::string& q, const std::string& prop) {
+        return collect_query_vars(GqlParser::parse(q)).at(0).intervals.at(prop);
+    };
+    SECTION("an inline map property is an equality point") {
+        auto iv = interval_of("MATCH (a:Person {age: 30}) RETURN a", "age");
+        REQUIRE(iv.has_lower); REQUIRE(iv.lower_val == 30); REQUIRE(iv.lower_inclusive);
+        REQUIRE(iv.has_upper); REQUIRE(iv.upper_val == 30); REQUIRE(iv.upper_inclusive);
+    }
+    SECTION("a segment WHERE comparison becomes a bound") {
+        auto iv = interval_of("MATCH (a:Person) WHERE a.age > 30 RETURN a", "age");
+        REQUIRE(iv.has_lower); REQUIRE(iv.lower_val == 30); REQUIRE_FALSE(iv.lower_inclusive);
+    }
+    SECTION("an inline node WHERE comparison becomes the same bound") {
+        auto iv = interval_of("MATCH (a:Person WHERE a.age > 30) RETURN a", "age");
+        REQUIRE(iv.has_lower); REQUIRE(iv.lower_val == 30); REQUIRE_FALSE(iv.lower_inclusive);
+    }
+}
+
+TEST_CASE("collect_all_query_vars folds an edge's map property into its intervals", "[gql_optimizer]") {
+    auto vs = collect_all_query_vars(GqlParser::parse("MATCH (a)-[e:KNOWS {weight: 5}]->(b) RETURN a"));
+    const VarInfo* e = find_var(vs, "e");
+    REQUIRE(e != nullptr);
+    auto iv = e->intervals.at("weight");
+    REQUIRE(iv.has_lower); REQUIRE(iv.lower_val == 5); REQUIRE(iv.lower_inclusive);
+    REQUIRE(iv.has_upper); REQUIRE(iv.upper_val == 5); REQUIRE(iv.upper_inclusive);
+}

@@ -394,3 +394,44 @@ TEST_CASE("is_variable_referenced_outside_count walks every expression form", "[
     REQUIRE_FALSE(references_outside_count("y.age"));
     REQUIRE_FALSE(references_outside_count("42"));
 }
+
+TEST_CASE("rebuild_expression_without_pushed_predicates removes exactly the pushed conjuncts", "[gql_optimizer]") {
+    // extract_filters populates the pushdown map from a WHERE; rebuild then drops precisely those conjuncts
+    // so a pushed predicate is not re-applied after the scan. The two have to agree on what was pushed.
+    auto pushdowns_of = [](Expression* w) {
+        std::map<std::string, std::vector<PropertyFilter>> pd;
+        extract_filters(w, pd);
+        return pd;
+    };
+
+    SECTION("every conjunct pushed leaves no residual expression") {
+        auto q = GqlParser::parse("MATCH (a:P) WHERE a.x = 1 AND a.y > 2 RETURN a");
+        auto pd = pushdowns_of(q.where_expr.get());
+        auto rebuilt = rebuild_expression_without_pushed_predicates(std::move(q.where_expr), pd);
+        REQUIRE(rebuilt == nullptr);
+    }
+    SECTION("a conjunct that was not pushed survives") {
+        // a.x = a.y is property-to-property, so extract_filters never pushes it; only a.x = 1 is pushed,
+        // and the surviving residual is the a.x = a.y comparison.
+        auto q = GqlParser::parse("MATCH (a:P) WHERE a.x = 1 AND a.x = a.y RETURN a");
+        auto pd = pushdowns_of(q.where_expr.get());
+        auto rebuilt = rebuild_expression_without_pushed_predicates(std::move(q.where_expr), pd);
+        REQUIRE(rebuilt != nullptr);
+        REQUIRE(rebuilt->kind == ExpressionKind::BINARY_OP);
+        REQUIRE(static_cast<const BinaryOpExpr*>(rebuilt.get())->op == BinaryOpKind::EQ);
+    }
+    SECTION("an OR is never pushed, so it is kept whole") {
+        auto q = GqlParser::parse("MATCH (a:P) WHERE a.x = 1 OR a.y = 2 RETURN a");
+        auto pd = pushdowns_of(q.where_expr.get());
+        REQUIRE(pd.empty());
+        auto rebuilt = rebuild_expression_without_pushed_predicates(std::move(q.where_expr), pd);
+        REQUIRE(rebuilt != nullptr);
+        REQUIRE(static_cast<const BinaryOpExpr*>(rebuilt.get())->op == BinaryOpKind::OR);
+    }
+    SECTION("with no pushdowns nothing is removed") {
+        auto q = GqlParser::parse("MATCH (a:P) WHERE a.x = 1 RETURN a");
+        std::map<std::string, std::vector<PropertyFilter>> empty;
+        auto rebuilt = rebuild_expression_without_pushed_predicates(std::move(q.where_expr), empty);
+        REQUIRE(rebuilt != nullptr);
+    }
+}

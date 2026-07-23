@@ -270,6 +270,7 @@ add_executable(ragedb src/main/main.cpp src/main/util/stop_signal.hh
         src/gql/GqlTypechecker.cpp src/gql/GqlTypechecker.h
         src/gql/GqlValue.cpp src/gql/GqlValue.h
         src/gql/GqlValueFunctions.cpp
+        src/gql/GqlValueEvaluate.cpp
         src/gql/GqlValueSerialize.cpp
         src/gql/GqlWriter.cpp src/gql/GqlWriter.h
         src/gql/GqlAst.h

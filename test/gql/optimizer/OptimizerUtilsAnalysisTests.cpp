@@ -337,3 +337,50 @@ TEST_CASE("is_simple_unbounded_right_hop recognises only the plain unbounded RIG
     REQUIRE_FALSE(is_hop("MATCH (a)<-[*]-(b) RETURN a"));      // a LEFT hop is not right-directed
     REQUIRE_FALSE(is_hop("MATCH (a)-[*2..5]->(b) RETURN a"));  // a bounded hop is not unbounded
 }
+
+TEST_CASE("rewrite_count_to_sum_degree rewrites a matching count into sum(start.degree)", "[gql_optimizer]") {
+    // start a, end b, edge e: a count over the end or edge variable (or count(*)) is the number of
+    // out-edges, so it becomes sum(a.deg). A distinct count or a count over another variable is untouched.
+    auto becomes_sum_degree = [](const std::string& e) {
+        auto q = GqlParser::parse("MATCH (a)-[e:R]->(b) RETURN " + e + " AS c");
+        bool fired = false;
+        rewrite_count_to_sum_degree(q.returns[0].expr, "a", "b", "e", "deg", fired);
+        auto* ex = q.returns[0].expr.get();
+        if (!fired || ex->kind != ExpressionKind::AGGREGATION) return false;
+        auto* agg = static_cast<AggregateExpr*>(ex);
+        if (agg->fn_kind != AggregateKind::SUM || !agg->expr ||
+            agg->expr->kind != ExpressionKind::PROPERTY_LOOKUP) return false;
+        auto* pl = static_cast<PropertyLookupExpr*>(agg->expr.get());
+        return pl->variable == "a" && pl->property == "deg";
+    };
+    auto left_as_count = [](const std::string& e) {
+        auto q = GqlParser::parse("MATCH (a)-[e:R]->(b) RETURN " + e + " AS c");
+        bool fired = false;
+        rewrite_count_to_sum_degree(q.returns[0].expr, "a", "b", "e", "deg", fired);
+        return !fired && q.returns[0].expr->kind == ExpressionKind::AGGREGATION &&
+               static_cast<AggregateExpr*>(q.returns[0].expr.get())->fn_kind == AggregateKind::COUNT;
+    };
+    SECTION("count over the end variable becomes sum(a.deg)") { REQUIRE(becomes_sum_degree("count(b)")); }
+    SECTION("count over the edge variable becomes sum(a.deg)") { REQUIRE(becomes_sum_degree("count(e)")); }
+    SECTION("count(*) becomes sum(a.deg)") { REQUIRE(becomes_sum_degree("count(*)")); }
+    SECTION("count(DISTINCT ...) is left as a distinct count") { REQUIRE(left_as_count("count(DISTINCT b)")); }
+    SECTION("count over a non-target variable is left untouched") { REQUIRE(left_as_count("count(a)")); }
+}
+
+TEST_CASE("rewrite_khop_count_to_var replaces a matching count with the bare variable", "[gql_optimizer]") {
+    auto becomes_var = [](const std::string& e) {
+        auto q = GqlParser::parse("MATCH (a)-[e:R]->(b) RETURN " + e + " AS c");
+        rewrite_khop_count_to_var(q.returns[0].expr, "b");
+        auto* ex = q.returns[0].expr.get();
+        return ex->kind == ExpressionKind::VARIABLE && static_cast<VariableExpr*>(ex)->name == "b";
+    };
+    auto left_as_count = [](const std::string& e) {
+        auto q = GqlParser::parse("MATCH (a)-[e:R]->(b) RETURN " + e + " AS c");
+        rewrite_khop_count_to_var(q.returns[0].expr, "b");
+        return q.returns[0].expr->kind == ExpressionKind::AGGREGATION;
+    };
+    SECTION("count over the variable becomes the variable") { REQUIRE(becomes_var("count(b)")); }
+    SECTION("count(*) becomes the variable") { REQUIRE(becomes_var("count(*)")); }
+    SECTION("count(DISTINCT ...) is left untouched") { REQUIRE(left_as_count("count(DISTINCT b)")); }
+    SECTION("count over a different variable is left untouched") { REQUIRE(left_as_count("count(a)")); }
+}

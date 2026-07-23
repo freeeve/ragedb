@@ -198,3 +198,92 @@ TEST_CASE("query_has_distinct_aggregate detects count(DISTINCT ...)", "[gql_opti
     REQUIRE(query_has_distinct_aggregate(GqlParser::parse("MATCH (a:P) RETURN count(DISTINCT a) AS n")));
     REQUIRE_FALSE(query_has_distinct_aggregate(GqlParser::parse("MATCH (a:P) RETURN count(a) AS n")));
 }
+
+namespace {
+// Extract the range intervals a WHERE predicate implies for variable x. This is the analysis that lets the
+// contradiction/domain pruners decide a query is unsatisfiable (an empty interval), so its operator mapping,
+// operand reversal, and NOT/De-Morgan handling all have to be exact.
+std::map<std::string, Interval> intervals_for(const std::string& where) {
+    auto q = GqlParser::parse("MATCH (x) WHERE " + where + " RETURN x");
+    std::map<std::string, Interval> ivs;
+    extract_intervals_from_expr(q.where_expr.get(), "x", ivs, false);
+    return ivs;
+}
+}  // namespace
+
+TEST_CASE("extract_intervals_from_expr maps each comparison operator to a bound", "[gql_optimizer]") {
+    SECTION("x.age < 5 is an exclusive upper bound") {
+        auto iv = intervals_for("x.age < 5").at("age");
+        REQUIRE(iv.has_upper); REQUIRE(iv.upper_val == 5); REQUIRE_FALSE(iv.upper_inclusive);
+        REQUIRE_FALSE(iv.has_lower);
+    }
+    SECTION("x.age <= 5 is an inclusive upper bound") {
+        auto iv = intervals_for("x.age <= 5").at("age");
+        REQUIRE(iv.has_upper); REQUIRE(iv.upper_val == 5); REQUIRE(iv.upper_inclusive);
+    }
+    SECTION("x.age > 5 is an exclusive lower bound") {
+        auto iv = intervals_for("x.age > 5").at("age");
+        REQUIRE(iv.has_lower); REQUIRE(iv.lower_val == 5); REQUIRE_FALSE(iv.lower_inclusive);
+        REQUIRE_FALSE(iv.has_upper);
+    }
+    SECTION("x.age >= 5 is an inclusive lower bound") {
+        auto iv = intervals_for("x.age >= 5").at("age");
+        REQUIRE(iv.has_lower); REQUIRE(iv.lower_val == 5); REQUIRE(iv.lower_inclusive);
+    }
+    SECTION("x.age = 5 pins both bounds to the same point") {
+        auto iv = intervals_for("x.age = 5").at("age");
+        REQUIRE(iv.has_lower); REQUIRE(iv.lower_val == 5); REQUIRE(iv.lower_inclusive);
+        REQUIRE(iv.has_upper); REQUIRE(iv.upper_val == 5); REQUIRE(iv.upper_inclusive);
+        REQUIRE_FALSE(iv.is_empty());
+    }
+}
+
+TEST_CASE("extract_intervals_from_expr normalizes a comparison with the constant on the left", "[gql_optimizer]") {
+    SECTION("5 < x.age is read as x.age > 5") {
+        auto iv = intervals_for("5 < x.age").at("age");
+        REQUIRE(iv.has_lower); REQUIRE(iv.lower_val == 5); REQUIRE_FALSE(iv.lower_inclusive);
+    }
+    SECTION("5 >= x.age is read as x.age <= 5") {
+        auto iv = intervals_for("5 >= x.age").at("age");
+        REQUIRE(iv.has_upper); REQUIRE(iv.upper_val == 5); REQUIRE(iv.upper_inclusive);
+    }
+}
+
+TEST_CASE("extract_intervals_from_expr intersects an AND and detects a contradiction", "[gql_optimizer]") {
+    SECTION("x.age >= 3 AND x.age <= 10 is the closed range [3, 10]") {
+        auto iv = intervals_for("x.age >= 3 AND x.age <= 10").at("age");
+        REQUIRE(iv.lower_val == 3); REQUIRE(iv.upper_val == 10);
+        REQUIRE_FALSE(iv.is_empty());
+    }
+    SECTION("x.age >= 10 AND x.age <= 3 is an empty interval -- the pruner's unsatisfiable case") {
+        auto iv = intervals_for("x.age >= 10 AND x.age <= 3").at("age");
+        REQUIRE(iv.is_empty());
+    }
+}
+
+TEST_CASE("extract_intervals_from_expr applies NOT and De Morgan", "[gql_optimizer]") {
+    SECTION("NOT (x.age < 5) flips to x.age >= 5") {
+        auto iv = intervals_for("NOT (x.age < 5)").at("age");
+        REQUIRE(iv.has_lower); REQUIRE(iv.lower_val == 5); REQUIRE(iv.lower_inclusive);
+    }
+    SECTION("NOT (x.age > 3 OR x.age > 10) becomes x.age <= 3 (the tighter bound)") {
+        auto iv = intervals_for("NOT (x.age > 3 OR x.age > 10)").at("age");
+        REQUIRE(iv.has_upper); REQUIRE(iv.upper_val == 3); REQUIRE(iv.upper_inclusive);
+        REQUIRE_FALSE(iv.has_lower);
+    }
+    SECTION("NOT (x.age = 5) yields no interval -- inequality is not a single range") {
+        REQUIRE(intervals_for("NOT (x.age = 5)").empty());
+    }
+    SECTION("NOT (x.age > 3 AND x.age < 10) yields no interval -- a negated conjunction is a disjunction") {
+        REQUIRE(intervals_for("NOT (x.age > 3 AND x.age < 10)").empty());
+    }
+}
+
+TEST_CASE("extract_intervals_from_expr ignores predicates outside the target variable's scope", "[gql_optimizer]") {
+    SECTION("a comparison on a different variable contributes nothing") {
+        REQUIRE(intervals_for("y.age > 5").empty());
+    }
+    SECTION("a non-numeric comparison contributes nothing") {
+        REQUIRE(intervals_for("x.name > 'foo'").empty());
+    }
+}

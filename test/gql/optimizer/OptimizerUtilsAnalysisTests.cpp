@@ -384,3 +384,28 @@ TEST_CASE("rewrite_khop_count_to_var replaces a matching count with the bare var
     SECTION("count(DISTINCT ...) is left untouched") { REQUIRE(left_as_count("count(DISTINCT b)")); }
     SECTION("count over a different variable is left untouched") { REQUIRE(left_as_count("count(a)")); }
 }
+
+TEST_CASE("extract_rel_types collects the literal types from an edge label expression", "[gql_optimizer]") {
+    auto contains = [](const std::vector<std::string>& v, const std::string& s) {
+        for (const auto& x : v) {
+            if (x == s) return true;
+        }
+        return false;
+    };
+    SECTION("an OR of labels yields each literal type") {
+        auto q = GqlParser::parse("MATCH (a)-[e:R|S|T]->(b) RETURN a");
+        std::vector<std::string> types;
+        extract_rel_types(q.matches[0].pattern.edges[0].label_expr.get(), types);
+        REQUIRE(types.size() == 3);
+        REQUIRE(contains(types, "R"));
+        REQUIRE(contains(types, "S"));
+        REQUIRE(contains(types, "T"));
+    }
+    SECTION("a single literal label yields exactly that type") {
+        auto q = GqlParser::parse("MATCH (a)-[e:R]->(b) RETURN a");
+        std::vector<std::string> types;
+        extract_rel_types(q.matches[0].pattern.edges[0].label_expr.get(), types);
+        REQUIRE(types.size() == 1);
+        REQUIRE(types[0] == "R");
+    }
+}

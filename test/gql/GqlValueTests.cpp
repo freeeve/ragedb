@@ -20,6 +20,7 @@
 
 #include <catch2/catch.hpp>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 #include "../../src/gql/GqlValue.h"
@@ -151,5 +152,67 @@ TEST_CASE("matches_label_expr evaluates a label expression against a node's type
     }
     SECTION("an absent label expression matches any type") {
         REQUIRE(label_matches("", "Anything"));
+    }
+}
+
+TEST_CASE("as_list_elements coerces lists and stored list properties, else nullopt", "[gql_value]") {
+    SECTION("a LIST value yields its elements") {
+        GqlValue v;
+        v.type = GqlValue::LIST;
+        v.list = std::make_shared<std::vector<GqlValue>>();
+        v.list->push_back(GqlValue(property_type_t{(int64_t)1}));
+        v.list->push_back(GqlValue(property_type_t{(int64_t)2}));
+        auto r = as_list_elements(v);
+        REQUIRE(r.has_value());
+        REQUIRE(r->size() == 2);
+    }
+    SECTION("a LIST with no backing vector is an empty list") {
+        GqlValue v;
+        v.type = GqlValue::LIST;   // the list pointer is left null
+        auto r = as_list_elements(v);
+        REQUIRE(r.has_value());
+        REQUIRE(r->empty());
+    }
+    SECTION("a stored integer-list property is a list") {
+        auto r = as_list_elements(GqlValue(property_type_t{std::vector<int64_t>{5, 6, 7}}));
+        REQUIRE(r.has_value());
+        REQUIRE(r->size() == 3);
+    }
+    SECTION("a stored string-list property is a list") {
+        auto r = as_list_elements(GqlValue(property_type_t{std::vector<std::string>{"a", "b"}}));
+        REQUIRE(r.has_value());
+        REQUIRE(r->size() == 2);
+    }
+    SECTION("a scalar property is not a list") {
+        REQUIRE_FALSE(as_list_elements(GqlValue(property_type_t{(int64_t)7})).has_value());
+    }
+    SECTION("a null value is not a list") {
+        REQUIRE_FALSE(as_list_elements(GqlValue()).has_value());
+    }
+}
+
+TEST_CASE("gql_temporal_field extracts calendar and clock components from an epoch-ms datetime", "[gql_value]") {
+    auto field = [](int64_t ms, const std::string& f) {
+        return std::get<int64_t>(gql_temporal_field(ms, f).property);
+    };
+    SECTION("the epoch itself is 1970-01-01T00:00:00") {
+        REQUIRE(field(0, "year") == 1970);
+        REQUIRE(field(0, "month") == 1);
+        REQUIRE(field(0, "day") == 1);
+        REQUIRE(field(0, "hour") == 0);
+        REQUIRE(field(0, "minute") == 0);
+        REQUIRE(field(0, "second") == 0);
+    }
+    SECTION("time-of-day components come from the millisecond offset") {
+        REQUIRE(field(3661000, "hour") == 1);     // 1h 1m 1s past the epoch
+        REQUIRE(field(3661000, "minute") == 1);
+        REQUIRE(field(3661000, "second") == 1);
+    }
+    SECTION("a full day advances the day component") {
+        REQUIRE(field(86400000, "day") == 2);
+    }
+    SECTION("an unknown field is NULL") {
+        GqlValue r = gql_temporal_field(0, "bogus");
+        REQUIRE((r.type != GqlValue::PROPERTY || std::holds_alternative<std::monostate>(r.property)));
     }
 }

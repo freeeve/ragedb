@@ -71,3 +71,49 @@ TEST_CASE("compare_gql_values orders values of different types consistently", "[
     REQUIRE(forward != 0);                                 // values of different types are never equal
     REQUIRE(compare_gql_values(list, prop) == -forward);   // and the ordering is antisymmetric
 }
+
+namespace {
+bool is_null_value(const GqlValue& v) {
+    return v.type != GqlValue::PROPERTY || std::holds_alternative<std::monostate>(v.property);
+}
+GqlValue prop_int(int64_t x) { return GqlValue(property_type_t{x}); }
+GqlValue prop_double(double x) { return GqlValue(property_type_t{x}); }
+GqlValue prop_string(std::string x) { return GqlValue(property_type_t{x}); }
+GqlValue prop_bool(bool x) { return GqlValue(property_type_t{x}); }
+}  // namespace
+
+TEST_CASE("apply_cast to STRING renders each primitive", "[gql_value]") {
+    REQUIRE(std::get<std::string>(apply_cast(prop_int(42), CastType::STRING).property) == "42");
+    REQUIRE(std::get<std::string>(apply_cast(prop_double(2.5), CastType::STRING).property) == "2.5");
+    REQUIRE(std::get<std::string>(apply_cast(prop_bool(true), CastType::STRING).property) == "true");
+}
+
+TEST_CASE("apply_cast to INTEGER parses whole strings, rounds floats, and NULLs the rest", "[gql_value]") {
+    REQUIRE(std::get<int64_t>(apply_cast(prop_string("42"), CastType::INTEGER).property) == 42);
+    REQUIRE(is_null_value(apply_cast(prop_string("42x"), CastType::INTEGER)));   // a partial parse is NULL
+    REQUIRE(is_null_value(apply_cast(prop_string("abc"), CastType::INTEGER)));
+    REQUIRE(std::get<int64_t>(apply_cast(prop_double(2.7), CastType::INTEGER).property) == 3);   // rounds
+    REQUIRE(std::get<int64_t>(apply_cast(prop_double(2.4), CastType::INTEGER).property) == 2);
+    REQUIRE(std::get<int64_t>(apply_cast(prop_bool(true), CastType::INTEGER).property) == 1);
+}
+
+TEST_CASE("apply_cast to FLOAT widens integers and parses whole strings", "[gql_value]") {
+    REQUIRE(std::get<double>(apply_cast(prop_int(5), CastType::FLOAT).property) == 5.0);
+    REQUIRE(std::get<double>(apply_cast(prop_string("2.5"), CastType::FLOAT).property) == 2.5);
+    REQUIRE(is_null_value(apply_cast(prop_string("2.5x"), CastType::FLOAT)));
+}
+
+TEST_CASE("apply_cast to BOOLEAN uses truthiness and case-insensitive keywords", "[gql_value]") {
+    REQUIRE(std::get<bool>(apply_cast(prop_int(0), CastType::BOOLEAN).property) == false);
+    REQUIRE(std::get<bool>(apply_cast(prop_int(5), CastType::BOOLEAN).property) == true);
+    REQUIRE(std::get<bool>(apply_cast(prop_string("TRUE"), CastType::BOOLEAN).property) == true);
+    REQUIRE(is_null_value(apply_cast(prop_string("yes"), CastType::BOOLEAN)));   // not a boolean keyword
+}
+
+TEST_CASE("apply_cast returns NULL for a null or non-primitive value", "[gql_value]") {
+    REQUIRE(is_null_value(apply_cast(GqlValue(), CastType::INTEGER)));
+    GqlValue list;
+    list.type = GqlValue::LIST;
+    list.list = std::make_shared<std::vector<GqlValue>>();
+    REQUIRE(is_null_value(apply_cast(list, CastType::STRING)));
+}

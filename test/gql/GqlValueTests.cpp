@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 #include "../../src/gql/GqlValue.h"
+#include "../../src/gql/GqlParser.h"
 
 using namespace ragedb;
 using namespace ragedb::gql;
@@ -116,4 +117,39 @@ TEST_CASE("apply_cast returns NULL for a null or non-primitive value", "[gql_val
     list.type = GqlValue::LIST;
     list.list = std::make_shared<std::vector<GqlValue>>();
     REQUIRE(is_null_value(apply_cast(list, CastType::STRING)));
+}
+
+namespace {
+// Match a node's actual type against the label expression parsed from `(n<label>)`.
+bool label_matches(const std::string& label, const std::string& type) {
+    auto q = GqlParser::parse("MATCH (n" + label + ") RETURN n");
+    return matches_label_expr(type, q.matches[0].pattern.nodes[0].label_expr);
+}
+}  // namespace
+
+TEST_CASE("matches_label_expr evaluates a label expression against a node's type", "[gql_value]") {
+    SECTION("a literal matches only its own type") {
+        REQUIRE(label_matches(":Person", "Person"));
+        REQUIRE_FALSE(label_matches(":Person", "Company"));
+    }
+    SECTION("NOT inverts the match") {
+        REQUIRE_FALSE(label_matches(":!Person", "Person"));
+        REQUIRE(label_matches(":!Person", "Company"));
+    }
+    SECTION("OR matches either alternative") {
+        REQUIRE(label_matches(":Person|Company", "Person"));
+        REQUIRE(label_matches(":Person|Company", "Company"));
+        REQUIRE_FALSE(label_matches(":Person|Company", "Other"));
+    }
+    SECTION("AND of two distinct labels cannot be satisfied by a single type") {
+        REQUIRE_FALSE(label_matches(":Person&Employee", "Person"));
+        REQUIRE_FALSE(label_matches(":Person&Employee", "Employee"));
+    }
+    SECTION("a wildcard matches any non-empty type") {
+        REQUIRE(label_matches(":%", "Person"));
+        REQUIRE_FALSE(label_matches(":%", ""));
+    }
+    SECTION("an absent label expression matches any type") {
+        REQUIRE(label_matches("", "Anything"));
+    }
 }

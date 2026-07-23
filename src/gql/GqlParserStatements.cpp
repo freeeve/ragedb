@@ -98,6 +98,22 @@ static std::unique_ptr<Expression> substitute_return_aliases(
             l->value = substitute_return_aliases(std::move(l->value), aliases);
             return expr;
         }
+        case ExpressionKind::IS_NULL_CHECK: {
+            auto* n = static_cast<IsNullExpr*>(expr.get());
+            n->expr = substitute_return_aliases(std::move(n->expr), aliases);
+            return expr;
+        }
+        case ExpressionKind::IS_DIRECTED: {
+            auto* d = static_cast<IsDirectedExpr*>(expr.get());
+            d->value = substitute_return_aliases(std::move(d->value), aliases);
+            return expr;
+        }
+        case ExpressionKind::IS_SOURCE_DEST: {
+            auto* s = static_cast<IsSourceDestExpr*>(expr.get());
+            s->value = substitute_return_aliases(std::move(s->value), aliases);
+            s->edge = substitute_return_aliases(std::move(s->edge), aliases);
+            return expr;
+        }
         case ExpressionKind::LIST_LITERAL: {
             auto* le = static_cast<ListExpr*>(expr.get());
             for (auto& element : le->elements) {

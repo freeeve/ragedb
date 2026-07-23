@@ -452,6 +452,15 @@ TEST_CASE("ORDER BY resolves RETURN aliases into sort keys", "[gql_parser]") {
         REQUIRE(bin->left->kind == ExpressionKind::PROPERTY_LOOKUP);
     }
 
+    SECTION("alias inside a postfix IS-predicate sort key is substituted, not only IS LABELED") {
+        // The substitution must descend into every postfix-IS arm; when it skipped IS NULL / IS DIRECTED /
+        // IS SOURCE the alias stayed an unresolved variable and the sort key evaluated as null on every row.
+        auto q = GqlParser::parse("MATCH (p:Person) RETURN p.age AS a ORDER BY a IS NULL DESC");
+        REQUIRE(q.order_by[0].expr->kind == ExpressionKind::IS_NULL_CHECK);
+        const auto* inner = static_cast<const IsNullExpr*>(q.order_by[0].expr.get())->expr.get();
+        REQUIRE(inner->kind == ExpressionKind::PROPERTY_LOOKUP);
+    }
+
     SECTION("intermediate NEXT segment ORDER BY resolves that segment's aliases") {
         auto q = GqlParser::parse(
             "MATCH (p:Person)<-[:HAS_CREATOR]-(m) RETURN p, count(m) AS cnt ORDER BY cnt DESC LIMIT 3 "

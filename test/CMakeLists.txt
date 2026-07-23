@@ -170,6 +170,7 @@ add_executable(tests tests.cpp shard/ShardIds.cpp shard/Ids.cpp shard/NodeTypes.
         ../src/gql/GqlTypechecker.cpp ../src/gql/GqlTypechecker.h
         ../src/gql/GqlValue.cpp ../src/gql/GqlValue.h
         ../src/gql/GqlValueFunctions.cpp
+        ../src/gql/GqlValueSerialize.cpp
         ../src/gql/GqlWriter.cpp ../src/gql/GqlWriter.h
         ../src/gql/GqlAst.h
         )
@@ -278,6 +279,7 @@ add_executable(tests2 main/ConnectedHandler.cpp
         ../src/gql/GqlTypechecker.cpp ../src/gql/GqlTypechecker.h
         ../src/gql/GqlValue.cpp ../src/gql/GqlValue.h
         ../src/gql/GqlValueFunctions.cpp
+        ../src/gql/GqlValueSerialize.cpp
         ../src/gql/GqlWriter.cpp ../src/gql/GqlWriter.h
         ../src/gql/GqlAst.h
         )

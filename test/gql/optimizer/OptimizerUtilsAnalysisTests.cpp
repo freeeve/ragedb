@@ -289,3 +289,51 @@ TEST_CASE("estimate_selectivity ranks a unique id equality above a range above a
         REQUIRE(selectivity("MATCH (a:Person) WHERE a.id > 5 RETURN a", "a") == SelectivityClass::INDEXED);
     }
 }
+
+TEST_CASE("reverse_match_pattern_if_safe reverses topology and flips edge directions", "[gql_optimizer]") {
+    SECTION("a RIGHT hop reverses node order and becomes a LEFT hop") {
+        auto q = GqlParser::parse("MATCH (a)-[:R]->(b) RETURN a");
+        auto& m = q.matches[0];
+        REQUIRE(reverse_match_pattern_if_safe(m));
+        REQUIRE(m.pattern.nodes[0].variable == "b");
+        REQUIRE(m.pattern.nodes[1].variable == "a");
+        REQUIRE(m.pattern.edges[0].direction == EdgeDirection::LEFT);
+    }
+    SECTION("a LEFT hop becomes a RIGHT hop") {
+        auto q = GqlParser::parse("MATCH (a)<-[:R]-(b) RETURN a");
+        auto& m = q.matches[0];
+        REQUIRE(reverse_match_pattern_if_safe(m));
+        REQUIRE(m.pattern.edges[0].direction == EdgeDirection::RIGHT);
+    }
+    SECTION("an undirected hop keeps its direction but still reverses node order") {
+        auto q = GqlParser::parse("MATCH (a)-[:R]-(b) RETURN a");
+        auto& m = q.matches[0];
+        REQUIRE(reverse_match_pattern_if_safe(m));
+        REQUIRE(m.pattern.nodes[0].variable == "b");
+        REQUIRE(m.pattern.edges[0].direction == EdgeDirection::ANY);
+    }
+    SECTION("a bound path variable makes reversal unsafe, so it is declined and left unchanged") {
+        auto q = GqlParser::parse("MATCH p = (a)-[:R]->(b) RETURN a");
+        auto& m = q.matches[0];
+        REQUIRE_FALSE(reverse_match_pattern_if_safe(m));
+        REQUIRE(m.pattern.nodes[0].variable == "a");                       // unchanged
+        REQUIRE(m.pattern.edges[0].direction == EdgeDirection::RIGHT);
+    }
+    SECTION("a shortest-path selector is also declined") {
+        auto q = GqlParser::parse("MATCH p = ANY SHORTEST (a)-[:R]-{1,2}(b) RETURN a");
+        REQUIRE_FALSE(reverse_match_pattern_if_safe(q.matches[0]));
+    }
+}
+
+TEST_CASE("is_simple_unbounded_right_hop recognises only the plain unbounded RIGHT hop", "[gql_optimizer]") {
+    auto is_hop = [](const std::string& query) {
+        auto q = GqlParser::parse(query);
+        const auto& m = q.matches[0];
+        return !m.pattern.edges.empty() && is_simple_unbounded_right_hop(m, m.pattern.edges[0]);
+    };
+    REQUIRE(is_hop("MATCH (a)-[*]->(b) RETURN a"));            // the algebraic fast-path shape
+    REQUIRE_FALSE(is_hop("MATCH (a)-[e*]->(b) RETURN a"));     // an edge binding disqualifies
+    REQUIRE_FALSE(is_hop("MATCH (a)-[:R]->(b) RETURN a"));     // a fixed single hop is not variable-length
+    REQUIRE_FALSE(is_hop("MATCH (a)<-[*]-(b) RETURN a"));      // a LEFT hop is not right-directed
+    REQUIRE_FALSE(is_hop("MATCH (a)-[*2..5]->(b) RETURN a"));  // a bounded hop is not unbounded
+}

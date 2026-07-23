@@ -358,3 +358,39 @@ TEST_CASE("collect_all_query_vars folds an edge's map property into its interval
     REQUIRE(iv.has_lower); REQUIRE(iv.lower_val == 5); REQUIRE(iv.lower_inclusive);
     REQUIRE(iv.has_upper); REQUIRE(iv.upper_val == 5); REQUIRE(iv.upper_inclusive);
 }
+
+namespace {
+// Whether variable x is referenced anywhere in the RETURN expression except inside a count(). This gate
+// decides whether a count-only variable can be dropped from a subquery's projection, so the count
+// short-circuit has to be exact.
+bool references_outside_count(const std::string& e) {
+    auto q = GqlParser::parse("MATCH (x), (y) RETURN " + e + " AS r");
+    return is_variable_referenced_outside_count(q.returns[0].expr.get(), "x");
+}
+}  // namespace
+
+TEST_CASE("is_variable_referenced_outside_count ignores references inside count()", "[gql_optimizer]") {
+    SECTION("a variable used only inside count is not an outside reference") {
+        REQUIRE_FALSE(references_outside_count("count(x)"));
+        REQUIRE_FALSE(references_outside_count("count(DISTINCT x)"));
+        REQUIRE_FALSE(references_outside_count("count(x) > 5"));   // only appearance is the count argument
+    }
+    SECTION("the same variable used outside the count is an outside reference") {
+        REQUIRE(references_outside_count("count(x) + x.age"));
+    }
+    SECTION("a non-COUNT aggregate does reference its argument (only COUNT short-circuits)") {
+        REQUIRE(references_outside_count("sum(x.age)"));
+    }
+}
+
+TEST_CASE("is_variable_referenced_outside_count walks every expression form", "[gql_optimizer]") {
+    REQUIRE(references_outside_count("x"));                                       // bare variable
+    REQUIRE(references_outside_count("x.age"));                                   // property lookup
+    REQUIRE(references_outside_count("abs(x.age)"));                              // function-call argument
+    REQUIRE(references_outside_count("CASE WHEN x.age > 5 THEN 1 ELSE 0 END"));   // case branch
+    REQUIRE(references_outside_count("NOT (x.age > 5)"));                         // unary over binary
+    REQUIRE(references_outside_count("x.age IN [1, 2]"));                         // in-list value
+    // A different variable or a bare literal is not a reference to x.
+    REQUIRE_FALSE(references_outside_count("y.age"));
+    REQUIRE_FALSE(references_outside_count("42"));
+}

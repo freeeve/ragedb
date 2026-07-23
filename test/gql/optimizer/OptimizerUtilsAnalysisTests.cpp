@@ -264,3 +264,28 @@ TEST_CASE("rebuild_expression_without_pushed_predicates removes exactly the push
         REQUIRE(rebuilt != nullptr);
     }
 }
+
+namespace {
+SelectivityClass selectivity(const std::string& q, const std::string& var) {
+    return estimate_selectivity(var, collect_query_vars(GqlParser::parse(q)));
+}
+}  // namespace
+
+TEST_CASE("estimate_selectivity ranks a unique id equality above a range above a scan", "[gql_optimizer]") {
+    SECTION("an unconstrained variable is a full scan") {
+        REQUIRE(selectivity("MATCH (a:Person) RETURN a", "a") == SelectivityClass::SCAN);
+    }
+    SECTION("an absent or empty variable name is a scan") {
+        REQUIRE(selectivity("MATCH (a:Person) RETURN a", "z") == SelectivityClass::SCAN);
+        REQUIRE(selectivity("MATCH (a:Person) RETURN a", "") == SelectivityClass::SCAN);
+    }
+    SECTION("an id equality point is UNIQUE") {
+        REQUIRE(selectivity("MATCH (a:Person {id: 5}) RETURN a", "a") == SelectivityClass::UNIQUE);
+    }
+    SECTION("a non-id constraint is INDEXED, not unique") {
+        REQUIRE(selectivity("MATCH (a:Person {age: 30}) RETURN a", "a") == SelectivityClass::INDEXED);
+    }
+    SECTION("an id range rather than a single point is INDEXED, not unique") {
+        REQUIRE(selectivity("MATCH (a:Person) WHERE a.id > 5 RETURN a", "a") == SelectivityClass::INDEXED);
+    }
+}

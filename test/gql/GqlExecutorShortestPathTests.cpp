@@ -89,7 +89,7 @@ TEST_CASE("GQL Execution Shortest Path Tests", "[gql_executor_shortest_path]") {
         REQUIRE((results.find("Solara") != std::string::npos || results.find("Mirage") != std::string::npos));
     }
 
-    SECTION("ANY SHORTEST with an unbounded quantifier terminates (task 053: IC13 OOM)") {
+    SECTION("ANY SHORTEST with an unbounded quantifier terminates (IC13 OOM)") {
         // `{1,}` has no upper bound. A path-enumerating BFS fans out by the average degree each level
         // and exhausts the heap before reaching the destination; the ANY search must instead keep one
         // path per node so the frontier stays bounded and it returns the single 2-hop shortest path.

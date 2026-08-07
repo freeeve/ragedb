@@ -21,6 +21,9 @@
 // pinned directly rather than through a query result.
 
 #include <catch2/catch.hpp>
+#include <map>
+#include <set>
+#include <string>
 #include "../../../src/gql/GqlParser.h"
 #include "../../../src/gql/optimizer/OptimizerUtils.h"
 
@@ -134,6 +137,110 @@ TEST_CASE("has_post_scan_residual_predicate flags rows a later filter still drop
     }
     SECTION("a property filter on a non-anchor node post-filters") {
         REQUIRE(residual("MATCH (p:Person)-[:KNOWS]->(f:Person {name: 'Bob'}) RETURN p"));
+    }
+}
+
+namespace {
+// Collects referenced variable names by an independent walk, so a gap in the production walk cannot
+// hide behind the same gap here.
+void collect_names(const Expression* e, std::set<std::string>& out) {
+    if (!e) return;
+    switch (e->kind) {
+        case ExpressionKind::VARIABLE:
+            out.insert(static_cast<const VariableExpr*>(e)->name); return;
+        case ExpressionKind::PROPERTY_LOOKUP:
+            out.insert(static_cast<const PropertyLookupExpr*>(e)->variable); return;
+        case ExpressionKind::UNARY_OP:
+            collect_names(static_cast<const UnaryOpExpr*>(e)->expr.get(), out); return;
+        case ExpressionKind::BINARY_OP: {
+            auto* b = static_cast<const BinaryOpExpr*>(e);
+            collect_names(b->left.get(), out); collect_names(b->right.get(), out); return;
+        }
+        case ExpressionKind::AGGREGATION:
+            collect_names(static_cast<const AggregateExpr*>(e)->expr.get(), out); return;
+        case ExpressionKind::IS_NULL_CHECK:
+            collect_names(static_cast<const IsNullExpr*>(e)->expr.get(), out); return;
+        case ExpressionKind::IS_LABELED:
+            collect_names(static_cast<const IsLabeledExpr*>(e)->value.get(), out); return;
+        case ExpressionKind::IS_DIRECTED:
+            collect_names(static_cast<const IsDirectedExpr*>(e)->value.get(), out); return;
+        case ExpressionKind::IS_SOURCE_DEST: {
+            auto* sd = static_cast<const IsSourceDestExpr*>(e);
+            collect_names(sd->value.get(), out); collect_names(sd->edge.get(), out); return;
+        }
+        case ExpressionKind::CAST:
+            collect_names(static_cast<const CastExpr*>(e)->value.get(), out); return;
+        case ExpressionKind::FUNCTION_CALL:
+            for (const auto& a : static_cast<const FunctionCallExpr*>(e)->args) collect_names(a.get(), out);
+            return;
+        case ExpressionKind::CASE_WHEN: {
+            auto* c = static_cast<const CaseExpr*>(e);
+            for (const auto& br : c->branches) {
+                collect_names(br.first.get(), out); collect_names(br.second.get(), out);
+            }
+            collect_names(c->else_expr.get(), out); return;
+        }
+        case ExpressionKind::IN_LIST: {
+            auto* i = static_cast<const InExpr*>(e);
+            collect_names(i->value.get(), out); collect_names(i->list.get(), out); return;
+        }
+        case ExpressionKind::LIST_LITERAL:
+            for (const auto& v : static_cast<const ListExpr*>(e)->elements) collect_names(v.get(), out);
+            return;
+        case ExpressionKind::LIST_INDEX: {
+            auto* ix = static_cast<const IndexExpr*>(e);
+            collect_names(ix->list.get(), out); collect_names(ix->index.get(), out); return;
+        }
+        default:
+            return;
+    }
+}
+
+// Renames b -> c inside the projected expression and reports which names survive.
+std::set<std::string> renamed_names(const std::string& projection) {
+    auto q = GqlParser::parse("MATCH (b:P) RETURN " + projection);
+    std::map<std::string, std::string> var_map{{"b", "c"}};
+    rewrite_expr_vars(q.returns[0].expr, var_map);
+    std::set<std::string> names;
+    collect_names(q.returns[0].expr.get(), names);
+    return names;
+}
+}  // namespace
+
+TEST_CASE("rewrite_expr_vars renames through every expression arm", "[gql_optimizer]") {
+    // Callers merge two variables and then erase the match that bound the discarded one, so an arm this
+    // walk skips leaves a reference to a variable nothing binds.
+    auto renames = [](const std::string& projection) {
+        auto names = renamed_names(projection);
+        return names.count("b") == 0 && names.count("c") == 1;
+    };
+
+    SECTION("arms that already worked") {
+        REQUIRE(renames("b.name"));
+        REQUIRE(renames("count(b)"));
+        REQUIRE(renames("-b.age"));
+        REQUIRE(renames("b.age + 1"));
+    }
+    SECTION("arms that silently skipped the rename") {
+        REQUIRE(renames("upper(b.name)"));
+        REQUIRE(renames("CASE WHEN b.age > 1 THEN 'y' ELSE 'n' END"));
+        REQUIRE(renames("CAST(b.age AS FLOAT)"));
+        REQUIRE(renames("b IS LABELED P"));
+        REQUIRE(renames("b.age IS NULL"));
+        REQUIRE(renames("b.age IN [1, 2]"));
+        REQUIRE(renames("[b.name]"));
+        REQUIRE(renames("[b.name][0]"));
+    }
+    SECTION("a scoped iteration variable shadows the rename in the body") {
+        // `b` here is the comprehension's element, not the outer node, so the body must be left alone.
+        auto q = GqlParser::parse("MATCH (n:P) RETURN [b IN n.vals WHERE b > 1 | b]");
+        std::map<std::string, std::string> var_map{{"b", "c"}};
+        rewrite_expr_vars(q.returns[0].expr, var_map);
+        std::set<std::string> names;
+        const auto* lc = static_cast<const ListComprehensionExpr*>(q.returns[0].expr.get());
+        collect_names(lc->filter.get(), names);
+        REQUIRE(names.count("b") == 1);
+        REQUIRE(names.count("c") == 0);
     }
 }
 

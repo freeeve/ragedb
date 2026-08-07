@@ -157,6 +157,21 @@ std::map<HierarchyKey, std::map<std::string, std::vector<std::string>>> build_ta
     return graphs;
 }
 
+/**
+ * @brief Whether the declared hierarchy mentions this value at all, as either end of some declared edge.
+ *        Reachability conclusions only hold for values inside the declared graph; for anything else the
+ *        constraints simply say nothing.
+ */
+bool value_declared(const std::map<std::string, std::vector<std::string>>& adj, const std::string& value) {
+    if (adj.count(value)) return true;
+    for (const auto& [child, parents] : adj) {
+        for (const auto& parent : parents) {
+            if (parent == value) return true;
+        }
+    }
+    return false;
+}
+
 std::optional<uint64_t> find_shortest_path_hops(
     const std::map<std::string, std::vector<std::string>>& adj,
     const std::string& start,
@@ -251,6 +266,15 @@ void TransitiveReachabilityPruner::transitive_reachability_pruning_pass(GqlQuery
                         HierarchyKey key{rel_type, child_label_expected, parent_label_expected, prop};
                         auto graph_it = graphs.find(key);
                         if (graph_it != graphs.end()) {
+                            // The declared hierarchy answers questions about the values it actually
+                            // contains. A value no constraint mentions is outside what was declared, so
+                            // finding no route to it reflects the gap in the declaration rather than the
+                            // data, and treating that as unreachable empties queries with real answers.
+                            if (!value_declared(graph_it->second, child_val) ||
+                                !value_declared(graph_it->second, parent_val)) {
+                                continue;
+                            }
+
                             auto path_len_opt = find_shortest_path_hops(graph_it->second, child_val, parent_val);
                             if (!path_len_opt.has_value()) {
                                 query.no_op = true;

@@ -92,3 +92,39 @@ TEST_CASE("GQL Optimizer Phase 8: Transitive DAG Reachability Short-Circuiting",
 
     GqlVirtualCatalog::local().clear();
 }
+
+TEST_CASE("transitive reachability judges only values the hierarchy declares", "[gql_optimizer]") {
+    // The declared hierarchy is whatever the registered constraints spell out, not a census of the
+    // category tree. Failing to find a route to a value nobody declared says something about the
+    // declaration, not about the data.
+    GqlVirtualCatalog::local().clear();
+    GqlVirtualCatalog::local().add_constraint(
+        "SciFiToFiction",
+        "MATCH (c:Category {name: 'SciFi'})-[:SUB_CATEGORY]->(p:Category {name: 'Fiction'}) RETURN c");
+
+    auto pruned = [](const std::string& text) {
+        auto query = GqlParser::parse(text);
+        GqlOptimizer::optimize(query);
+        return query.no_op;
+    };
+
+    SECTION("a target the constraints never mention is not judged unreachable") {
+        REQUIRE_FALSE(pruned("MATCH (a:Category {name: 'SciFi'})-[:SUB_CATEGORY*]->"
+                             "(b:Category {name: 'Biography'}) RETURN a.name"));
+    }
+
+    SECTION("neither endpoint declared leaves the query alone") {
+        REQUIRE_FALSE(pruned("MATCH (a:Category {name: 'Memoir'})-[:SUB_CATEGORY*]->"
+                             "(b:Category {name: 'Essay'}) RETURN a.name"));
+    }
+
+    SECTION("a declared pair is still judged, including its distance") {
+        // Both ends are declared one hop apart, so a window that excludes one hop cannot match.
+        REQUIRE(pruned("MATCH (a:Category {name: 'SciFi'})-[:SUB_CATEGORY*2..3]->"
+                       "(b:Category {name: 'Fiction'}) RETURN a.name"));
+        REQUIRE_FALSE(pruned("MATCH (a:Category {name: 'SciFi'})-[:SUB_CATEGORY*]->"
+                             "(b:Category {name: 'Fiction'}) RETURN a.name"));
+    }
+
+    GqlVirtualCatalog::local().clear();
+}

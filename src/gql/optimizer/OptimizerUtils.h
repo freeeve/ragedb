@@ -66,6 +66,16 @@ bool is_equivalent_pattern(const PathPattern& p1, const PathPattern& p2);
 template <typename SmartPtr>
 void rewrite_expr_vars(SmartPtr& expr, const std::map<std::string, std::string>& var_map);
 
+// Three walks below must visit every ExpressionKind that owns a child: expression_references_variable,
+// binds_scoped_variable and rewrite_expr_vars. Missing one is silent -- the walk simply reports nothing
+// there -- and has produced wrong answers more than once, so this pins the enum's size. Adding a kind
+// trips it; extend those three walks (and check the others in this header) before updating the count.
+//
+// The build sets no -Werror or -Wswitch-enum, so dropping the `default:` arms would not be enforced;
+// this assert is what turns a new kind into a compile-time failure instead of a silent gap.
+static_assert(static_cast<int>(ExpressionKind::TEMPORAL_FIELD) == 20,
+              "ExpressionKind changed: update the complete expression walks in this header");
+
 /**
  * @brief Whether @p name is referenced anywhere in this expression.
  *
@@ -104,6 +114,8 @@ inline bool expression_references_variable(const Expression* expr, const std::st
         }
         case ExpressionKind::CAST:
             return expression_references_variable(static_cast<const CastExpr*>(expr)->value.get(), name);
+        case ExpressionKind::TEMPORAL_FIELD:
+            return expression_references_variable(static_cast<const TemporalFieldExpr*>(expr)->value.get(), name);
         case ExpressionKind::FUNCTION_CALL: {
             for (const auto& a : static_cast<const FunctionCallExpr*>(expr)->args) {
                 if (expression_references_variable(a.get(), name)) return true;
@@ -222,6 +234,8 @@ inline bool binds_scoped_variable(const Expression* expr, const std::string& nam
         }
         case ExpressionKind::CAST:
             return binds_scoped_variable(static_cast<const CastExpr*>(expr)->value.get(), name);
+        case ExpressionKind::TEMPORAL_FIELD:
+            return binds_scoped_variable(static_cast<const TemporalFieldExpr*>(expr)->value.get(), name);
         case ExpressionKind::FUNCTION_CALL: {
             for (const auto& a : static_cast<const FunctionCallExpr*>(expr)->args) {
                 if (binds_scoped_variable(a.get(), name)) return true;
@@ -373,6 +387,8 @@ void rewrite_expr_vars(SmartPtr& expr, const std::map<std::string, std::string>&
         rewrite_expr_vars(sd->edge, var_map);
     } else if (expr->kind == ExpressionKind::CAST) {
         rewrite_expr_vars(static_cast<CastExpr*>(expr.get())->value, var_map);
+    } else if (expr->kind == ExpressionKind::TEMPORAL_FIELD) {
+        rewrite_expr_vars(static_cast<TemporalFieldExpr*>(expr.get())->value, var_map);
     } else if (expr->kind == ExpressionKind::FUNCTION_CALL) {
         for (auto& arg : static_cast<FunctionCallExpr*>(expr.get())->args) {
             rewrite_expr_vars(arg, var_map);

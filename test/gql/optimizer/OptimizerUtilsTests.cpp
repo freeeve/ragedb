@@ -226,6 +226,30 @@ TEST_CASE("query_binds_scoped_variable finds an element name a rename could capt
     }
 }
 
+TEST_CASE("expression_references_variable sees a variable through any wrapper", "[gql_optimizer]") {
+    // Passes ask this before erasing the match that binds a variable, so a wrapper the walk cannot enter
+    // reads as "unused" and takes the binding with it.
+    auto refs = [](const std::string& projection, const std::string& name) {
+        auto q = GqlParser::parse("MATCH (l:L) RETURN " + projection);
+        return expression_references_variable(q.returns[0].expr.get(), name);
+    };
+
+    SECTION("through each wrapper that owns a child") {
+        REQUIRE(refs("l.name", "l"));
+        REQUIRE(refs("upper(l.name)", "l"));
+        REQUIRE(refs("CASE WHEN l.name = 'x' THEN 1 ELSE 0 END", "l"));
+        REQUIRE(refs("CAST(l.age AS FLOAT)", "l"));
+        REQUIRE(refs("[l.name]", "l"));
+        REQUIRE(refs("l.name IN ['a']", "l"));
+        REQUIRE(refs("l.name IS NULL", "l"));
+        REQUIRE(refs("l.created.year", "l"));
+    }
+
+    SECTION("and does not invent one") {
+        REQUIRE_FALSE(refs("upper(l.name)", "zz"));
+    }
+}
+
 TEST_CASE("rewrite_expr_vars renames through every expression arm", "[gql_optimizer]") {
     // Callers merge two variables and then erase the match that bound the discarded one, so an arm this
     // walk skips leaves a reference to a variable nothing binds.
@@ -249,6 +273,9 @@ TEST_CASE("rewrite_expr_vars renames through every expression arm", "[gql_optimi
         REQUIRE(renames("b.age IN [1, 2]"));
         REQUIRE(renames("[b.name]"));
         REQUIRE(renames("[b.name][0]"));
+        // A temporal accessor owns its operand, and being last in the ExpressionKind enum it was the
+        // arm every one of these walks originally omitted.
+        REQUIRE(renames("b.created.year"));
     }
     SECTION("a scoped iteration variable shadows the rename in the body") {
         // `b` here is the comprehension's element, not the outer node, so the body must be left alone.

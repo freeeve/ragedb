@@ -21,8 +21,10 @@
 
 #include "OptimizerUtils.h"
 #include "../GqlValue.h"
+#include "../executor/ExpressionEvaluator.h"
 #include <algorithm>
 #include <limits>
+#include <optional>
 
 namespace ragedb::gql {
 
@@ -156,6 +158,39 @@ bool has_post_scan_residual_predicate(const GqlQuery& query) {
         }
     }
     return false;
+}
+
+/**
+ * @brief The number of rows after which a query's projection can stop pulling input, or nullopt when
+ *        the query must consume its whole input.
+ *
+ *        This is an OUTPUT-row cap, not the scan-count bound has_post_scan_residual_predicate gates.
+ *        The distinction matters: a scan bound fixes how many rows are READ, so it is only sound when
+ *        nothing downstream drops rows, which is why that gate rejects a residual WHERE and why the
+ *        limit pushdown additionally has to prove every join mandatory. Counting rows the query has
+ *        actually PRODUCED needs no such proof -- a filtering predicate or a reducing join simply
+ *        means more input is consumed before the cap is reached, never fewer output rows. So a WHERE,
+ *        an inline property filter, the match count, and join reducing-ness are all deliberately
+ *        absent below.
+ *
+ *        Disqualifying instead are the constructs for which an early row is not a final row: ORDER BY
+ *        (the last input row can sort first), an aggregate or an explicit GROUP BY (many rows fold
+ *        into few), and DISTINCT (dedup collapses rows after projection). A write must apply to every
+ *        matched row rather than the first page, and a DDL statement projects no rows at all.
+ *
+ *        Returns the whole page window (OFFSET + LIMIT): with an offset, stopping at LIMIT rows would
+ *        halt before reaching the rows the page actually returns.
+ */
+std::optional<uint64_t> output_row_cap(const GqlQuery& query) {
+    if (query.kind != QueryKind::SINGLE || !query.limit.has_value()) return std::nullopt;
+    if (!query.order_by.empty() || query.distinct) return std::nullopt;
+    if (!query.group_by.empty() || !query.writes.empty() || query.schema_op.has_value()) return std::nullopt;
+    for (const auto& item : query.returns) {
+        if (has_aggregates(item.expr.get())) return std::nullopt;
+    }
+    const uint64_t skip = query.offset.value_or(0);
+    if (skip > std::numeric_limits<uint64_t>::max() - *query.limit) return std::nullopt;
+    return skip + *query.limit;
 }
 
 /**

@@ -137,6 +137,42 @@ TEST_CASE("has_post_scan_residual_predicate flags rows a later filter still drop
     }
 }
 
+TEST_CASE("output_row_cap bounds a page without proving the scan non-reducing", "[gql_optimizer]") {
+    auto cap = [](const std::string& q) {
+        return output_row_cap(GqlParser::parse(q));
+    };
+    SECTION("a plain LIMIT caps at the limit") {
+        REQUIRE(cap("MATCH (p:Person) RETURN p.name LIMIT 10") == std::optional<uint64_t>(10));
+    }
+    SECTION("an OFFSET caps at the whole page window, not the bare limit") {
+        REQUIRE(cap("MATCH (p:Person) RETURN p.name OFFSET 25 LIMIT 10") == std::optional<uint64_t>(35));
+    }
+    SECTION("a residual WHERE still caps -- filtered rows are never produced") {
+        // The same query disqualifies the SCAN bound, which is exactly the case this cap unlocks.
+        const std::string q = "MATCH (p:Person) WHERE p.age > 30 RETURN p.name LIMIT 10";
+        REQUIRE(has_post_scan_residual_predicate(GqlParser::parse(q)));
+        REQUIRE(cap(q) == std::optional<uint64_t>(10));
+    }
+    SECTION("a reducing join still caps -- no mandatory-relation proof needed") {
+        // limit pushdown leaves this query's scan unbounded because it cannot prove the second match
+        // mandatory; counting produced rows needs no such proof.
+        REQUIRE(cap("MATCH (p:Person) MATCH (p)-[:SHIPPED_FROM]->(l:Location) RETURN p.name LIMIT 10")
+                == std::optional<uint64_t>(10));
+    }
+    SECTION("ORDER BY is not capped: the last input row can sort first") {
+        REQUIRE_FALSE(cap("MATCH (p:Person) RETURN p.name ORDER BY p.name LIMIT 10").has_value());
+    }
+    SECTION("DISTINCT is not capped: dedup collapses rows after projection") {
+        REQUIRE_FALSE(cap("MATCH (p:Person) RETURN DISTINCT p.name LIMIT 10").has_value());
+    }
+    SECTION("an aggregate is not capped: many rows fold into few") {
+        REQUIRE_FALSE(cap("MATCH (p:Person) RETURN count(p) AS c LIMIT 10").has_value());
+    }
+    SECTION("no LIMIT means no cap") {
+        REQUIRE_FALSE(cap("MATCH (p:Person) RETURN p.name").has_value());
+    }
+}
+
 TEST_CASE("is_equivalent_pattern compares nodes and edges position by position", "[gql_optimizer]") {
     auto pat = [](const std::string& p) {
         return GqlParser::parse("MATCH " + p + " RETURN a").matches[0].pattern;

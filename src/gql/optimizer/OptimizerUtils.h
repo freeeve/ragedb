@@ -117,6 +117,7 @@ bool is_variable_referenced_outside_count(const Expression* expr, const std::str
 bool expression_has_distinct_aggregate(const Expression* expr);
 bool query_has_distinct_aggregate(const GqlQuery& query);
 bool has_post_scan_residual_predicate(const GqlQuery& query);
+std::optional<uint64_t> output_row_cap(const GqlQuery& query);
 bool is_simple_unbounded_right_hop(const MatchStatement& match, const PatternEdge& edge);
 
 /**

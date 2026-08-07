@@ -15,9 +15,12 @@
  */
 
 #include <catch2/catch.hpp>
+#include <set>
+#include <string>
 #include "../../../src/gql/GqlParser.h"
 #include "../../../src/gql/GqlOptimizer.h"
 #include "../../../src/gql/GqlVirtualCatalog.h"
+#include "../../../src/gql/optimizer/OptimizerUtils.h"
 
 using namespace ragedb;
 using namespace ragedb::gql;
@@ -83,4 +86,41 @@ TEST_CASE("join elimination does not crash on count(*) over a mandatory relation
     SUCCEED("optimize returned without crashing");
 
     GqlVirtualCatalog::local().clear();
+}
+
+TEST_CASE("join elimination keeps a match whose variable the projection still uses", "[gql_optimizer]") {
+    // Stripping the join is only invisible when nothing else needs the target variable. The reference
+    // check has to see every spelling: one it fails to notice reads as "unused", and the match is erased
+    // while the projection still asks for the value.
+    auto still_bound = [](const std::string& projection) {
+        GqlVirtualCatalog::local().clear();
+        GqlVirtualCatalog::local().add_constraint(
+            "MandatoryShippedFrom",
+            "MATCH (s:Shipment) WHERE NOT EXISTS { MATCH (s)-[:SHIPPED_FROM]->(l:Location) } RETURN s");
+        auto query = GqlParser::parse(
+            "MATCH (s:Shipment)-[:SHIPPED_FROM]->(l:Location) RETURN DISTINCT " + projection);
+        GqlOptimizer::optimize(query);
+        std::set<std::string> bound;
+        collect_variables_from_matches(query.matches, bound);
+        GqlVirtualCatalog::local().clear();
+        return bound.count("l") == 1;
+    };
+
+    SECTION("references the check already saw") {
+        REQUIRE(still_bound("l.name"));
+        REQUIRE(still_bound("l.name IN ['a', 'b']"));
+    }
+
+    SECTION("references it used to miss") {
+        REQUIRE(still_bound("upper(l.name)"));
+        REQUIRE(still_bound("CASE WHEN l.name = 'x' THEN 1 ELSE 0 END"));
+        REQUIRE(still_bound("CAST(l.code AS INTEGER)"));
+        REQUIRE(still_bound("[l.name]"));
+        REQUIRE(still_bound("l.name IS NULL"));
+    }
+
+    SECTION("a genuinely unused target is still eliminated") {
+        // Without this the fix could pass by never eliminating anything.
+        REQUIRE_FALSE(still_bound("s.id"));
+    }
 }

@@ -67,6 +67,117 @@ template <typename SmartPtr>
 void rewrite_expr_vars(SmartPtr& expr, const std::map<std::string, std::string>& var_map);
 
 /**
+ * @brief Whether @p name is referenced anywhere in this expression.
+ *
+ * Passes ask this before ERASING the match that binds a variable, so the two answers are not equally
+ * costly: reporting a reference that is not really there only forgoes an optimization, while missing one
+ * leaves a live reference with nothing to bind it. Every arm must therefore be present, and the walk
+ * deliberately errs toward reporting -- it descends into a scoped binder's body without checking whether
+ * the element name shadows @p name, and into a nested pattern's own variables.
+ */
+inline bool expression_references_variable(const Expression* expr, const std::string& name) {
+    if (!expr) return false;
+    switch (expr->kind) {
+        case ExpressionKind::VARIABLE:
+            return static_cast<const VariableExpr*>(expr)->name == name;
+        case ExpressionKind::PROPERTY_LOOKUP:
+            return static_cast<const PropertyLookupExpr*>(expr)->variable == name;
+        case ExpressionKind::UNARY_OP:
+            return expression_references_variable(static_cast<const UnaryOpExpr*>(expr)->expr.get(), name);
+        case ExpressionKind::BINARY_OP: {
+            const auto* bin = static_cast<const BinaryOpExpr*>(expr);
+            return expression_references_variable(bin->left.get(), name) ||
+                   expression_references_variable(bin->right.get(), name);
+        }
+        case ExpressionKind::AGGREGATION:
+            return expression_references_variable(static_cast<const AggregateExpr*>(expr)->expr.get(), name);
+        case ExpressionKind::IS_NULL_CHECK:
+            return expression_references_variable(static_cast<const IsNullExpr*>(expr)->expr.get(), name);
+        case ExpressionKind::IS_LABELED:
+            return expression_references_variable(static_cast<const IsLabeledExpr*>(expr)->value.get(), name);
+        case ExpressionKind::IS_DIRECTED:
+            return expression_references_variable(static_cast<const IsDirectedExpr*>(expr)->value.get(), name);
+        case ExpressionKind::IS_SOURCE_DEST: {
+            const auto* sd = static_cast<const IsSourceDestExpr*>(expr);
+            return expression_references_variable(sd->value.get(), name) ||
+                   expression_references_variable(sd->edge.get(), name);
+        }
+        case ExpressionKind::CAST:
+            return expression_references_variable(static_cast<const CastExpr*>(expr)->value.get(), name);
+        case ExpressionKind::FUNCTION_CALL: {
+            for (const auto& a : static_cast<const FunctionCallExpr*>(expr)->args) {
+                if (expression_references_variable(a.get(), name)) return true;
+            }
+            return false;
+        }
+        case ExpressionKind::CASE_WHEN: {
+            const auto* ce = static_cast<const CaseExpr*>(expr);
+            for (const auto& br : ce->branches) {
+                if (expression_references_variable(br.first.get(), name)) return true;
+                if (expression_references_variable(br.second.get(), name)) return true;
+            }
+            return expression_references_variable(ce->else_expr.get(), name);
+        }
+        case ExpressionKind::IN_LIST: {
+            const auto* in = static_cast<const InExpr*>(expr);
+            return expression_references_variable(in->value.get(), name) ||
+                   expression_references_variable(in->list.get(), name);
+        }
+        case ExpressionKind::LIST_LITERAL: {
+            for (const auto& el : static_cast<const ListExpr*>(expr)->elements) {
+                if (expression_references_variable(el.get(), name)) return true;
+            }
+            return false;
+        }
+        case ExpressionKind::LIST_INDEX: {
+            const auto* ix = static_cast<const IndexExpr*>(expr);
+            return expression_references_variable(ix->list.get(), name) ||
+                   expression_references_variable(ix->index.get(), name);
+        }
+        case ExpressionKind::LIST_COMPREHENSION: {
+            const auto* lc = static_cast<const ListComprehensionExpr*>(expr);
+            return expression_references_variable(lc->list.get(), name) ||
+                   expression_references_variable(lc->filter.get(), name) ||
+                   expression_references_variable(lc->projection.get(), name);
+        }
+        case ExpressionKind::QUANTIFIED_PREDICATE: {
+            const auto* qp = static_cast<const QuantifiedPredicateExpr*>(expr);
+            return expression_references_variable(qp->list.get(), name) ||
+                   expression_references_variable(qp->predicate.get(), name);
+        }
+        case ExpressionKind::EXISTS:
+        case ExpressionKind::SIZE_OP: {
+            const std::vector<MatchStatement>* matches = nullptr;
+            const Expression* where = nullptr;
+            if (expr->kind == ExpressionKind::EXISTS) {
+                const auto* ex = static_cast<const ExistsExpr*>(expr);
+                matches = &ex->matches;
+                where = ex->where_expr.get();
+            } else {
+                const auto* sz = static_cast<const SizeExpr*>(expr);
+                matches = &sz->matches;
+                where = sz->where_expr.get();
+            }
+            if (expression_references_variable(where, name)) return true;
+            for (const auto& m : *matches) {
+                for (const auto& node : m.pattern.nodes) {
+                    if (node.variable == name) return true;
+                    if (expression_references_variable(node.where_expr.get(), name)) return true;
+                }
+                for (const auto& edge : m.pattern.edges) {
+                    if (edge.variable == name) return true;
+                    if (expression_references_variable(edge.where_expr.get(), name)) return true;
+                    if (expression_references_variable(edge.cost_expr.get(), name)) return true;
+                }
+            }
+            return false;
+        }
+        default:
+            return false;
+    }
+}
+
+/**
  * @brief Whether any list comprehension or quantified predicate in this expression binds an iteration
  *        variable called @p name.
  *

@@ -474,6 +474,27 @@ TEST_CASE("ORDER BY resolves RETURN aliases into sort keys", "[gql_parser]") {
         auto q = GqlParser::parse("MATCH (p:Person) RETURN p.name AS n ORDER BY p");
         REQUIRE(q.order_by[0].expr->kind == ExpressionKind::VARIABLE);
     }
+
+    SECTION("an alias aggregated over in ORDER BY is substituted") {
+        // ORDER BY may aggregate a projected alias. While aggregate arguments were skipped, the alias
+        // stayed a bare variable that resolves to nothing at sort time, silently losing the ordering.
+        auto q = GqlParser::parse(
+            "MATCH (p:Person) RETURN p.age AS a, count(*) AS c ORDER BY max(a)");
+        REQUIRE(q.order_by[0].expr->kind == ExpressionKind::AGGREGATION);
+        const auto* arg = static_cast<const AggregateExpr*>(q.order_by[0].expr.get())->expr.get();
+        REQUIRE(arg != nullptr);
+        REQUIRE(arg->kind == ExpressionKind::PROPERTY_LOOKUP);
+    }
+
+    SECTION("an aggregate-valued alias is not spliced into another aggregate") {
+        // Substituting count(*) into max(...) would nest one aggregate inside another, so the alias is
+        // left in place for the typechecker to report.
+        auto q = GqlParser::parse("MATCH (p:Person) RETURN count(*) AS c ORDER BY max(c)");
+        REQUIRE(q.order_by[0].expr->kind == ExpressionKind::AGGREGATION);
+        const auto* arg = static_cast<const AggregateExpr*>(q.order_by[0].expr.get())->expr.get();
+        REQUIRE(arg != nullptr);
+        REQUIRE(arg->kind != ExpressionKind::AGGREGATION);
+    }
 }
 
 TEST_CASE("EXISTS accepts an openCypher-style bare pattern subquery", "[gql_parser]") {

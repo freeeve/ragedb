@@ -36,11 +36,75 @@
 namespace ragedb::gql {
 
 /**
+ * @brief Whether an expression contains an aggregate anywhere in its tree.
+ */
+static bool expression_contains_aggregate(const Expression* expr) {
+    if (!expr) return false;
+    switch (expr->kind) {
+        case ExpressionKind::AGGREGATION:
+            return true;
+        case ExpressionKind::UNARY_OP:
+            return expression_contains_aggregate(static_cast<const UnaryOpExpr*>(expr)->expr.get());
+        case ExpressionKind::BINARY_OP: {
+            auto* bin = static_cast<const BinaryOpExpr*>(expr);
+            return expression_contains_aggregate(bin->left.get()) ||
+                   expression_contains_aggregate(bin->right.get());
+        }
+        case ExpressionKind::FUNCTION_CALL: {
+            for (const auto& a : static_cast<const FunctionCallExpr*>(expr)->args) {
+                if (expression_contains_aggregate(a.get())) return true;
+            }
+            return false;
+        }
+        case ExpressionKind::CAST:
+            return expression_contains_aggregate(static_cast<const CastExpr*>(expr)->value.get());
+        default:
+            return false;
+    }
+}
+
+/**
+ * @brief Whether substituting inside this subtree would splice an aggregate-valued alias into it.
+ *        Used to keep an aggregate's argument free of a nested aggregate.
+ */
+static bool references_aggregate_alias(const Expression* expr,
+                                       const std::map<std::string, const Expression*>& aliases) {
+    if (!expr) return false;
+    switch (expr->kind) {
+        case ExpressionKind::VARIABLE: {
+            auto it = aliases.find(static_cast<const VariableExpr*>(expr)->name);
+            return it != aliases.end() && expression_contains_aggregate(it->second);
+        }
+        case ExpressionKind::UNARY_OP:
+            return references_aggregate_alias(static_cast<const UnaryOpExpr*>(expr)->expr.get(), aliases);
+        case ExpressionKind::BINARY_OP: {
+            auto* bin = static_cast<const BinaryOpExpr*>(expr);
+            return references_aggregate_alias(bin->left.get(), aliases) ||
+                   references_aggregate_alias(bin->right.get(), aliases);
+        }
+        case ExpressionKind::FUNCTION_CALL: {
+            for (const auto& a : static_cast<const FunctionCallExpr*>(expr)->args) {
+                if (references_aggregate_alias(a.get(), aliases)) return true;
+            }
+            return false;
+        }
+        case ExpressionKind::CAST:
+            return references_aggregate_alias(static_cast<const CastExpr*>(expr)->value.get(), aliases);
+        default:
+            return false;
+    }
+}
+
+/**
  * @brief Replace references to the projection's output aliases inside an ORDER BY sort key with
  *        clones of the aliased expressions. ORDER BY is evaluated after the projection, so its
  *        aliases are in scope for the sort keys (as in Cypher and SQL); the executor evaluates
  *        sort keys against pre-projection rows, so the substitution reconstructs that scope.
- *        Aggregation arguments are not descended into (an alias cannot appear there).
+ *
+ *        Every arm owning a child expression must be listed, or a sort key spelled with that syntax
+ *        keeps a bare alias that resolves to nothing at sort time and the requested order is lost.
+ *        EXISTS and SIZE_OP are deliberately excluded: their nested patterns introduce their own
+ *        variable scope, so a name inside them is not necessarily the projection's alias.
  */
 static std::unique_ptr<Expression> substitute_return_aliases(
         std::unique_ptr<Expression> expr, const std::map<std::string, const Expression*>& aliases) {
@@ -50,6 +114,16 @@ static std::unique_ptr<Expression> substitute_return_aliases(
             auto it = aliases.find(static_cast<const VariableExpr*>(expr.get())->name);
             if (it != aliases.end()) {
                 return it->second->clone();
+            }
+            return expr;
+        }
+        case ExpressionKind::AGGREGATION: {
+            // ORDER BY may aggregate over a projected alias, e.g. `RETURN p.age AS a ... ORDER BY max(a)`,
+            // which has to become max(p.age) to resolve at sort time. An alias that is ITSELF an aggregate
+            // is left in place, since splicing it in would nest one aggregate inside another.
+            auto* agg = static_cast<AggregateExpr*>(expr.get());
+            if (!references_aggregate_alias(agg->expr.get(), aliases)) {
+                agg->expr = substitute_return_aliases(std::move(agg->expr), aliases);
             }
             return expr;
         }

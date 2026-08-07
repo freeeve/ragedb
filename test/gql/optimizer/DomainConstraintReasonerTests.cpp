@@ -71,3 +71,45 @@ TEST_CASE("GQL Optimizer Phase 7: Composite Attribute Domain Constraint Reasonin
 
     GqlVirtualCatalog::local().clear();
 }
+
+TEST_CASE("domain reasoning reports unsatisfiable only when the query really is", "[gql_optimizer]") {
+    // The pass answers with nothing at all when its solve comes back UNSAT, so an encoding slip -- a
+    // predicate the query never mentions forced false, a label or property mixed up between the query and
+    // the constraint -- would empty queries with obvious answers and look exactly like "no matches".
+    // These pin the shapes a single-predicate constraint must leave alone.
+    GqlVirtualCatalog::local().clear();
+    GqlVirtualCatalog::local().add_constraint(
+        "PositiveAge", "MATCH (p:Person) WHERE p.age < 0 RETURN p");
+
+    auto pruned = [](const std::string& text) {
+        auto query = GqlParser::parse(text);
+        GqlOptimizer::optimize(query);
+        return query.no_op;
+    };
+
+    SECTION("ranges that clear, straddle, or sit inside the legal region survive") {
+        REQUIRE_FALSE(pruned("MATCH (p:Person) WHERE p.age > 20 RETURN p.name"));
+        REQUIRE_FALSE(pruned("MATCH (p:Person) WHERE p.age > -5 RETURN p.name"));
+        REQUIRE_FALSE(pruned("MATCH (p:Person) WHERE p.age = 30 RETURN p.name"));
+        REQUIRE_FALSE(pruned("MATCH (p:Person) WHERE p.age > 10 AND p.age < 50 RETURN p.name"));
+    }
+
+    SECTION("a constraint says nothing about other properties, labels, or an unfiltered query") {
+        REQUIRE_FALSE(pruned("MATCH (p:Person) WHERE p.score > 10 RETURN p.name"));
+        REQUIRE_FALSE(pruned("MATCH (p:Person) WHERE p.age > 10 AND p.score < 5 RETURN p.name"));
+        REQUIRE_FALSE(pruned("MATCH (c:Company) WHERE c.age < -5 RETURN c.name"));
+        REQUIRE_FALSE(pruned("MATCH (p:Person) RETURN p.name"));
+    }
+
+    SECTION("a disjunction survives while one branch remains legal") {
+        REQUIRE_FALSE(pruned("MATCH (p:Person) WHERE p.age < -1 OR p.age > 30 RETURN p.name"));
+        REQUIRE_FALSE(pruned("MATCH (p:Person) WHERE NOT (p.age < 0) RETURN p.name"));
+    }
+
+    SECTION("genuine contradictions are still reported") {
+        REQUIRE(pruned("MATCH (p:Person) WHERE p.age < -5 RETURN p.name"));
+        REQUIRE(pruned("MATCH (p:Person) WHERE p.age > 50 AND p.age < 10 RETURN p.name"));
+    }
+
+    GqlVirtualCatalog::local().clear();
+}

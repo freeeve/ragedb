@@ -22,6 +22,40 @@ namespace ragedb::gql {
 
 namespace {
 
+/**
+ * @brief Whether this expression evaluates to NULL -- as opposed to a definite true or false -- when
+ *        @p var is unbound.
+ *
+ * The distinction decides what NOT does to it. Comparisons and arithmetic propagate null, so negating
+ * them yields null again and the row is still filtered out. IS [NOT] NULL answers with a real boolean
+ * even for an unbound variable, so negating it can produce TRUE and keep the row.
+ */
+bool yields_null_when_unbound(const Expression* expr, const std::string& var) {
+    if (!expr) return false;
+    switch (expr->kind) {
+        case ExpressionKind::PROPERTY_LOOKUP:
+            return static_cast<const PropertyLookupExpr*>(expr)->variable == var;
+        case ExpressionKind::VARIABLE:
+            return static_cast<const VariableExpr*>(expr)->name == var;
+        case ExpressionKind::BINARY_OP: {
+            const auto* bin = static_cast<const BinaryOpExpr*>(expr);
+            // AND/OR can still resolve to a definite value from the other side, so only comparison and
+            // arithmetic operators are treated as null-propagating here.
+            if (bin->op == BinaryOpKind::AND || bin->op == BinaryOpKind::OR) return false;
+            return yields_null_when_unbound(bin->left.get(), var) ||
+                   yields_null_when_unbound(bin->right.get(), var);
+        }
+        case ExpressionKind::UNARY_OP: {
+            const auto* un = static_cast<const UnaryOpExpr*>(expr);
+            if (un->op == UnaryOpKind::NEG) return yields_null_when_unbound(un->expr.get(), var);
+            return false;
+        }
+        default:
+            // IS [NOT] NULL, EXISTS, functions such as coalesce: a definite value, or not analyzed.
+            return false;
+    }
+}
+
 bool is_null_rejecting(const Expression* expr, const std::string& var) {
     if (!expr) return false;
     
@@ -43,6 +77,13 @@ bool is_null_rejecting(const Expression* expr, const std::string& var) {
         }
         case ExpressionKind::UNARY_OP: {
             const auto* un = static_cast<const UnaryOpExpr*>(expr);
+            if (un->op == UnaryOpKind::NOT) {
+                // Negation flips the answer, so the operand rejecting nulls proves nothing about the
+                // negation. `NOT (f.age IS NOT NULL)` is TRUE for an unbound f -- those rows are exactly
+                // what the query asked for, and promoting the match would drop them. Only an operand that
+                // stays NULL for an unbound variable keeps the negation non-true.
+                return yields_null_when_unbound(un->expr.get(), var);
+            }
             return is_null_rejecting(un->expr.get(), var);
         }
         case ExpressionKind::BINARY_OP: {

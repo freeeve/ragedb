@@ -39,6 +39,30 @@ bool prunes(const std::string& q) {
 }
 }  // namespace
 
+TEST_CASE("a multi-property edge constraint forbids only the combination of its bounds",
+          "[gql_optimizer]") {
+    // No KNOWS edge is BOTH under weight 5 AND under rank 2; neither bound is banned on its own.
+    auto pruned_against_constraint = [](const std::string& q) {
+        GqlVirtualCatalog::local().clear();
+        GqlVirtualCatalog::local().add_constraint(
+            "WeakLowRank", "MATCH (a:N)-[r:KNOWS]->(b:N) WHERE r.weight < 5 AND r.rank < 2 RETURN a");
+        GqlQuery query = GqlParser::parse(q);
+        EdgeContradictionPruner::edge_contradiction_pruning_pass(query);
+        bool no_op = query.no_op;
+        GqlVirtualCatalog::local().clear();
+        return no_op;
+    };
+
+    SECTION("bounding one conjunct alone leaves satisfying edges") {
+        REQUIRE_FALSE(pruned_against_constraint(
+            "MATCH (a:N)-[r:KNOWS]->(b:N) WHERE r.weight < 3 RETURN a"));
+    }
+    SECTION("bounding every conjunct is unsatisfiable") {
+        REQUIRE(pruned_against_constraint(
+            "MATCH (a:N)-[r:KNOWS]->(b:N) WHERE r.weight < 3 AND r.rank < 1 RETURN a"));
+    }
+}
+
 TEST_CASE("edge contradiction on a required edge prunes to no_op", "[gql_optimizer]") {
     SECTION("an inline edge WHERE with an empty range empties the query") {
         REQUIRE(prunes("MATCH (a:N)-[r:KNOWS WHERE r.weight > 5 AND r.weight < 2]->(b:N) RETURN a"));

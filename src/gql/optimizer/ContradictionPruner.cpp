@@ -151,17 +151,27 @@ void ContradictionPruner::semantic_pruning_pass(GqlQuery& query) {
             
             for (const auto& c_vi : c_vars) {
                 if (c_vi.label.empty()) continue;
+                if (c_vi.intervals.empty()) continue;
                 for (const auto& q_vi : q_vars) {
                     if (optional_only_vars.count(q_vi.variable)) continue;
                     if (q_vi.label == c_vi.label) {
+                        // A constraint forbids the COMBINATION of its bounds, so the query is empty only
+                        // when every one of them is already implied by the query's own bounds. Matching a
+                        // single bound proves nothing: `WHERE age < 18 AND score < 10` leaves a row with
+                        // age 10 and score 50 perfectly legal. (For a constraint written with OR each
+                        // branch would ban on its own, so requiring all of them merely forgoes a prune,
+                        // which is the safe direction to be wrong in.)
+                        bool every_bound_implied = true;
                         for (const auto& [prop, c_interval] : c_vi.intervals) {
                             auto it = q_vi.intervals.find(prop);
-                            if (it != q_vi.intervals.end()) {
-                                if (c_interval.contains(it->second)) {
-                                    query.no_op = true;
-                                    return;
-                                }
+                            if (it == q_vi.intervals.end() || !c_interval.contains(it->second)) {
+                                every_bound_implied = false;
+                                break;
                             }
+                        }
+                        if (every_bound_implied) {
+                            query.no_op = true;
+                            return;
                         }
                     }
                 }

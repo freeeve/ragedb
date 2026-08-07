@@ -92,17 +92,24 @@ void EdgeContradictionPruner::edge_contradiction_pruning_pass(GqlQuery& query) {
             for (const auto& c_vi : c_vars) {
                 if (c_vi.label.empty() || !c_edge_vars.count(c_vi.variable)) continue;
                 
+                if (c_vi.intervals.empty()) continue;
                 for (const auto& q_vi : q_edge_vars) {
                     if (q_vi.label == c_vi.label) {
+                        // The constraint forbids the COMBINATION of its bounds, so every one of them has
+                        // to be implied by the query's own bounds before the query is provably empty.
+                        // Matching a single bound of a multi-property constraint leaves rows that satisfy
+                        // that bound and violate none of the others.
+                        bool every_bound_implied = true;
                         for (const auto& [prop, c_interval] : c_vi.intervals) {
                             auto it = q_vi.intervals.find(prop);
-                            if (it != q_vi.intervals.end()) {
-                                // If the query interval is entirely contained within the forbidden constraint interval, it's a contradiction.
-                                if (c_interval.contains(it->second)) {
-                                    query.no_op = true;
-                                    return;
-                                }
+                            if (it == q_vi.intervals.end() || !c_interval.contains(it->second)) {
+                                every_bound_implied = false;
+                                break;
                             }
+                        }
+                        if (every_bound_implied) {
+                            query.no_op = true;
+                            return;
                         }
                     }
                 }

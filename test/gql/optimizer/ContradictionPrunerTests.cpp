@@ -51,6 +51,31 @@ TEST_CASE("GQL Optimizer Phase 1: Primitive Constraints & Contradiction Pruning"
     GqlVirtualCatalog::local().clear();
 }
 
+TEST_CASE("a multi-property constraint forbids only the combination of its bounds", "[gql_optimizer]") {
+    GqlVirtualCatalog::local().clear();
+    // No Person is BOTH under 18 AND under 10 points. Neither bound is forbidden on its own.
+    GqlVirtualCatalog::local().add_constraint(
+        "JuniorLowScore", "MATCH (p:Person) WHERE p.age < 18 AND p.score < 10 RETURN p");
+
+    auto pruned = [](const std::string& text) {
+        auto query = GqlParser::parse(text);
+        GqlOptimizer::optimize(query);
+        return query.no_op;
+    };
+
+    SECTION("a query bounded by one conjunct alone still has answers") {
+        // A ten-year-old with 50 points satisfies age < 15 and violates nothing.
+        REQUIRE_FALSE(pruned("MATCH (p:Person) WHERE p.age < 15 RETURN p.name"));
+        REQUIRE_FALSE(pruned("MATCH (p:Person) WHERE p.score < 5 RETURN p.name"));
+    }
+
+    SECTION("a query implying every conjunct is unsatisfiable") {
+        REQUIRE(pruned("MATCH (p:Person) WHERE p.age < 15 AND p.score < 5 RETURN p.name"));
+    }
+
+    GqlVirtualCatalog::local().clear();
+}
+
 TEST_CASE("GQL Optimizer Phase 3: Multi-Variable Relational Predicate Reasoning", "[gql_optimizer][semantic]") {
     GqlVirtualCatalog::local().clear();
 

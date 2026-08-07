@@ -31,33 +31,11 @@ bool is_var_safe_in_where_expr(const Expression* expr, const std::string& var) {
         }
     }
     
-    bool references_var = false;
-    std::vector<const Expression*> stack = { expr };
-    while (!stack.empty()) {
-        const auto* curr = stack.back();
-        stack.pop_back();
-        if (curr->kind == ExpressionKind::VARIABLE) {
-            if (static_cast<const VariableExpr*>(curr)->name == var) {
-                references_var = true;
-                break;
-            }
-        } else if (curr->kind == ExpressionKind::PROPERTY_LOOKUP) {
-            if (static_cast<const PropertyLookupExpr*>(curr)->variable == var) {
-                references_var = true;
-                break;
-            }
-        } else if (curr->kind == ExpressionKind::UNARY_OP) {
-            stack.push_back(static_cast<const UnaryOpExpr*>(curr)->expr.get());
-        } else if (curr->kind == ExpressionKind::BINARY_OP) {
-            const auto* b = static_cast<const BinaryOpExpr*>(curr);
-            stack.push_back(b->left.get());
-            stack.push_back(b->right.get());
-        } else if (curr->kind == ExpressionKind::AGGREGATION) {
-            stack.push_back(static_cast<const AggregateExpr*>(curr)->expr.get());
-        }
-    }
-    
-    if (!references_var) {
+    // A predicate that never mentions the variable cannot constrain it. Missing a mention here would
+    // wrongly report the variable as unconstrained, so this uses the shared complete check: only after
+    // establishing that the variable IS mentioned does the shape test below decide whether the mention is
+    // one this pass can reason about.
+    if (!expression_references_variable(expr, var)) {
         return true;
     }
     
@@ -136,30 +114,11 @@ static bool subsumption_binds_same_vars(const MatchStatement& m1, const MatchSta
 }
 
 bool is_var_dead_end_except_global_where(const GqlQuery& query, const std::string& var, int my_match_id) {
+    // "Dead end" means nothing outside this match needs the variable, which is what licenses pruning the
+    // match. A reference this walk cannot enter therefore reads as dead and takes the binding with it, so
+    // it uses the shared complete check rather than a local partial one.
     auto check_expr = [&](const Expression* expr) -> bool {
-        if (!expr) return false;
-        std::vector<const Expression*> stack = { expr };
-        while (!stack.empty()) {
-            const auto* curr = stack.back();
-            stack.pop_back();
-            // A child pushed below can be null: count(*) is an AggregateExpr with no argument, and a
-            // malformed binary/unary op can carry a null operand. Skip it rather than dereference kind.
-            if (!curr) continue;
-            if (curr->kind == ExpressionKind::VARIABLE) {
-                if (static_cast<const VariableExpr*>(curr)->name == var) return true;
-            } else if (curr->kind == ExpressionKind::PROPERTY_LOOKUP) {
-                if (static_cast<const PropertyLookupExpr*>(curr)->variable == var) return true;
-            } else if (curr->kind == ExpressionKind::UNARY_OP) {
-                stack.push_back(static_cast<const UnaryOpExpr*>(curr)->expr.get());
-            } else if (curr->kind == ExpressionKind::BINARY_OP) {
-                const auto* bin = static_cast<const BinaryOpExpr*>(curr);
-                stack.push_back(bin->left.get());
-                stack.push_back(bin->right.get());
-            } else if (curr->kind == ExpressionKind::AGGREGATION) {
-                stack.push_back(static_cast<const AggregateExpr*>(curr)->expr.get());
-            }
-        }
-        return false;
+        return expression_references_variable(expr, var);
     };
 
     for (const auto& item : query.returns) {

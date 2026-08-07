@@ -222,6 +222,13 @@ void DisjointConceptPruner::disjoint_concept_pruning_pass(GqlQuery& query) {
     
     auto graphs = build_taxonomy_graphs();
     auto equalities = collect_query_equalities(query);
+
+    // The relationship types a registered hierarchy constraint describes, i.e. the ones whose endpoints
+    // stand in an is-a relation. Only those licence the label check below.
+    std::set<std::string> subsumption_rel_types;
+    for (const auto& [key, adj] : graphs) {
+        subsumption_rel_types.insert(key.rel_type);
+    }
     
     for (const auto& match : query.matches) {
         // An OPTIONAL match with an impossible (disjoint-endpoint) traversal null-extends the anchor rows
@@ -239,12 +246,21 @@ void DisjointConceptPruner::disjoint_concept_pruning_pass(GqlQuery& query) {
             const auto& start_node = match.pattern.nodes[i];
             const auto& end_node = match.pattern.nodes[i + 1];
             
-            // 1. Check direct label disjointness if both start and end have labels
-            if (start_node.label_expr && start_node.label_expr->kind == LabelExprKind::LITERAL &&
+            // 1. Direct label disjointness, but ONLY across a subsumption relationship.
+            //
+            // Disjoint labels assert that no single entity carries both, which says nothing about whether
+            // an instance of one can REACH an instance of the other: a Person is not a Product, yet a
+            // Person may certainly be connected to one, so emptying that query answers a satisfiable
+            // question with nothing. (The engine never pruned the single-hop spelling of the very same
+            // query, so the two disagreed.) Across a registered hierarchy the inference does hold: a path
+            // child -[:IS_A*]-> parent makes every instance of the start label an instance of the end
+            // label, which a disjointness declaration contradicts, so no row can match.
+            if (subsumption_rel_types.count(edge.label_expr->name) &&
+                start_node.label_expr && start_node.label_expr->kind == LabelExprKind::LITERAL &&
                 end_node.label_expr && end_node.label_expr->kind == LabelExprKind::LITERAL) {
                 std::string l1 = start_node.label_expr->name;
                 std::string l2 = end_node.label_expr->name;
-                
+
                 auto it = disjoint_labels.find(l1);
                 if (it != disjoint_labels.end() && it->second.count(l2)) {
                     query.no_op = true;

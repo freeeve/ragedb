@@ -36,14 +36,33 @@ GqlQuery optimized(const std::string& text) {
 }
 }  // namespace
 
-TEST_CASE("a variable-length path between disjoint labels is unsatisfiable", "[gql_optimizer]") {
-    GqlVirtualCatalog::local().clear();
-    GqlVirtualCatalog::local().add_disjoint_labels("Person", "Product");
+TEST_CASE("disjoint labels are unsatisfiable only across a subsumption relationship", "[gql_optimizer]") {
+    SECTION("a path over a registered hierarchy is unsatisfiable") {
+        // Reaching :Biography from :Fiction by following is-a edges would make every Fiction a
+        // Biography, which the disjointness declaration forbids -- so no row can match.
+        GqlVirtualCatalog::local().clear();
+        GqlVirtualCatalog::local().add_constraint("H",
+            "MATCH (c:Fiction {name: 'SciFi'})-[:SUB_CATEGORY]->(p:Biography {name: 'Memoir'}) RETURN c");
+        GqlVirtualCatalog::local().add_disjoint_labels("Fiction", "Biography");
 
-    auto q = optimized("MATCH (p:Person)-[:KNOWS*1..3]->(x:Product) RETURN p");
-    REQUIRE(q.no_op);
+        auto q = optimized("MATCH (a:Fiction)-[:SUB_CATEGORY*1..3]->(b:Biography) RETURN a");
+        REQUIRE(q.no_op);
 
-    GqlVirtualCatalog::local().clear();
+        GqlVirtualCatalog::local().clear();
+    }
+
+    SECTION("a path over an ordinary relationship is satisfiable and must survive") {
+        // Disjointness says no entity is both a Person and a Product. It says nothing about a Person
+        // being CONNECTED to one, so emptying this query would answer a real question with nothing.
+        GqlVirtualCatalog::local().clear();
+        GqlVirtualCatalog::local().add_disjoint_labels("Person", "Product");
+
+        REQUIRE_FALSE(optimized("MATCH (p:Person)-[:KNOWS*1..3]->(x:Product) RETURN p").no_op);
+        REQUIRE_FALSE(optimized("MATCH (p:Person)-[:BOUGHT*1..2]->(x:Product) RETURN p").no_op);
+        REQUIRE_FALSE(optimized("MATCH (x:Product)<-[:BOUGHT*1..2]-(p:Person) RETURN p").no_op);
+
+        GqlVirtualCatalog::local().clear();
+    }
 }
 
 TEST_CASE("the disjoint pruner leaves satisfiable queries alone", "[gql_optimizer]") {
@@ -79,9 +98,9 @@ TEST_CASE("the disjoint pruner leaves satisfiable queries alone", "[gql_optimize
 }
 
 TEST_CASE("the disjoint pruner only judges variable-length traversals", "[gql_optimizer]") {
-    // A single fixed hop between disjoint labels is equally impossible, but proving that is another
-    // pass's job -- this one inspects quantified edges only. Pinned so the boundary is deliberate:
-    // widening it later should be a decision, not a surprise.
+    // This pass inspects quantified edges only. A single fixed hop between disjoint labels is not
+    // impossible in the first place -- the labels cannot describe the same entity, which leaves any
+    // relationship between two separate entities untouched.
     GqlVirtualCatalog::local().clear();
     GqlVirtualCatalog::local().add_disjoint_labels("Person", "Product");
 

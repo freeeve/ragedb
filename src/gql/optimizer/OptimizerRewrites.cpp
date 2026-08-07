@@ -56,6 +56,17 @@ bool is_variable_referenced_outside_count(const Expression* expr, const std::str
             }
             return is_variable_referenced_outside_count(agg->expr.get(), var_name);
         }
+        case ExpressionKind::IS_NULL_CHECK: {
+            // A null test reads the variable like any other predicate does. Skipping it let the caller
+            // truncate the pattern out from under `WHERE m.age IS NULL`.
+            auto* is_null = static_cast<const IsNullExpr*>(expr);
+            return is_variable_referenced_outside_count(is_null->expr.get(), var_name);
+        }
+        case ExpressionKind::EXISTS:
+        case ExpressionKind::SIZE_OP:
+            // A nested pattern binds and reads the variable, which is a use outside any count. The
+            // complete walk is reused here rather than restating the pattern traversal.
+            return expression_references_variable(expr, var_name);
         case ExpressionKind::FUNCTION_CALL: {
             auto* fc = static_cast<const FunctionCallExpr*>(expr);
             for (const auto& a : fc->args) {

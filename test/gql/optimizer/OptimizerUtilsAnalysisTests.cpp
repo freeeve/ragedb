@@ -219,9 +219,23 @@ TEST_CASE("is_variable_referenced_outside_count walks every expression form", "[
     REQUIRE(references_outside_count("CASE WHEN x.age > 5 THEN 1 ELSE 0 END"));   // case branch
     REQUIRE(references_outside_count("NOT (x.age > 5)"));                         // unary over binary
     REQUIRE(references_outside_count("x.age IN [1, 2]"));                         // in-list value
+    REQUIRE(references_outside_count("x.age IS NULL"));                           // null test
+    REQUIRE(references_outside_count("x.age IS NOT NULL"));                       // negated null test
+    REQUIRE(references_outside_count("x.created.year"));                          // temporal accessor
     // A different variable or a bare literal is not a reference to x.
     REQUIRE_FALSE(references_outside_count("y.age"));
     REQUIRE_FALSE(references_outside_count("42"));
+}
+
+TEST_CASE("is_variable_referenced_outside_count sees a nested pattern's variables", "[gql_optimizer]") {
+    // A pattern inside EXISTS or SIZE binds and reads the variable, which is a use outside any count.
+    // Missing these let a caller strip the pattern that bound it.
+    auto in_where = [](const std::string& w) {
+        auto q = GqlParser::parse("MATCH (x), (y) WHERE " + w + " RETURN count(y) AS n");
+        return is_variable_referenced_outside_count(q.where_expr.get(), "x");
+    };
+    REQUIRE(in_where("EXISTS { MATCH (x)-[:R]->(z) }"));
+    REQUIRE_FALSE(in_where("EXISTS { MATCH (y)-[:R]->(z) }"));
 }
 
 TEST_CASE("rebuild_expression_without_pushed_predicates removes exactly the pushed conjuncts", "[gql_optimizer]") {

@@ -100,3 +100,30 @@ TEST_CASE("GQL Optimizer Algebraic Path Count Rewrite", "[gql_optimizer]") {
         REQUIRE(query.returns[1].alias == "count(d)");
     }
 }
+
+TEST_CASE("the path-count rewrite keeps an intermediate node a predicate still reads",
+          "[gql_optimizer]") {
+    // Collapsing the chain to a hop count discards the intermediate bindings, which is only sound when
+    // nothing outside the count reads them. A predicate the reference check could not see got the
+    // intermediate truncated away while the filter on it survived.
+    auto rewritten_nodes = [](const std::string& text) {
+        GqlVirtualCatalog::local().clear();
+        auto query = GqlParser::parse(text);
+        GqlOptimizer::optimize(query);
+        return query.matches.empty() ? 0u : query.matches[0].pattern.nodes.size();
+    };
+
+    const std::string chain = "MATCH (a:P)-[:R]->(m)-[:R]->(b:P) ";
+
+    SECTION("with nothing else reading the intermediate, the chain still collapses") {
+        // Without this the guard below could pass by disabling the rewrite entirely.
+        REQUIRE(rewritten_nodes(chain + "RETURN count(b) AS n") == 1u);
+    }
+
+    SECTION("a predicate on the intermediate blocks the collapse") {
+        REQUIRE(rewritten_nodes(chain + "WHERE m.age > 1 RETURN count(b) AS n") == 3u);
+        REQUIRE(rewritten_nodes(chain + "WHERE m.age IS NULL RETURN count(b) AS n") == 3u);
+        REQUIRE(rewritten_nodes(chain + "WHERE m.age IS NOT NULL RETURN count(b) AS n") == 3u);
+        REQUIRE(rewritten_nodes(chain + "WHERE EXISTS { MATCH (m)-[:S]->(z:P) } RETURN count(b) AS n") == 3u);
+    }
+}

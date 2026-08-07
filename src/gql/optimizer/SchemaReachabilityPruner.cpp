@@ -17,6 +17,7 @@
 #include "SchemaReachabilityPruner.h"
 #include "../GqlVirtualCatalog.h"
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <algorithm>
 
@@ -38,6 +39,14 @@ void SchemaReachabilityPruner::schema_reachability_pass(GqlQuery& query) {
     const auto& allowed = GqlVirtualCatalog::local().get_allowed_relationships();
     if (allowed.empty()) return; // No schema rules registered, skip pruning
 
+    // Registered rules are a whitelist for the relationship types they mention, not a claim that the
+    // schema describes the whole graph. An edge whose type appears in no rule is one the schema says
+    // nothing about, and reading that silence as a denial empties queries that have real answers.
+    std::unordered_set<std::string> described_rel_types;
+    for (const auto& [a_src, a_rel, a_tgt] : allowed) {
+        described_rel_types.insert(a_rel);
+    }
+
     for (const auto& match : query.matches) {
         // An OPTIONAL match whose edge is schema-unreachable does not empty the query -- it null-extends
         // the anchor rows -- so its unreachable edge must not mark the whole query no_op.
@@ -58,6 +67,7 @@ void SchemaReachabilityPruner::schema_reachability_pass(GqlQuery& query) {
                 std::string tgt_label = var_to_label[tgt_var];
                 if (edge.label_expr && edge.label_expr->kind == LabelExprKind::LITERAL && !src_label.empty() && !tgt_label.empty()) {
                     std::string rel_type = edge.label_expr->name;
+                    if (!described_rel_types.count(rel_type)) continue;
                     bool forward_allowed = false;
                     bool backward_allowed = false;
                     for (const auto& [a_src, a_rel, a_tgt] : allowed) {
@@ -77,7 +87,8 @@ void SchemaReachabilityPruner::schema_reachability_pass(GqlQuery& query) {
             
             if (edge.label_expr && edge.label_expr->kind == LabelExprKind::LITERAL) {
                 std::string rel_type = edge.label_expr->name;
-                
+                if (!described_rel_types.count(rel_type)) continue;
+
                 if (!src_label.empty() && !tgt_label.empty()) {
                     bool found = false;
                     for (const auto& [a_src, a_rel, a_tgt] : allowed) {

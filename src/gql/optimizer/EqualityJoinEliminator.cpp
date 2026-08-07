@@ -233,7 +233,12 @@ void EqualityJoinEliminator::equality_join_elimination_pass(GqlQuery& query) {
                     if (equated.count(p)) {
                         std::string keep_var = target1;
                         std::string prune_var = target2;
-                        
+
+                        // Renaming onto a name a list comprehension or quantified predicate already uses
+                        // for its element would push the rewritten references into that element's scope,
+                        // silently rebinding them to the list item. Leave the join in place instead.
+                        if (query_binds_scoped_variable(query, keep_var)) continue;
+
                         // Setup the variable replacement mapping
                         std::map<std::string, std::string> var_map;
                         var_map[prune_var] = keep_var;

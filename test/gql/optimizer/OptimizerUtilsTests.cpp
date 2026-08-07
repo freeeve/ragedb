@@ -207,6 +207,25 @@ std::set<std::string> renamed_names(const std::string& projection) {
 }
 }  // namespace
 
+TEST_CASE("query_binds_scoped_variable finds an element name a rename could capture", "[gql_optimizer]") {
+    auto binds = [](const std::string& text, const std::string& name) {
+        return query_binds_scoped_variable(GqlParser::parse(text), name);
+    };
+    SECTION("a comprehension element is reported, in the projection or a sort key") {
+        REQUIRE(binds("MATCH (n:P) RETURN [c IN n.vals | c] AS l", "c"));
+        REQUIRE(binds("MATCH (n:P) RETURN n.name AS x ORDER BY [c IN n.vals | c]", "c"));
+    }
+    SECTION("a quantified predicate's variable is reported") {
+        REQUIRE(binds("MATCH (n:P) WHERE any(c IN n.vals WHERE c > 1) RETURN n.name", "c"));
+    }
+    SECTION("an unrelated name is not reported") {
+        REQUIRE_FALSE(binds("MATCH (n:P) RETURN [c IN n.vals | c] AS l", "b"));
+    }
+    SECTION("an ordinary pattern variable is not a scoped binder") {
+        REQUIRE_FALSE(binds("MATCH (a:P)-[:R]->(c:P) RETURN c.name", "c"));
+    }
+}
+
 TEST_CASE("rewrite_expr_vars renames through every expression arm", "[gql_optimizer]") {
     // Callers merge two variables and then erase the match that bound the discarded one, so an arm this
     // walk skips leaves a reference to a variable nothing binds.

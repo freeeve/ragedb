@@ -22,9 +22,12 @@
 // collapses when the equality makes it sound and leaves a plain self-join alone when it does not.
 
 #include <catch2/catch.hpp>
+#include <set>
+#include <string>
 #include "../../../src/gql/GqlParser.h"
 #include "../../../src/gql/GqlOptimizer.h"
 #include "../../../src/gql/GqlVirtualCatalog.h"
+#include "../../../src/gql/optimizer/OptimizerUtils.h"
 
 using namespace ragedb;
 using namespace ragedb::gql;
@@ -54,6 +57,30 @@ TEST_CASE("equality join elimination collapses an equated self-join", "[gql_opti
                            "WHERE b = c RETURN DISTINCT a.name");
         REQUIRE(q.matches.size() == 1);
     }
+}
+
+TEST_CASE("equality join elimination never renames a reference into a scoped element's name",
+          "[gql_optimizer]") {
+    // Merging rewrites references from the pruned variable to the kept one. If a comprehension already
+    // uses the kept name for its element, an outer reference rewritten into the body stops meaning the
+    // node and starts meaning the list item -- wrong values rather than an error.
+    auto q = optimized("MATCH (a:P)-[:R]->(b:P) MATCH (a:P)-[:R]->(c:P) WHERE b = c "
+                       "RETURN [c IN a.vals | c + b.age] AS l");
+
+    const auto* lc = static_cast<const ListComprehensionExpr*>(q.returns[0].expr.get());
+    REQUIRE(lc != nullptr);
+
+    // Whatever the pass decides, the body's outer reference must still name a variable a surviving
+    // pattern binds, and must not have become the comprehension's element.
+    const auto* sum = static_cast<const BinaryOpExpr*>(lc->projection.get());
+    REQUIRE(sum != nullptr);
+    REQUIRE(sum->right->kind == ExpressionKind::PROPERTY_LOOKUP);
+    const std::string outer = static_cast<const PropertyLookupExpr*>(sum->right.get())->variable;
+    REQUIRE(outer != lc->variable);
+
+    std::set<std::string> bound;
+    collect_variables_from_matches(q.matches, bound);
+    REQUIRE(bound.count(outer) == 1);
 }
 
 TEST_CASE("equality join elimination leaves a genuine self-join in place", "[gql_optimizer]") {

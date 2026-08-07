@@ -198,6 +198,10 @@ void AntisymmetricLoopCollapser::antisymmetric_loop_pass(GqlQuery& query) {
                     std::string keep_var = e1.src;
                     std::string prune_var = e1.tgt;
 
+                    // Renaming onto a name a scoped binder already uses for its element would rebind the
+                    // rewritten references to the list item, so the collapse is skipped instead.
+                    if (query_binds_scoped_variable(query, keep_var)) return;
+
                     std::map<std::string, std::string> var_map;
                     var_map[prune_var] = keep_var;
 

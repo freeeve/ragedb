@@ -67,6 +67,124 @@ template <typename SmartPtr>
 void rewrite_expr_vars(SmartPtr& expr, const std::map<std::string, std::string>& var_map);
 
 /**
+ * @brief Whether any list comprehension or quantified predicate in this expression binds an iteration
+ *        variable called @p name.
+ *
+ * Callers rename one variable onto another. If the destination name is also a scoped element name, the
+ * rename would push an outer reference into that element's scope and silently rebind it -- so a merge is
+ * declined when this returns true. Under-reporting reintroduces that capture, so this must visit the same
+ * arms rewrite_expr_vars does; keep the two in step.
+ */
+inline bool binds_scoped_variable(const Expression* expr, const std::string& name) {
+    if (!expr) return false;
+    switch (expr->kind) {
+        case ExpressionKind::LIST_COMPREHENSION: {
+            auto* lc = static_cast<const ListComprehensionExpr*>(expr);
+            return lc->variable == name || binds_scoped_variable(lc->list.get(), name) ||
+                   binds_scoped_variable(lc->filter.get(), name) ||
+                   binds_scoped_variable(lc->projection.get(), name);
+        }
+        case ExpressionKind::QUANTIFIED_PREDICATE: {
+            auto* qp = static_cast<const QuantifiedPredicateExpr*>(expr);
+            return qp->variable == name || binds_scoped_variable(qp->list.get(), name) ||
+                   binds_scoped_variable(qp->predicate.get(), name);
+        }
+        case ExpressionKind::UNARY_OP:
+            return binds_scoped_variable(static_cast<const UnaryOpExpr*>(expr)->expr.get(), name);
+        case ExpressionKind::BINARY_OP: {
+            auto* bin = static_cast<const BinaryOpExpr*>(expr);
+            return binds_scoped_variable(bin->left.get(), name) ||
+                   binds_scoped_variable(bin->right.get(), name);
+        }
+        case ExpressionKind::AGGREGATION:
+            return binds_scoped_variable(static_cast<const AggregateExpr*>(expr)->expr.get(), name);
+        case ExpressionKind::IS_NULL_CHECK:
+            return binds_scoped_variable(static_cast<const IsNullExpr*>(expr)->expr.get(), name);
+        case ExpressionKind::IS_LABELED:
+            return binds_scoped_variable(static_cast<const IsLabeledExpr*>(expr)->value.get(), name);
+        case ExpressionKind::IS_DIRECTED:
+            return binds_scoped_variable(static_cast<const IsDirectedExpr*>(expr)->value.get(), name);
+        case ExpressionKind::IS_SOURCE_DEST: {
+            auto* sd = static_cast<const IsSourceDestExpr*>(expr);
+            return binds_scoped_variable(sd->value.get(), name) ||
+                   binds_scoped_variable(sd->edge.get(), name);
+        }
+        case ExpressionKind::CAST:
+            return binds_scoped_variable(static_cast<const CastExpr*>(expr)->value.get(), name);
+        case ExpressionKind::FUNCTION_CALL: {
+            for (const auto& a : static_cast<const FunctionCallExpr*>(expr)->args) {
+                if (binds_scoped_variable(a.get(), name)) return true;
+            }
+            return false;
+        }
+        case ExpressionKind::CASE_WHEN: {
+            auto* ce = static_cast<const CaseExpr*>(expr);
+            for (const auto& br : ce->branches) {
+                if (binds_scoped_variable(br.first.get(), name)) return true;
+                if (binds_scoped_variable(br.second.get(), name)) return true;
+            }
+            return binds_scoped_variable(ce->else_expr.get(), name);
+        }
+        case ExpressionKind::IN_LIST: {
+            auto* in = static_cast<const InExpr*>(expr);
+            return binds_scoped_variable(in->value.get(), name) ||
+                   binds_scoped_variable(in->list.get(), name);
+        }
+        case ExpressionKind::LIST_LITERAL: {
+            for (const auto& el : static_cast<const ListExpr*>(expr)->elements) {
+                if (binds_scoped_variable(el.get(), name)) return true;
+            }
+            return false;
+        }
+        case ExpressionKind::LIST_INDEX: {
+            auto* ix = static_cast<const IndexExpr*>(expr);
+            return binds_scoped_variable(ix->list.get(), name) ||
+                   binds_scoped_variable(ix->index.get(), name);
+        }
+        case ExpressionKind::EXISTS: {
+            auto* ex = static_cast<const ExistsExpr*>(expr);
+            return binds_scoped_variable(ex->where_expr.get(), name);
+        }
+        case ExpressionKind::SIZE_OP: {
+            auto* sz = static_cast<const SizeExpr*>(expr);
+            return binds_scoped_variable(sz->where_expr.get(), name);
+        }
+        default:
+            return false;
+    }
+}
+
+/**
+ * @brief Whether renaming some other variable onto @p name would be captured by a scoped binder
+ *        anywhere the callers rewrite: the projection, sort keys, LET bindings, writes and filters.
+ */
+inline bool query_binds_scoped_variable(const GqlQuery& query, const std::string& name) {
+    for (const auto& item : query.returns) {
+        if (binds_scoped_variable(item.expr.get(), name)) return true;
+    }
+    for (const auto& spec : query.order_by) {
+        if (binds_scoped_variable(spec.expr.get(), name)) return true;
+    }
+    for (const auto& let : query.let_bindings) {
+        if (binds_scoped_variable(let.expr.get(), name)) return true;
+    }
+    for (const auto& write : query.writes) {
+        if (binds_scoped_variable(write.set_expr.get(), name)) return true;
+    }
+    if (binds_scoped_variable(query.where_expr.get(), name)) return true;
+    for (const auto& match : query.matches) {
+        for (const auto& node : match.pattern.nodes) {
+            if (binds_scoped_variable(node.where_expr.get(), name)) return true;
+        }
+        for (const auto& edge : match.pattern.edges) {
+            if (binds_scoped_variable(edge.where_expr.get(), name)) return true;
+            if (binds_scoped_variable(edge.cost_expr.get(), name)) return true;
+        }
+    }
+    return false;
+}
+
+/**
  * @brief Renames the node/edge variables a nested pattern binds, and the expressions hanging off it.
  *        Shared by the EXISTS and SIZE_OP arms, which have the same pattern-plus-WHERE shape.
  */

@@ -135,6 +135,7 @@ add_executable(tests tests.cpp shard/ShardIds.cpp shard/Ids.cpp shard/NodeTypes.
         ../src/gql/GqlParserStatements.cpp
         ../src/gql/GqlOptimizer.cpp ../src/gql/GqlOptimizer.h
         ../src/gql/optimizer/OptimizerUtils.cpp ../src/gql/optimizer/OptimizerUtils.h
+        ../src/gql/optimizer/OptimizerFilters.cpp
         ../src/gql/optimizer/OptimizerRewrites.cpp
         ../src/gql/optimizer/ContradictionPruner.cpp ../src/gql/optimizer/ContradictionPruner.h
         ../src/gql/optimizer/DomainConstraintReasoner.cpp ../src/gql/optimizer/DomainConstraintReasoner.h
@@ -245,6 +246,7 @@ add_executable(tests2 main/ConnectedHandler.cpp
         ../src/gql/GqlParserStatements.cpp
         ../src/gql/GqlOptimizer.cpp ../src/gql/GqlOptimizer.h
         ../src/gql/optimizer/OptimizerUtils.cpp ../src/gql/optimizer/OptimizerUtils.h
+        ../src/gql/optimizer/OptimizerFilters.cpp
         ../src/gql/optimizer/OptimizerRewrites.cpp
         ../src/gql/optimizer/ContradictionPruner.cpp ../src/gql/optimizer/ContradictionPruner.h
         ../src/gql/optimizer/DomainConstraintReasoner.cpp ../src/gql/optimizer/DomainConstraintReasoner.h

@@ -61,6 +61,37 @@ TEST_CASE("schema reachability prunes only types the schema describes", "[gql_op
     GqlVirtualCatalog::local().clear();
 }
 
+TEST_CASE("an undirected edge is judged against both orientations", "[gql_optimizer]") {
+    // `-[:R]-` matches an edge traversed either way, so it contradicts the schema only when NEITHER
+    // orientation is declared. Checking one direction would empty queries whose edges exist, just written
+    // from the other end.
+    GqlVirtualCatalog::local().clear();
+    GqlVirtualCatalog::local().add_allowed_relationship("Person", "FRIEND", "Person");
+    GqlVirtualCatalog::local().add_allowed_relationship("Person", "WORKS_AT", "Company");
+
+    SECTION("the declared orientation survives") {
+        REQUIRE_FALSE(pruned("MATCH (a:Person)-[:WORKS_AT]-(b:Company) RETURN a"));
+    }
+
+    SECTION("the reverse of a declared orientation also survives") {
+        // The schema declares Person -WORKS_AT-> Company; written from the Company end an undirected
+        // edge is the same set of edges, so it must not be judged impossible.
+        REQUIRE_FALSE(pruned("MATCH (a:Company)-[:WORKS_AT]-(b:Person) RETURN a"));
+    }
+
+    SECTION("neither orientation declared is unsatisfiable") {
+        REQUIRE(pruned("MATCH (a:Company)-[:WORKS_AT]-(b:Company) RETURN a"));
+    }
+
+    SECTION("a type the schema never mentions is not judged, undirected either") {
+        // Same rule as for a directed edge: registered rules are a whitelist for the types they name,
+        // and silence about a type is not a denial.
+        REQUIRE_FALSE(pruned("MATCH (a:Person)-[:LIKES]-(b:Company) RETURN a"));
+    }
+
+    GqlVirtualCatalog::local().clear();
+}
+
 TEST_CASE("schema reachability prunes nothing without a registered schema", "[gql_optimizer]") {
     GqlVirtualCatalog::local().clear();
     REQUIRE_FALSE(pruned("MATCH (a:Person)-[:FRIEND]->(b:Category) RETURN a"));

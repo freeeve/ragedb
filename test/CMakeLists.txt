@@ -39,6 +39,7 @@ add_executable(tests tests.cpp shard/ShardIds.cpp shard/Ids.cpp shard/NodeTypes.
         gql/optimizer/DisjointConceptPrunerTests.cpp
         gql/optimizer/OptimizerUtilsTests.cpp
         gql/optimizer/OptimizerFiltersTests.cpp
+        gql/optimizer/SubqueryUnnestingTests.cpp
         gql/optimizer/OptimizerUtilsAnalysisTests.cpp
         gql/optimizer/EqualityJoinEliminatorTests.cpp
         gql/optimizer/AlgebraicRewriterTests.cpp

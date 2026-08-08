@@ -191,6 +191,8 @@ void collect_names(const Expression* e, std::set<std::string>& out) {
             auto* ix = static_cast<const IndexExpr*>(e);
             collect_names(ix->list.get(), out); collect_names(ix->index.get(), out); return;
         }
+        case ExpressionKind::TEMPORAL_FIELD:
+            collect_names(static_cast<const TemporalFieldExpr*>(e)->value.get(), out); return;
         default:
             return;
     }

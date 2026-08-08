@@ -71,7 +71,11 @@ bool optimizes_to_noop_taxonomy(const std::string& q) {
 
 TEST_CASE("an impossible REQUIRED pattern is still pruned to no_op", "[gql_optimizer]") {
     SECTION("a schema-unreachable required edge empties the query") {
-        REQUIRE(optimizes_to_noop("MATCH (a:N)-[:BADREL]->(b:M) RETURN a", /*schema=*/true));
+        // The schema declares N-GOOD->M. A GOOD edge to some other label contradicts that rule and
+        // cannot match. An edge of a type the schema never mentions is a different case: the schema is
+        // silent about it, so it is left to execute rather than judged unreachable.
+        REQUIRE(optimizes_to_noop("MATCH (a:N)-[:GOOD]->(b:Other) RETURN a", /*schema=*/true));
+        REQUIRE_FALSE(optimizes_to_noop("MATCH (a:N)-[:BADREL]->(b:M) RETURN a", /*schema=*/true));
     }
     SECTION("an empty attribute range on a required node empties the query") {
         REQUIRE(optimizes_to_noop("MATCH (a:N)-[:R]->(b:M WHERE b.age > 5 AND b.age < 2) RETURN a"));

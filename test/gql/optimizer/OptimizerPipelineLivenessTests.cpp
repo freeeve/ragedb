@@ -69,6 +69,39 @@ TEST_CASE("each rewrite still reaches a query through the whole pipeline", "[gql
     }
 }
 
+TEST_CASE("the liveness assertions fail when the optimizer is switched off", "[gql_optimizer]") {
+    // An assertion that holds whether or not the pass runs proves nothing about the pass. Each shape
+    // above is repeated here with NO_SEMANTIC, and must NOT show the optimized form -- so if a rewrite is
+    // ever made unconditional, or an assertion is weakened into something that was always true, this
+    // fails rather than the liveness case silently becoming decorative.
+
+    SECTION("no degree lookup without the optimizer") {
+        auto q = fully_optimized("NO_SEMANTIC MATCH (a:Person) RETURN size((a)-[:KNOWS]->()) AS n");
+        REQUIRE_FALSE(q.returns.empty());
+        REQUIRE(q.returns[0].expr != nullptr);
+        REQUIRE(q.returns[0].expr->kind != ExpressionKind::PROPERTY_LOOKUP);
+    }
+
+    SECTION("no chain collapse without the optimizer") {
+        auto q = fully_optimized("NO_SEMANTIC MATCH (a:P)-[:R]->(m)-[:R]->(b:P) RETURN count(b) AS n");
+        REQUIRE_FALSE(q.matches.empty());
+        REQUIRE(q.matches[0].pattern.nodes.size() == 3);
+    }
+
+    SECTION("no join elimination without the optimizer") {
+        auto q = fully_optimized(
+            "NO_SEMANTIC MATCH (a:Person)-[:KNOWS]->(b:Person) MATCH (a:Person)-[:KNOWS]->(c:Person) "
+            "WHERE b = c RETURN a.name");
+        REQUIRE(q.matches.size() == 2);
+    }
+
+    SECTION("no limit pushdown without the optimizer") {
+        auto q = fully_optimized("NO_SEMANTIC MATCH (p:Person) RETURN p.name LIMIT 5");
+        REQUIRE_FALSE(q.matches.empty());
+        REQUIRE_FALSE(q.matches[0].limit.has_value());
+    }
+}
+
 TEST_CASE("the anti-join rewrite does not survive the pipeline today", "[gql_optimizer]") {
     // Recording a known limitation rather than omitting the pass from this file and leaving the gap
     // invisible. The promotion replaces the OPTIONAL match with a NOT EXISTS, and the later subquery

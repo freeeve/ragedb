@@ -44,6 +44,11 @@ bool optimizes_to_noop(const std::string& q, bool register_schema = false) {
 bool optimizes_to_noop_disjoint(const std::string& q) {
     GqlVirtualCatalog::local().clear();
     GqlVirtualCatalog::local().add_disjoint_labels("X", "Y");   // X and Y are disjoint concepts
+    // Disjointness alone does not make a traversal impossible -- it forbids one entity being both, not a
+    // path between two. The inference is licensed only across a subsumption relationship, so R is
+    // declared as one here; otherwise this pattern has real answers and is correctly left alone.
+    GqlVirtualCatalog::local().add_constraint(
+        "XRY", "MATCH (c:X {code: 'a'})-[:R]->(p:Y {code: 'b'}) RETURN c");
     GqlQuery query = GqlParser::parse(q);
     GqlOptimizer::optimize(query);
     bool no_op = query.no_op;

@@ -130,14 +130,16 @@ TEST_CASE("Equality Join Elimination (Phase 19)", "[gql_optimizer][phase19]") {
 TEST_CASE("Disjoint Concept Path Pruning (Phase 20)", "[gql_optimizer][phase20]") {
     GqlVirtualCatalog::local().clear();
 
-    SECTION("Direct disjoint label pruning for variable-length paths") {
+    SECTION("Disjoint labels do not make an ordinary traversal impossible") {
         GqlVirtualCatalog::local().add_disjoint_labels("Person", "Company");
-        
-        // MATCH (a:Person)-[:WORKS_FOR*]->(b:Company) RETURN a
+
+        // Declaring the labels disjoint says no entity is both a Person and a Company. It says nothing
+        // about a Person being connected to one, so this query has real answers and must survive.
+        // WORKS_FOR is not a subsumption relationship, which is what would license the inference.
         std::string query_str = "MATCH (a:Person)-[:WORKS_FOR*]->(b:Company) RETURN a";
         auto query = GqlParser::parse(query_str);
         GqlOptimizer::optimize(query);
-        REQUIRE(query.no_op);
+        REQUIRE_FALSE(query.no_op);
     }
 
     SECTION("Taxonomy value disjointness pruning") {

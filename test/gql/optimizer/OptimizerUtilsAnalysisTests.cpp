@@ -143,6 +143,70 @@ TEST_CASE("collect_all_query_vars also gathers edge variables", "[gql_optimizer]
     REQUIRE(e->label == "KNOWS");
 }
 
+TEST_CASE("an inline property value becomes a point interval on the variable", "[gql_optimizer]") {
+    // The passes that decide a query is unsatisfiable reason over these intervals, so a value written
+    // inline in the pattern has to reach the model exactly as a WHERE equality would. If it did not, a
+    // query pinning a property in the pattern would simply never be checked against a constraint.
+    SECTION("an integer value pins both bounds to it") {
+        auto vs = collect_all_query_vars(GqlParser::parse("MATCH (a:Person {age: 30}) RETURN a"));
+        const VarInfo* a = find_var(vs, "a");
+        REQUIRE(a != nullptr);
+        REQUIRE(a->intervals.count("age") == 1);
+        const Interval& iv = a->intervals.at("age");
+        REQUIRE(iv.has_lower);
+        REQUIRE(iv.has_upper);
+        REQUIRE(iv.lower_val == 30);
+        REQUIRE(iv.upper_val == 30);
+        REQUIRE(iv.lower_inclusive);
+        REQUIRE(iv.upper_inclusive);
+        REQUIRE_FALSE(iv.is_empty());
+    }
+
+    SECTION("a floating point value is carried the same way") {
+        auto vs = collect_all_query_vars(GqlParser::parse("MATCH (a:Person {score: 1.5}) RETURN a"));
+        const VarInfo* a = find_var(vs, "a");
+        REQUIRE(a != nullptr);
+        REQUIRE(a->intervals.at("score").lower_val == 1.5);
+        REQUIRE(a->intervals.at("score").upper_val == 1.5);
+    }
+
+    SECTION("a non-numeric value contributes no interval") {
+        // Intervals are numeric; a string equality is left to the solver rather than approximated here.
+        auto vs = collect_all_query_vars(GqlParser::parse("MATCH (a:Person {name: 'Bob'}) RETURN a"));
+        const VarInfo* a = find_var(vs, "a");
+        REQUIRE(a != nullptr);
+        REQUIRE(a->intervals.count("name") == 0);
+    }
+
+    SECTION("an inline value and a WHERE bound on the same property intersect") {
+        // age = 30 in the pattern and age > 40 in the WHERE cannot both hold, and the intersection is
+        // what lets a pruner see that without evaluating anything.
+        auto vs = collect_all_query_vars(
+            GqlParser::parse("MATCH (a:Person {age: 30}) WHERE a.age > 40 RETURN a"));
+        const VarInfo* a = find_var(vs, "a");
+        REQUIRE(a != nullptr);
+        REQUIRE(a->intervals.at("age").is_empty());
+    }
+}
+
+TEST_CASE("is_equivalent_properties compares maps key by key", "[gql_optimizer]") {
+    auto props = [](const std::string& pattern) {
+        return GqlParser::parse("MATCH " + pattern + " RETURN a").matches[0].pattern.nodes[0].properties;
+    };
+    SECTION("identical maps are equivalent") {
+        REQUIRE(is_equivalent_properties(props("(a:P {x: 1, y: 2})"), props("(a:P {x: 1, y: 2})")));
+    }
+    SECTION("a differing value is not") {
+        REQUIRE_FALSE(is_equivalent_properties(props("(a:P {x: 1})"), props("(a:P {x: 2})")));
+    }
+    SECTION("a missing key is not") {
+        REQUIRE_FALSE(is_equivalent_properties(props("(a:P {x: 1, y: 2})"), props("(a:P {x: 1})")));
+    }
+    SECTION("two empty maps are equivalent") {
+        REQUIRE(is_equivalent_properties(props("(a:P)"), props("(a:P)")));
+    }
+}
+
 TEST_CASE("collect_query_vars skips anonymous nodes and edges", "[gql_optimizer]") {
     auto vs = collect_query_vars(GqlParser::parse("MATCH (a:Person)-[:KNOWS]->() RETURN a"));
     REQUIRE(vs.size() == 1);

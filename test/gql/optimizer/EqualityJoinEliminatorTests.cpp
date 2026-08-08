@@ -59,6 +59,54 @@ TEST_CASE("equality join elimination collapses an equated self-join", "[gql_opti
     }
 }
 
+TEST_CASE("equality expressed through id properties collapses the same join", "[gql_optimizer]") {
+    // `b.id = c.id` and `b = c` pin the same two variables to the same node, so the pass has to treat
+    // them alike. Only the bare-variable spelling was covered, leaving the id form -- both recognising it
+    // and removing it afterwards -- unexercised.
+    SECTION("b.id = c.id collapses the arms") {
+        auto q = optimized("MATCH (a:Person)-[:KNOWS]->(b:Person) MATCH (a:Person)-[:KNOWS]->(c:Person) "
+                           "WHERE b.id = c.id RETURN a.name");
+        REQUIRE(q.matches.size() == 1);
+    }
+
+    SECTION("a property other than id does not equate the variables") {
+        // Two people can share a name without being the same node, so this is a real filter, not an
+        // identity, and the arms must stay.
+        auto q = optimized("MATCH (a:Person)-[:KNOWS]->(b:Person) MATCH (a:Person)-[:KNOWS]->(c:Person) "
+                           "WHERE b.name = c.name RETURN a.name");
+        REQUIRE(q.matches.size() == 2);
+    }
+
+    SECTION("the equated pair is recognised whichever order it is written") {
+        // The pair is normalised before lookup, so naming the later variable first must still match.
+        auto q = optimized("MATCH (a:Person)-[:KNOWS]->(b:Person) MATCH (a:Person)-[:KNOWS]->(c:Person) "
+                           "WHERE c = b RETURN a.name");
+        REQUIRE(q.matches.size() == 1);
+    }
+
+    SECTION("unrelated conjuncts either side of the equality are kept") {
+        // Removing the equality must rebuild the remaining AND rather than drop the siblings with it.
+        // The siblings are property-to-property comparisons on purpose: a literal comparison would be
+        // lifted into the scan by pushdown and correctly vanish from the residual, which would test the
+        // wrong thing.
+        auto q = optimized("MATCH (a:Person)-[:KNOWS]->(b:Person) MATCH (a:Person)-[:KNOWS]->(c:Person) "
+                           "WHERE a.x = a.y AND b = c AND a.p = a.q RETURN a.name");
+        REQUIRE(q.matches.size() == 1);
+        REQUIRE(q.where_expr != nullptr);
+        REQUIRE(q.where_expr->kind == ExpressionKind::BINARY_OP);
+        REQUIRE(static_cast<const BinaryOpExpr*>(q.where_expr.get())->op == BinaryOpKind::AND);
+    }
+
+    SECTION("an equality whose siblings are all pushed leaves no residual at all") {
+        // The complement of the case above, recorded so the empty residual reads as intended rather than
+        // as something lost: both literal comparisons become scan filters and the equality is removed.
+        auto q = optimized("MATCH (a:Person)-[:KNOWS]->(b:Person) MATCH (a:Person)-[:KNOWS]->(c:Person) "
+                           "WHERE a.age > 1 AND b = c AND a.rank < 9 RETURN a.name");
+        REQUIRE(q.matches.size() == 1);
+        REQUIRE(q.where_expr == nullptr);
+    }
+}
+
 TEST_CASE("equality join elimination never renames a reference into a scoped element's name",
           "[gql_optimizer]") {
     // Merging rewrites references from the pruned variable to the kept one. If a comprehension already
